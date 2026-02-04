@@ -364,6 +364,7 @@ class FileWorker(QtCore.QThread):
                 s = avg_df[f"loc_{dim}_std"].dropna()
                 meds.append(float(s.median()) if len(s) else float("nan"))
             loc_prec = tuple(float(f"{v:.2f}") for v in meds)
+            ratio_loc_per_trace = avg_df["n"].sum() / len(avg_df)
 
         save_path = os.path.join(p["save_folder"], f"{base}.csv")
         avg_save_path = os.path.join(p["save_folder"], f"{base}_stats.csv")
@@ -377,27 +378,14 @@ class FileWorker(QtCore.QThread):
             ("Last iteration localizations", str(last_iteration_loc)),
             ("After trace filtering", str(after_trace)),
             ("After EFO filtering", str(len(df))),
-            ("Localization precision", str(loc_prec) if loc_prec is not None else "—"),
+            ("Localization precision (x, y, z)", str(loc_prec) if loc_prec is not None else "—"),
+            ("Ratio loc per trace", f"{ratio_loc_per_trace:.4f}"),
             ("% remaining", f"{(len(df)/total_loc*100):.2f}%"),
             ("Saved filtered CSV", save_path),
             ("Saved stats CSV", avg_save_path),
         ]
         self.status.emit(f"Saved: {base}")
         return dict(display_name=base, items=items, ctx=ctx, chosen=chosen)
-"""
-            ("File", self._current_ctx["base"]),
-            ("Total imaging time (min)", f"{self._current_ctx['total_tim']/60:.2f}"),
-            ("Total raw localizations", str(self._current_ctx["total_loc"])),
-            ("Last iteration localizations", str(self._current_ctx["last_iteration_loc"])),
-            ("After trace filtering", str(self._current_ctx["after_trace"])),
-            ("After EFO filtering", str(int(np.count_nonzero(mask)))),
-            ("Localization precision", str(lp) if lp is not None else "—"),
-            ("% remaining", f"{(int(np.count_nonzero(mask))/self._current_ctx['total_loc']*100):.2f}%"),
-            ("Note", "Preview only. Click Continue to save + advance."),
-"""
-
-
-
 
 # -------------------- main window --------------------
 class MainWindow(QtWidgets.QMainWindow):
@@ -421,7 +409,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # ---- top area: controls + output ----
         top = QtWidgets.QHBoxLayout()
-        root.addLayout(top)
+        root.addLayout(top, 3)
 
         left = QtWidgets.QVBoxLayout()
         top.addLayout(left, 3)
@@ -518,11 +506,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.out_table.setColumnWidth(0, 200)  # ADD THIS LINE - set first column width
         self.out_table.verticalHeader().setVisible(False)
         self.out_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+
+        font = self.out_table.font()
+        font.setPointSize(12)  # Adjust size as needed (default is usually 13)
+        self.out_table.setFont(font)
+        self.out_table.verticalHeader().setDefaultSectionSize(20)  # Row height in pixels
+
         ov.addWidget(self.out_table)
 
         # ---- bottom area: histogram + plotly ----
         bottom = QtWidgets.QHBoxLayout()
-        root.addLayout(bottom, 1)
+        root.addLayout(bottom, 5)
 
         # histogram panel
         hist_box = QtWidgets.QGroupBox("EFO selection")
@@ -544,8 +538,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.apply_btn.setEnabled(False)
         self.apply_btn.clicked.connect(self.apply_preview)
         ctrl.addWidget(self.apply_btn)
-
-        self.continue_btn = QtWidgets.QPushButton("Save & Continue")
+        
+        self.continue_btn = QtWidgets.QPushButton("Save && Continue")
         self.continue_btn.setEnabled(False)
         self.continue_btn.clicked.connect(self.continue_file)
         ctrl.addWidget(self.continue_btn)
@@ -957,6 +951,14 @@ class MainWindow(QtWidgets.QMainWindow):
         lp = preview_localization_precision(arr_efo)
         lp = tuple(float(f"{v:.2f}") for v in lp) if lp is not None else None
 
+        # ratio loc per trace
+        if len(arr_efo) == 0:
+            ratio_loc_per_trace = 0.0
+        else:
+            unique_tids, inv_idx, locs_per_tid = np.unique(
+                arr_efo["tid"], return_inverse=True, return_counts=True
+            )
+            ratio_loc_per_trace = np.sum(locs_per_tid) / len(unique_tids)
         items = [
             ("File", self._current_ctx["base"]),
             ("Total imaging time (min)", f"{self._current_ctx['total_tim']/60:.2f}"),
@@ -964,7 +966,8 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Last iteration localizations", str(self._current_ctx["last_iteration_loc"])),
             ("After trace filtering", str(self._current_ctx["after_trace"])),
             ("After EFO filtering", str(int(np.count_nonzero(mask)))),
-            ("Localization precision", str(lp) if lp is not None else "—"),
+            ("Localization precision (x, y, z)", str(lp) if lp is not None else "—"),
+            ("Ratio loc per trace", f"{ratio_loc_per_trace:.4f}"),
             ("% remaining", f"{(int(np.count_nonzero(mask))/self._current_ctx['total_loc']*100):.2f}%"),
             ("Note", "Preview only. Click Continue to save + advance."),
         ]
@@ -1023,9 +1026,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-"""
-I have a problem with the 3D mode. The idea is that the data is visualized in the right window and the data that is displayed changes depending on the filtering (possible to do filtering in the left window) or on ticking the box "avg etc.". When changing the data being displayed (doing one of the previous options) the zoom level and position in the plot should not change.
-THIS is working very fine in the 2D plot,. but when changing to the 3D plot the 3d point cloud disappears completely when applying a change to the data and then appears again when doing anohter change (does not matter which change is applied)
-FIX IT
-"""
