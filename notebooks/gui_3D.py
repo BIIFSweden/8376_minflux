@@ -105,67 +105,125 @@ def scatter_points_and_color(arr, avg_tid: bool):
     vals = np.array([end_to_end[tid] for tid in tids_plot], dtype=float)
     return loc_mean, vals, tids_plot
 
-
-def make_plotly_html(arr, avg_tid: bool, is3d: bool):
+def make_plotly_fig(arr, avg_tid: bool, is3d: bool):
     xyz, vals, tids_plot = scatter_points_and_color(arr, avg_tid)
-    if xyz is None:
-        return "<html><body style='font-family:sans-serif'>No data</body></html>"
 
-    x, y, z = xyz[:, 0], xyz[:, 1], xyz[:, 2]
+    # Defensive conversion to plain numeric numpy arrays
+    if xyz is None or len(xyz) == 0:
+        fig = go.Figure()
+        layout_kwargs = dict(
+            template="plotly_white",
+            margin=dict(l=0, r=0, t=20, b=0),
+            annotations=[dict(text="No data", x=0.5, y=0.5, showarrow=False)]
+        )
+        if is3d:
+            layout_kwargs["scene"] = dict(
+                aspectmode="data",
+                xaxis_title="X", yaxis_title="Y", zaxis_title="Z",
+            )
+        fig.update_layout(**layout_kwargs)
+        return fig
+
+    xyz = np.asarray(xyz, dtype=float)
+    vals = np.asarray(vals, dtype=float)
+    tids_plot = np.asarray(tids_plot)
+
+    # Ensure correct shapes
+    if xyz.ndim != 2 or xyz.shape[1] < 2:
+        fig = go.Figure()
+        fig.update_layout(
+            template="plotly_white",
+            margin=dict(l=0, r=0, t=20, b=0),
+            annotations=[dict(text=f"Bad loc shape: {xyz.shape}", x=0.5, y=0.5, showarrow=False)]
+        )
+        return fig
+
+    x = xyz[:, 0].astype(float)
+    y = xyz[:, 1].astype(float)
+    
+    # Handle z coordinate BEFORE sanitization
+    if xyz.shape[1] >= 3:
+        z = xyz[:, 2].astype(float)
+    else:
+        z = np.zeros(len(x), dtype=float)
+
+    # Sanitize data - remove non-finite values
+    if is3d:
+        finite = np.isfinite(x) & np.isfinite(y) & np.isfinite(z) & np.isfinite(vals)
+    else:
+        finite = np.isfinite(x) & np.isfinite(y) & np.isfinite(vals)
+    
+    if not np.all(finite):
+        x = x[finite]
+        y = y[finite]
+        z = z[finite]
+        vals = vals[finite]
+        tids_plot = tids_plot[finite]
+
+    # if everything got removed, show "No data"
+    if len(x) == 0:
+        fig = go.Figure()
+        layout_kwargs = dict(
+            template="plotly_white",
+            margin=dict(l=0, r=0, t=20, b=0),
+            annotations=[dict(text="No valid data after filtering", x=0.5, y=0.5, showarrow=False)]
+        )
+        if is3d:
+            layout_kwargs["scene"] = dict(
+                aspectmode="data",
+                xaxis_title="X", yaxis_title="Y", zaxis_title="Z",
+            )
+        fig.update_layout(**layout_kwargs)
+        return fig  # <-- THIS RETURN WAS MISSING!
+
+    # IMPORTANT: send plain lists to Plotly
+    xL = x.tolist()
+    yL = y.tolist()
+    zL = z.tolist()
+    cL = vals.tolist()
+
+    text = [f"tid={int(t)}<br>end2end={float(v):.3f}" for t, v in zip(tids_plot, vals)]
 
     if is3d:
         trace = go.Scatter3d(
-            x=x, y=y, z=z,
+            x=xL, y=yL, z=zL,
             mode="markers",
-            marker=dict(size=8, opacity=0.85, color=vals, colorscale="Turbo",
+            marker=dict(size=4, opacity=0.85, color=cL, colorscale="Turbo",
                         colorbar=dict(title="end-to-end")),
-            customdata=np.stack([tids_plot, vals], axis=1),
-            hovertemplate=("x=%{x:.3f}<br>y=%{y:.3f}<br>z=%{z:.3f}<br>"
-                           "tid=%{customdata[0]}<br>end2end=%{customdata[1]:.3f}"
-                           "<extra></extra>")
+            text=text,
+            hovertemplate="x=%{x:.3f}<br>y=%{y:.3f}<br>z=%{z:.3f}<br>%{text}<extra></extra>"
         )
         fig = go.Figure([trace])
         fig.update_layout(
             template="plotly_white",
             margin=dict(l=0, r=0, t=20, b=0),
-            uirevision="keep",
-            scene=dict(aspectmode="data", xaxis_title="X", yaxis_title="Y", zaxis_title="Z")
+            scene=dict(
+                aspectmode="data",
+                xaxis_title="X",
+                yaxis_title="Y",
+                zaxis_title="Z",
+            )
         )
     else:
         trace = go.Scattergl(
-            x=x, y=y,
+            x=xL, y=yL,
             mode="markers",
-            marker=dict(
-                size=8,# if avg_tid else 3,
-                opacity=0.9,# if avg_tid else 0.25,
-                color=vals,
-                colorscale="Turbo",
-                colorbar=dict(title="end-to-end"),
-            ),
-            customdata=np.stack([tids_plot, vals], axis=1),
-            hovertemplate=("x=%{x:.3f}<br>y=%{y:.3f}<br>"
-                           "tid=%{customdata[0]}<br>end2end=%{customdata[1]:.3f}"
-                           "<extra></extra>")
+            marker=dict(size=6, opacity=0.9, color=cL, colorscale="Turbo",
+                        colorbar=dict(title="end-to-end")),
+            text=text,
+            hovertemplate="x=%{x:.3f}<br>y=%{y:.3f}<br>%{text}<extra></extra>"
         )
         fig = go.Figure([trace])
         fig.update_layout(
             template="plotly_white",
             margin=dict(l=0, r=0, t=20, b=0),
             dragmode="pan",
-            uirevision="keep",
         )
+        fig.layout.margin.autoexpand = False
         fig.update_yaxes(scaleanchor="x", scaleratio=1)
-        fig.layout.margin.autoexpand=False
-
-
-    return pio.to_html(
-        fig,
-        full_html=True,
-        include_plotlyjs="cdn",   # <-- IMPORTANT
-        config={"scrollZoom": True, "displaylogo": False, "responsive": False},
-    )
-
-
+    
+    print("xyz shape:", xyz.shape, "vals shape:", vals.shape, "is3d:", is3d)
+    return fig
 # -------------------- worker --------------------
 class FileWorker(QtCore.QThread):
     need_efo = Signal(object)           # ctx dict -> GUI should show histogram + scatter and let user choose
@@ -320,13 +378,25 @@ class FileWorker(QtCore.QThread):
             ("After trace filtering", str(after_trace)),
             ("After EFO filtering", str(len(df))),
             ("Localization precision", str(loc_prec) if loc_prec is not None else "—"),
-            ("EFO range", f"{xmin:.2f} ... {xmax:.2f}"),
             ("% remaining", f"{(len(df)/total_loc*100):.2f}%"),
             ("Saved filtered CSV", save_path),
             ("Saved stats CSV", avg_save_path),
         ]
         self.status.emit(f"Saved: {base}")
         return dict(display_name=base, items=items, ctx=ctx, chosen=chosen)
+"""
+            ("File", self._current_ctx["base"]),
+            ("Total imaging time (min)", f"{self._current_ctx['total_tim']/60:.2f}"),
+            ("Total raw localizations", str(self._current_ctx["total_loc"])),
+            ("Last iteration localizations", str(self._current_ctx["last_iteration_loc"])),
+            ("After trace filtering", str(self._current_ctx["after_trace"])),
+            ("After EFO filtering", str(int(np.count_nonzero(mask)))),
+            ("Localization precision", str(lp) if lp is not None else "—"),
+            ("% remaining", f"{(int(np.count_nonzero(mask))/self._current_ctx['total_loc']*100):.2f}%"),
+            ("Note", "Preview only. Click Continue to save + advance."),
+"""
+
+
 
 
 # -------------------- main window --------------------
@@ -342,6 +412,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._current_ctx = None
         self._current_worker = None
         self._last_span = (None, None)
+        self._current_is_3d = False  # Track current plot mode
 
         # widgets
         central = QtWidgets.QWidget()
@@ -357,6 +428,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         right = QtWidgets.QVBoxLayout()
         top.addLayout(right, 2)
+
+        self._plot_arr = None          # array currently shown in scatter (may be EFO-filtered)
+        self._plot_is_filtered = False
 
         # folder rows
         self.data_edit = QtWidgets.QLineEdit()
@@ -376,7 +450,8 @@ class MainWindow(QtWidgets.QMainWindow):
         left.addLayout(grid)
 
         self._closing = False
-
+        self._plotly_loaded = False
+        self._pending_fig = None
         # params
         params_box = QtWidgets.QGroupBox("Parameters")
         left.addWidget(params_box)
@@ -422,11 +497,11 @@ class MainWindow(QtWidgets.QMainWindow):
         runrow.addWidget(self.file_combo, 1)
 
         self.avg_tid = QtWidgets.QCheckBox("avg loc (tid)")
-        self.avg_tid.stateChanged.connect(self.redraw_scatter)
+        self.avg_tid.stateChanged.connect(lambda _: self.redraw_scatter(reset_view=False))
         runrow.addWidget(self.avg_tid)
 
         self.is3d = QtWidgets.QCheckBox("3D")
-        self.is3d.stateChanged.connect(self.redraw_scatter)
+        self.is3d.stateChanged.connect(lambda _: self.redraw_scatter(reset_view=False))
         runrow.addWidget(self.is3d)
 
         self.current_lbl = QtWidgets.QLabel("Current file: —")
@@ -440,6 +515,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.out_table = QtWidgets.QTableWidget(0, 2)
         self.out_table.setHorizontalHeaderLabels(["Key", "Value"])
         self.out_table.horizontalHeader().setStretchLastSection(True)
+        self.out_table.setColumnWidth(0, 200)  # ADD THIS LINE - set first column width
         self.out_table.verticalHeader().setVisible(False)
         self.out_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         ov.addWidget(self.out_table)
@@ -469,7 +545,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.apply_btn.clicked.connect(self.apply_preview)
         ctrl.addWidget(self.apply_btn)
 
-        self.continue_btn = QtWidgets.QPushButton("Continue")
+        self.continue_btn = QtWidgets.QPushButton("Save & Continue")
         self.continue_btn.setEnabled(False)
         self.continue_btn.clicked.connect(self.continue_file)
         ctrl.addWidget(self.continue_btn)
@@ -481,17 +557,21 @@ class MainWindow(QtWidgets.QMainWindow):
         # plotly panel
         # plotly panel
         plot_box = QtWidgets.QGroupBox("Scatter plot")
-        bottom.addWidget(plot_box, 1)
+        bottom.addWidget(plot_box, 1) 
         pv = QtWidgets.QVBoxLayout(plot_box)
 
         self.web = QWebEngineView()
+        self._plotly_loaded = False
+        self._plotly_ready = False
+        self._pending_fig = None
 
+        self.web.page().loadFinished.connect(self._on_plotly_load_finished)
         # ---- debug hooks (ADD HERE) ----
         def _js_console(level, msg, line, source):
             print("JS:", msg, "line", line, "source:", source)
 
         # Note: PySide6 signature differs by version; this is a common working form:
-        self.web.page().javaScriptConsoleMessage = _js_console
+        #self.web.page().javaScriptConsoleMessage = _js_console
 
         self.web.page().loadFinished.connect(
             lambda ok: print("WEB loadFinished:", ok, "url:", self.web.url().toString())
@@ -511,6 +591,146 @@ class MainWindow(QtWidgets.QMainWindow):
         # status
         self.statusBar().showMessage("Ready.")
 
+    def _plotly_bootstrap_html(self):
+            return """<!doctype html>
+    <html>
+    <head>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+    <style>
+        html, body { margin:0; padding:0; width:100%; height:100%; overflow:hidden; }
+        #container { width:100%; height:100%; }
+        #plot { width:100%; height:100%; }
+    </style>
+    </head>
+    <body>
+    <div id="container"><div id="plot"></div></div>
+    <script>
+        window._plotState = { camera3d: null, range2d: null, currentMode: null };
+    </script>
+    </body>
+    </html>"""
+
+    def ensure_plotly_page(self):
+        if self._plotly_loaded:
+            return
+        self._plotly_loaded = True
+        self._plotly_ready = False
+        self.web.setHtml(self._plotly_bootstrap_html(), QUrl("about:blank"))
+
+    def _on_plotly_load_finished(self, ok: bool):
+        self._plotly_ready = bool(ok)
+        if ok and self._pending_fig is not None:
+            fig = self._pending_fig
+            self._pending_fig = None
+            self.update_plotly_fig(fig)
+
+    def update_plotly_fig(self, fig, reset_view=False):
+        self.ensure_plotly_page()
+
+        if not self._plotly_ready:
+            self._pending_fig = fig
+            return
+
+        target_is_3d = self.is3d.isChecked()
+        fig_json = pio.to_json(fig, validate=False)
+
+        js = f"""
+        (async function() {{
+            try {{
+                const fig = {fig_json};
+                const targetIs3D = {'true' if target_is_3d else 'false'};
+                const resetView = {'true' if reset_view else 'false'};
+                const container = document.getElementById('container');
+                let gd = document.getElementById('plot');
+                
+                if (!container || !gd) return "error: container not found";
+                
+                const state = window._plotState;
+                const modeChanged = (targetIs3D ? '3d' : '2d') !== state.currentMode;
+                
+                // If resetting view, clear saved state
+                if (resetView) {{
+                    state.range2d = null;
+                    state.camera3d = null;
+                }}
+                
+                // Save current view state (only if not resetting)
+                if (!resetView && gd._fullLayout) {{
+                    if (state.currentMode === '3d' && gd._fullLayout.scene) {{
+                        const cam = gd._fullLayout.scene.camera;
+                        if (cam) state.camera3d = JSON.parse(JSON.stringify(cam));
+                    }} else if (state.currentMode === '2d') {{
+                        const xa = gd._fullLayout.xaxis, ya = gd._fullLayout.yaxis;
+                        if (xa && xa.range && ya && ya.range) {{
+                            state.range2d = {{ xRange: [...xa.range], yRange: [...ya.range] }};
+                        }}
+                    }}
+                }}
+                
+                const config = {{ scrollZoom: true, displaylogo: false, responsive: true }};
+                
+                // If mode changed or resetting, rebuild the plot div
+                if (modeChanged || resetView || !gd.data) {{
+                    try {{ Plotly.purge(gd); }} catch(e) {{}}
+                    container.innerHTML = '<div id="plot" style="width:100%;height:100%;"></div>';
+                    gd = document.getElementById('plot');
+                    
+                    // Ensure autorange is enabled for fresh plot
+                    fig.layout = fig.layout || {{}};
+                    if (targetIs3D) {{
+                        fig.layout.scene = fig.layout.scene || {{}};
+                        fig.layout.scene.xaxis = fig.layout.scene.xaxis || {{}};
+                        fig.layout.scene.yaxis = fig.layout.scene.yaxis || {{}};
+                        fig.layout.scene.zaxis = fig.layout.scene.zaxis || {{}};
+                        fig.layout.scene.xaxis.autorange = true;
+                        fig.layout.scene.yaxis.autorange = true;
+                        fig.layout.scene.zaxis.autorange = true;
+                    }} else {{
+                        fig.layout.xaxis = fig.layout.xaxis || {{}};
+                        fig.layout.yaxis = fig.layout.yaxis || {{}};
+                        fig.layout.xaxis.autorange = true;
+                        fig.layout.yaxis.autorange = true;
+                    }}
+                    
+                    await Plotly.newPlot(gd, fig.data, fig.layout, config);
+                    state.currentMode = targetIs3D ? '3d' : '2d';
+                    return "ok (rebuilt)";
+                }}
+                
+                // Same mode: restore view state and update
+                if (targetIs3D) {{
+                    // For 3D: restore camera
+                    if (state.camera3d) {{
+                        fig.layout = fig.layout || {{}};
+                        fig.layout.scene = fig.layout.scene || {{}};
+                        fig.layout.scene.camera = state.camera3d;
+                    }}
+                    await Plotly.react(gd, fig.data, fig.layout, config);
+                }} else {{
+                    // For 2D: restore ranges
+                    if (state.range2d) {{
+                        fig.layout = fig.layout || {{}};
+                        fig.layout.xaxis = fig.layout.xaxis || {{}};
+                        fig.layout.yaxis = fig.layout.yaxis || {{}};
+                        fig.layout.xaxis.range = state.range2d.xRange;
+                        fig.layout.xaxis.autorange = false;
+                        fig.layout.yaxis.range = state.range2d.yRange;
+                        fig.layout.yaxis.autorange = false;
+                    }}
+                    await Plotly.react(gd, fig.data, fig.layout, config);
+                }}
+                
+                return "ok";
+            }} catch (e) {{
+                console.error("Plotly update failed:", e);
+                return "error: " + e.toString();
+            }}
+        }})();
+        """
+
+        self.web.page().runJavaScript(js, lambda ret: print("Plotly:", ret))
     # ---------------- UI actions ----------------
     def browse_folder(self):
         path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select MINFLUX data folder")
@@ -528,19 +748,22 @@ class MainWindow(QtWidgets.QMainWindow):
         print("closeEvent called")
         self._closing = True
 
-        # stop/cancel any running workers
+        # stop/cancel any running workers - with safe check
         try:
             if self._current_worker is not None and self._current_worker.isRunning():
                 self._current_worker.cancel()
-        except Exception:
-            pass
+        except RuntimeError:
+            # C++ object already deleted
+            self._current_worker = None
 
         # give Qt/WebEngine a moment to shut down cleanly, then hard-exit
         event.ignore()
         QtCore.QTimer.singleShot(1500, lambda: os._exit(0))
-        return
         
-        
+    def _on_worker_finished(self, worker):
+        """Clean up worker reference when it finishes."""
+        if self._current_worker is worker:
+            self._current_worker = None    
 
     def show_plotly(self, html: str):
         if self._plotly_tmp is None:
@@ -581,9 +804,23 @@ class MainWindow(QtWidgets.QMainWindow):
         if idx < 0 or idx >= len(self._all_files):
             return
 
-        if self._current_worker is not None and self._current_worker.isRunning():
+        # Safe check - worker might be deleted
+        try:
+            worker_running = (
+                self._current_worker is not None 
+                and self._current_worker.isRunning()
+            )
+        except RuntimeError:
+            # C++ object deleted
+            self._current_worker = None
+            worker_running = False
+
+        if worker_running:
             self._current_worker.cancel()
-            return  # don't switch files while a worker is still running
+            # Wait for current worker to finish before switching
+            # Optionally queue the switch for after cancellation completes
+            return
+        
         self._current_index = idx
         self.current_lbl.setText(f"Current file: {self.file_combo.currentText()}")
 
@@ -635,7 +872,10 @@ class MainWindow(QtWidgets.QMainWindow):
         w = FileWorker(f, params, parent=self)
 
         self._workers.add(w)
+        
+        # Clean up references properly
         w.finished.connect(lambda: self._workers.discard(w))
+        w.finished.connect(lambda: self._on_worker_finished(w))  # ADD THIS LINE
         w.finished.connect(w.deleteLater)
 
         w.need_efo.connect(self.on_need_efo)
@@ -647,6 +887,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---------------- EFO selection ----------------
     def on_need_efo(self, ctx):
+        self._plot_arr = ctx["arr"]          # start from trace-filtered data
+        self._plot_is_filtered = False
         self._current_ctx = ctx
         efo_vals = np.asarray(ctx["efo_vals"])
         base = ctx["base"]
@@ -682,15 +924,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.apply_btn.setEnabled(True)
         self.continue_btn.setEnabled(False)
 
-        # initial scatter
-        self.redraw_scatter()
+        # initial scatter - reset view for new file
+        self.redraw_scatter(reset_view=True)
 
-    def redraw_scatter(self):
+    def redraw_scatter(self, reset_view=False):
         if self._current_ctx is None:
             return
-        arr = self._current_ctx["arr"]
-        html = make_plotly_html(arr, self.avg_tid.isChecked(), self.is3d.isChecked())
-        self.show_plotly(html)
+        if self._plot_arr is None:
+            self._plot_arr = self._current_ctx["arr"]
+            self._plot_is_filtered = False
+
+        fig = make_plotly_fig(self._plot_arr, self.avg_tid.isChecked(), self.is3d.isChecked())
+        self.update_plotly_fig(fig, reset_view=reset_view)
 
     def apply_preview(self):
         if self._current_ctx is None:
@@ -700,9 +945,13 @@ class MainWindow(QtWidgets.QMainWindow):
         mask = (arr["efo"] >= xmin) & (arr["efo"] <= xmax)
         arr_efo = arr[mask]
 
+        # store as current plot data
+        self._plot_arr = arr_efo
+        self._plot_is_filtered = True
+
         # update scatter
-        html = make_plotly_html(arr_efo, self.avg_tid.isChecked(), self.is3d.isChecked())
-        self.show_plotly(html)
+        fig = make_plotly_fig(arr_efo, self.avg_tid.isChecked(), self.is3d.isChecked())
+        self.update_plotly_fig(fig)
 
         # preview localization precision
         lp = preview_localization_precision(arr_efo)
@@ -716,7 +965,6 @@ class MainWindow(QtWidgets.QMainWindow):
             ("After trace filtering", str(self._current_ctx["after_trace"])),
             ("After EFO filtering", str(int(np.count_nonzero(mask)))),
             ("Localization precision", str(lp) if lp is not None else "—"),
-            ("EFO range (preview)", f"{xmin:.2f} ... {xmax:.2f}"),
             ("% remaining", f"{(int(np.count_nonzero(mask))/self._current_ctx['total_loc']*100):.2f}%"),
             ("Note", "Preview only. Click Continue to save + advance."),
         ]
@@ -748,19 +996,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # advance to next file
         self._current_index += 1
+        
+        # Loop back to first file when reaching the end
         if self._current_index >= len(self._all_files):
-            self.statusBar().showMessage("Done.")
-            self.run_btn.setEnabled(True)
-            self.apply_btn.setEnabled(False)
-            self.continue_btn.setEnabled(False)
-            return
+            self._current_index = 0
+            self.statusBar().showMessage("Reached end of list. Looping back to first file.")
 
+        # Update combo box and label
         self.file_combo.blockSignals(True)
         self.file_combo.setCurrentIndex(self._current_index)
         self.file_combo.blockSignals(False)
         self.current_lbl.setText(f"Current file: {self.file_combo.currentText()}")
+        
         self.start_worker_for_current()
-
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
@@ -775,3 +1023,9 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+"""
+I have a problem with the 3D mode. The idea is that the data is visualized in the right window and the data that is displayed changes depending on the filtering (possible to do filtering in the left window) or on ticking the box "avg etc.". When changing the data being displayed (doing one of the previous options) the zoom level and position in the plot should not change.
+THIS is working very fine in the 2D plot,. but when changing to the 3D plot the 3d point cloud disappears completely when applying a change to the data and then appears again when doing anohter change (does not matter which change is applied)
+FIX IT
+"""
