@@ -18,10 +18,10 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
 from matplotlib.widgets import SpanSelector
-
+from PySide6.QtWebChannel import QWebChannel
 import plotly.graph_objects as go
 import plotly.io as pio
-
+import json
 
 # -------------------- helpers --------------------
 def save_to_csv(df, save_path):
@@ -44,6 +44,14 @@ def np_to_df(np_data):
             df = pd.concat([df.drop(column, axis=1), split_data], axis=1)
     return df
 
+def _camera_slim(cam: dict) -> dict:
+    if not isinstance(cam, dict):
+        return cam
+    out = {}
+    for k in ("eye", "up", "center", "projection"):
+        if k in cam:
+            out[k] = cam[k]
+    return out
 
 def preview_localization_precision(arr):
     if arr is None or len(arr) == 0:
@@ -118,7 +126,7 @@ def make_plotly_fig(arr, avg_tid: bool, is3d: bool):
         )
         if is3d:
             layout_kwargs["scene"] = dict(
-                aspectmode="data",
+                aspectmode="data",      # aspect mo
                 xaxis_title="X", yaxis_title="Y", zaxis_title="Z",
             )
         fig.update_layout(**layout_kwargs)
@@ -198,7 +206,7 @@ def make_plotly_fig(arr, avg_tid: bool, is3d: bool):
             template="plotly_white",
             margin=dict(l=0, r=0, t=20, b=0),
             scene=dict(
-                aspectmode="data",
+                aspectmode="data",      # or "cube"
                 xaxis_title="X",
                 yaxis_title="Y",
                 zaxis_title="Z",
@@ -224,6 +232,369 @@ def make_plotly_fig(arr, avg_tid: bool, is3d: bool):
     
     print("xyz shape:", xyz.shape, "vals shape:", vals.shape, "is3d:", is3d)
     return fig
+
+class PlotSyncBridge(QtCore.QObject):
+    viewChanged = Signal(str, object)  # (source_id, payload dict)
+
+    @QtCore.Slot(str, "QVariant")
+    def relayView(self, source_id, payload):
+        # payload is a dict like {"mode":"2d","xRange":[...],"yRange":[...]} or {"mode":"3d","camera":{...}}
+        self.viewChanged.emit(source_id, payload)
+
+
+class MultiColorWindow(QtWidgets.QMainWindow):
+    def __init__(self, on_view_changed, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Multicolor (all files)")
+        self.resize(1200, 700)
+        self._on_view_changed = on_view_changed
+        central = QtWidgets.QWidget()
+        self.setCentralWidget(central)
+
+        self.grid = QtWidgets.QGridLayout(central)
+        self.grid.setContentsMargins(6, 6, 6, 6)
+        self.grid.setSpacing(6)
+
+        self._views = {}  # base -> PlotlyView
+        self._labels = {} # base -> QLabel
+
+    def rebuild(self, base_names):
+        # clear grid
+        while self.grid.count():
+            item = self.grid.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+
+        self._views.clear()
+        self._labels.clear()
+
+        n = max(1, len(base_names))
+        cols = 2 if n <= 4 else 3  # simple layout rule; adjust as you like
+        r = c = 0
+
+        for base in base_names:
+            box = QtWidgets.QGroupBox(base)
+            vbox = QtWidgets.QVBoxLayout(box)
+            vbox.setContentsMargins(4, 8, 4, 4)
+
+            view = PlotlyView()
+            view.viewChanged.connect(self._on_view_changed)
+            vbox.addWidget(view, 1)
+
+            self._views[base] = view
+            self.grid.addWidget(box, r, c)
+
+            c += 1
+            if c >= cols:
+                c = 0
+                r += 1
+
+    def update_one(self, base, fig, reset_view=False, is3d=False):
+        view = self._views.get(base)
+        if view is None:
+            return
+        view.update_fig(fig, reset_view=reset_view, is3d=is3d)
+
+    def update_all(self, figs_by_base, reset_view=False, is3d=False):
+        for base, fig in figs_by_base.items():
+            self.update_one(base, fig, reset_view=reset_view, is3d=is3d)
+
+
+class PlotSyncBridge(QtCore.QObject):
+    viewChanged = Signal(str, object)  # (source_id, payload dict)
+
+    @QtCore.Slot(str, "QVariant")
+    def relayView(self, source_id, payload):
+        self.viewChanged.emit(source_id, payload)
+
+
+class PlotlyView(QtWidgets.QWidget):
+    """Widget hosting Plotly in a QWebEngineView + emits view changes."""
+    viewChanged = Signal(str, object)  # (source_id, payload)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+
+        self.web = QWebEngineView(self)
+        lay.addWidget(self.web)
+
+        s = self.web.settings()
+        s.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
+        s.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+        s.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
+
+        self._plotly_loaded = False
+        self._plotly_ready = False
+        self._pending_fig = None
+        self._id = hex(id(self))
+
+        # WebChannel bridge
+        self._bridge = PlotSyncBridge()
+        self._bridge.viewChanged.connect(self.viewChanged.emit)
+
+        self._channel = QWebChannel(self.web.page())
+        self._channel.registerObject("plotSync", self._bridge)
+        self.web.page().setWebChannel(self._channel)
+
+        self.web.page().loadFinished.connect(self._on_load_finished)
+
+    def _bootstrap_html(self):
+        return """<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+<script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+<style>
+html, body { margin:0; padding:0; width:100%; height:100%; overflow:hidden; }
+#container { width:100%; height:100%; }
+#plot { width:100%; height:100%; }
+</style>
+</head>
+<body>
+<div id="container"><div id="plot"></div></div>
+
+<script>
+window._plotSync = { ready:false, bridge:null, sourceId:null, ignore:false };
+
+new QWebChannel(qt.webChannelTransport, function(channel) {
+  window._plotSync.bridge = channel.objects.plotSync;
+  window._plotSync.ready = true;
+});
+
+function installRelayoutHandler() {
+  const gd = document.getElementById('plot');
+  if (!gd) return;
+
+  // Avoid multiple handlers if we rebuild/react
+  if (gd.removeAllListeners) gd.removeAllListeners('plotly_relayout');
+
+    let _lastSent = 0;
+    let _timer = null;
+    let _pending = null;
+
+    function buildPayload(gd) {
+    const is3d = !!(gd._fullLayout && gd._fullLayout.scene);
+    const payload = { mode: is3d ? "3d" : "2d" };
+
+    if (is3d) {
+        const cam = gd._fullLayout.scene && gd._fullLayout.scene.camera;
+        if (cam) payload.camera = cam;
+    } else {
+        const xa = gd._fullLayout.xaxis, ya = gd._fullLayout.yaxis;
+        if (xa && xa.range && ya && ya.range) {
+        payload.xRange = xa.range;
+        payload.yRange = ya.range;
+        }
+    }
+    return payload;
+    }
+
+    function maybeSend() {
+    _timer = null;
+    if (!_pending) return;
+    if (window._plotSync.ignore) { _pending = null; return; }
+
+    const payload = _pending;
+    _pending = null;
+
+    if (window._plotSync.ready && window._plotSync.bridge) {
+        window._plotSync.bridge.relayView(window._plotSync.sourceId || "unknown", payload);
+    }
+    }
+
+    gd.on('plotly_relayout', function(e) {
+    try {
+        if (window._plotSync.ignore) return;
+
+        const now = Date.now();
+        _pending = buildPayload(gd);
+
+        // throttle to ~40ms (25fps). adjust if you like.
+        const minInterval = 40;
+        const dt = now - _lastSent;
+
+        if (dt >= minInterval) {
+        _lastSent = now;
+        maybeSend();
+        } else {
+        if (_timer) clearTimeout(_timer);
+        _timer = setTimeout(() => {
+            _lastSent = Date.now();
+            maybeSend();
+        }, minInterval - dt);
+        }
+    } catch(err) {
+        console.log("relayout hook error", err);
+    }
+    });
+}
+</script>
+</body>
+</html>"""
+
+    def ensure_page(self):
+        if self._plotly_loaded:
+            return
+        self._plotly_loaded = True
+        self._plotly_ready = False
+        self.web.setHtml(self._bootstrap_html(), QUrl("about:blank"))
+
+    def _on_load_finished(self, ok: bool):
+        self._plotly_ready = bool(ok)
+        if ok and self._pending_fig is not None:
+            fig, reset_view, is3d = self._pending_fig
+            self._pending_fig = None
+            self.update_fig(fig, reset_view=reset_view, is3d=is3d)
+
+    def update_fig(self, fig, reset_view=False, is3d=False):
+        self.ensure_page()
+        if not self._plotly_ready:
+            self._pending_fig = (fig, reset_view, is3d)
+            return
+
+        fig_json = pio.to_json(fig, validate=False)
+        source_id = self._id
+
+        js = f"""
+    (async function() {{
+    try {{
+        const fig = {fig_json};
+        const targetIs3D = {'true' if is3d else 'false'};
+        const resetView = {'true' if reset_view else 'false'};
+
+        const container = document.getElementById('container');
+        let gd = document.getElementById('plot');
+        if (!container || !gd) return "error: container missing";
+
+        // --- capture current view from existing plot (if any) ---
+        let saved = null;
+        if (!resetView && gd._fullLayout) {{
+        const is3dNow = !!(gd._fullLayout.scene);
+        if (is3dNow) {{
+            const cam = gd._fullLayout.scene && gd._fullLayout.scene.camera;
+            if (cam) saved = {{ mode: "3d", camera: cam }};
+        }} else {{
+            const xa = gd._fullLayout.xaxis, ya = gd._fullLayout.yaxis;
+            if (xa && xa.range && ya && ya.range) {{
+            saved = {{ mode: "2d", xRange: xa.range, yRange: ya.range }};
+            }}
+        }}
+        }}
+
+        // Decide if we must rebuild (switch 2d<->3d or no plot yet)
+        const currently3D = !!(gd._fullLayout && gd._fullLayout.scene);
+        const modeChanged = (targetIs3D !== currently3D);
+
+        const config = {{ scrollZoom: true, displaylogo: false, responsive: true }};
+
+        // Prevent relayout events from being broadcast while we update
+        window._plotSync.sourceId = "{source_id}";
+        window._plotSync.ignore = true;
+
+        if (modeChanged || !gd.data) {{
+        try {{ Plotly.purge(gd); }} catch(e) {{}}
+        container.innerHTML = '<div id="plot" style="width:100%;height:100%;"></div>';
+        gd = document.getElementById('plot');
+        }}
+
+        // Ensure layout objects exist
+        fig.layout = fig.layout || {{}};
+
+        // --- re-apply saved view onto new layout (if compatible) ---
+        if (saved && saved.mode === "2d" && !targetIs3D) {{
+        fig.layout.xaxis = fig.layout.xaxis || {{}};
+        fig.layout.yaxis = fig.layout.yaxis || {{}};
+        fig.layout.xaxis.range = saved.xRange;
+        fig.layout.yaxis.range = saved.yRange;
+        fig.layout.xaxis.autorange = false;
+        fig.layout.yaxis.autorange = false;
+        }} else if (saved && saved.mode === "3d" && targetIs3D) {{
+        fig.layout.scene = fig.layout.scene || {{}};
+        fig.layout.scene.camera = saved.camera;
+        }} else {{
+        // If no saved view or incompatible (2d<->3d switch), allow autorange
+        if (targetIs3D) {{
+            fig.layout.scene = fig.layout.scene || {{}};
+            fig.layout.scene.xaxis = fig.layout.scene.xaxis || {{}};
+            fig.layout.scene.yaxis = fig.layout.scene.yaxis || {{}};
+            fig.layout.scene.zaxis = fig.layout.scene.zaxis || {{}};
+            fig.layout.scene.xaxis.autorange = true;
+            fig.layout.scene.yaxis.autorange = true;
+            fig.layout.scene.zaxis.autorange = true;
+        }} else {{
+            fig.layout.xaxis = fig.layout.xaxis || {{}};
+            fig.layout.yaxis = fig.layout.yaxis || {{}};
+            fig.layout.xaxis.autorange = true;
+            fig.layout.yaxis.autorange = true;
+        }}
+        }}
+
+        // Plot
+        if (modeChanged || !gd.data) {{
+        await Plotly.newPlot(gd, fig.data, fig.layout, config);
+        }} else {{
+        await Plotly.react(gd, fig.data, fig.layout, config);
+        }}
+
+        // Install relayout handler after plot exists
+        installRelayoutHandler();
+
+        // Re-enable broadcasting (next tick so Plotly internal relayouts won't echo)
+        setTimeout(() => {{ window._plotSync.ignore = false; }}, 60);
+
+        return "ok";
+    }} catch(e) {{
+        console.error(e);
+        try {{ window._plotSync.ignore = false; }} catch(_) {{}}
+        return "error: " + e.toString();
+    }}
+    }})();
+    """
+        self.web.page().runJavaScript(js)
+
+    def apply_view(self, payload: dict):
+        """Apply external view state to this plot (ranges/camera) without re-broadcast."""
+        self.ensure_page()
+        if not self._plotly_ready:
+            return
+
+        payload_json = json.dumps(payload)
+        js = f"""
+(function() {{
+  const gd = document.getElementById('plot');
+  if (!gd || !gd._fullLayout) return "no gd";
+
+  const p = {payload_json};
+  window._plotSync.ignore = true;
+  try {{
+    if (p.mode === "2d" && p.xRange && p.yRange) {{
+      Plotly.relayout(gd, {{
+        "xaxis.range": p.xRange,
+        "yaxis.range": p.yRange,
+        "xaxis.autorange": false,
+        "yaxis.autorange": false
+      }});
+    }} else if (p.mode === "3d" && p.camera) {{
+      Plotly.relayout(gd, {{
+        "scene.camera": p.camera
+      }});
+    }}
+  }} finally {{
+    const delay = (p.mode === "3d") ? 50 : 10;
+    setTimeout(() => {{ window._plotSync.ignore = false; }}, delay);
+  }}
+  return "applied";
+}})();
+"""
+        self.web.page().runJavaScript(js)
+
+
 # -------------------- worker --------------------
 class FileWorker(QtCore.QThread):
     need_efo = Signal(object)           # ctx dict -> GUI should show histogram + scatter and let user choose
@@ -401,7 +772,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._current_worker = None
         self._last_span = (None, None)
         self._current_is_3d = False  # Track current plot mode
-
+        self._arr_by_base = {}        # base -> currently active array for plotting (trace-filtered or EFO-filtered)
+        self._base_by_file = {}       # file_path -> base (optional convenience)
+        self._multicolor_win = None
         # widgets
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -493,14 +866,17 @@ class MainWindow(QtWidgets.QMainWindow):
         current_row = QtWidgets.QHBoxLayout()
         current_row.addWidget(self.current_lbl, 1)
 
+        self.multi_btn = QtWidgets.QPushButton("multicolor")
+        self.multi_btn.clicked.connect(self.open_multicolor)
+        current_row.addWidget(self.multi_btn)   # <-- between label and checkboxes
+
         self.avg_tid = QtWidgets.QCheckBox("avg loc (tid)")
-        self.avg_tid.stateChanged.connect(lambda _: self.redraw_scatter(reset_view=False))
+        self.avg_tid.stateChanged.connect(lambda _: self._refresh_all_plots_same_data())
         current_row.addWidget(self.avg_tid)
 
         self.is3d = QtWidgets.QCheckBox("3D")
-        self.is3d.stateChanged.connect(lambda _: self.redraw_scatter(reset_view=False))
+        self.is3d.stateChanged.connect(lambda _: self._refresh_all_plots_same_data())
         current_row.addWidget(self.is3d)
-
         left.addLayout(current_row)
 
         # output table
@@ -561,35 +937,9 @@ class MainWindow(QtWidgets.QMainWindow):
         plot_box = QtWidgets.QGroupBox("Scatter plot")
         bottom.addWidget(plot_box, 1) 
         pv = QtWidgets.QVBoxLayout(plot_box)
-
-        self.web = QWebEngineView()
-        self._plotly_loaded = False
-        self._plotly_ready = False
-        self._pending_fig = None
-
-        self.web.page().loadFinished.connect(self._on_plotly_load_finished)
-        # ---- debug hooks (ADD HERE) ----
-        def _js_console(level, msg, line, source):
-            print("JS:", msg, "line", line, "source:", source)
-
-        # Note: PySide6 signature differs by version; this is a common working form:
-        #self.web.page().javaScriptConsoleMessage = _js_console
-
-        self.web.page().loadFinished.connect(
-            lambda ok: print("WEB loadFinished:", ok, "url:", self.web.url().toString())
-        )
-
-        self.web.page().renderProcessTerminated.connect(
-            lambda status, code: print("WebEngine crashed:", status, code)
-        )
-        # -------------------------------
-
-        s = self.web.settings()
-        s.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
-        s.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
-        s.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
-
-        pv.addWidget(self.web)
+        self.plot_view = PlotlyView()
+        self.plot_view.viewChanged.connect(self.on_any_plot_view_changed)
+        pv.addWidget(self.plot_view)
         # status
         self.statusBar().showMessage("Ready.")
 
@@ -628,111 +978,68 @@ class MainWindow(QtWidgets.QMainWindow):
             self._pending_fig = None
             self.update_plotly_fig(fig)
 
-    def update_plotly_fig(self, fig, reset_view=False):
-        self.ensure_plotly_page()
-
-        if not self._plotly_ready:
-            self._pending_fig = fig
+    def _refresh_all_plots_same_data(self):
+        self.redraw_scatter(reset_view=False)
+        if self._multicolor_win is None or not self._multicolor_win.isVisible():
             return
+        for f in self._all_files:
+            base = os.path.splitext(os.path.basename(f))[0]
+            self._multicolor_update_base(base, reset_view=False)
 
-        target_is_3d = self.is3d.isChecked()
-        fig_json = pio.to_json(fig, validate=False)
+    def open_multicolor(self):
+        if self._multicolor_win is None:
+            self._multicolor_win = MultiColorWindow(self.on_any_plot_view_changed, self)
+        # Build base list from files
+        bases = [os.path.splitext(os.path.basename(f))[0] for f in self._all_files]
+        self._multicolor_win.rebuild(bases)
 
-        js = f"""
-        (async function() {{
-            try {{
-                const fig = {fig_json};
-                const targetIs3D = {'true' if target_is_3d else 'false'};
-                const resetView = {'true' if reset_view else 'false'};
-                const container = document.getElementById('container');
-                let gd = document.getElementById('plot');
-                
-                if (!container || !gd) return "error: container not found";
-                
-                const state = window._plotState;
-                const modeChanged = (targetIs3D ? '3d' : '2d') !== state.currentMode;
-                
-                // If resetting view, clear saved state
-                if (resetView) {{
-                    state.range2d = null;
-                    state.camera3d = null;
-                }}
-                
-                // Save current view state (only if not resetting)
-                if (!resetView && gd._fullLayout) {{
-                    if (state.currentMode === '3d' && gd._fullLayout.scene) {{
-                        const cam = gd._fullLayout.scene.camera;
-                        if (cam) state.camera3d = JSON.parse(JSON.stringify(cam));
-                    }} else if (state.currentMode === '2d') {{
-                        const xa = gd._fullLayout.xaxis, ya = gd._fullLayout.yaxis;
-                        if (xa && xa.range && ya && ya.range) {{
-                            state.range2d = {{ xRange: [...xa.range], yRange: [...ya.range] }};
-                        }}
-                    }}
-                }}
-                
-                const config = {{ scrollZoom: true, displaylogo: false, responsive: true }};
-                
-                // If mode changed or resetting, rebuild the plot div
-                if (modeChanged || resetView || !gd.data) {{
-                    try {{ Plotly.purge(gd); }} catch(e) {{}}
-                    container.innerHTML = '<div id="plot" style="width:100%;height:100%;"></div>';
-                    gd = document.getElementById('plot');
-                    
-                    // Ensure autorange is enabled for fresh plot
-                    fig.layout = fig.layout || {{}};
-                    if (targetIs3D) {{
-                        fig.layout.scene = fig.layout.scene || {{}};
-                        fig.layout.scene.xaxis = fig.layout.scene.xaxis || {{}};
-                        fig.layout.scene.yaxis = fig.layout.scene.yaxis || {{}};
-                        fig.layout.scene.zaxis = fig.layout.scene.zaxis || {{}};
-                        fig.layout.scene.xaxis.autorange = true;
-                        fig.layout.scene.yaxis.autorange = true;
-                        fig.layout.scene.zaxis.autorange = true;
-                    }} else {{
-                        fig.layout.xaxis = fig.layout.xaxis || {{}};
-                        fig.layout.yaxis = fig.layout.yaxis || {{}};
-                        fig.layout.xaxis.autorange = true;
-                        fig.layout.yaxis.autorange = true;
-                    }}
-                    
-                    await Plotly.newPlot(gd, fig.data, fig.layout, config);
-                    state.currentMode = targetIs3D ? '3d' : '2d';
-                    return "ok (rebuilt)";
-                }}
-                
-                // Same mode: restore view state and update
-                if (targetIs3D) {{
-                    // For 3D: restore camera
-                    if (state.camera3d) {{
-                        fig.layout = fig.layout || {{}};
-                        fig.layout.scene = fig.layout.scene || {{}};
-                        fig.layout.scene.camera = state.camera3d;
-                    }}
-                    await Plotly.react(gd, fig.data, fig.layout, config);
-                }} else {{
-                    // For 2D: restore ranges
-                    if (state.range2d) {{
-                        fig.layout = fig.layout || {{}};
-                        fig.layout.xaxis = fig.layout.xaxis || {{}};
-                        fig.layout.yaxis = fig.layout.yaxis || {{}};
-                        fig.layout.xaxis.range = state.range2d.xRange;
-                        fig.layout.xaxis.autorange = false;
-                        fig.layout.yaxis.range = state.range2d.yRange;
-                        fig.layout.yaxis.autorange = false;
-                    }}
-                    await Plotly.react(gd, fig.data, fig.layout, config);
-                }}
-                
-                return "ok";
-            }} catch (e) {{
-                console.error("Plotly update failed:", e);
-                return "error: " + e.toString();
-            }}
-        }})();
-        """
+        # Push whatever we currently have in memory
+        figs = {}
+        for f in self._all_files:
+            base = os.path.splitext(os.path.basename(f))[0]
+            arr = self._arr_by_base.get(base)
+            if arr is None:
+                continue
+            figs[base] = make_plotly_fig(arr, self.avg_tid.isChecked(), self.is3d.isChecked())
 
-        self.web.page().runJavaScript(js, lambda ret: print("Plotly:", ret))
+        self._multicolor_win.update_all(figs, reset_view=True, is3d=self.is3d.isChecked())
+        self._multicolor_win.show()
+        self._multicolor_win.raise_()
+        self._multicolor_win.activateWindow()
+    
+    def on_any_plot_view_changed(self, source_id, payload):
+        # Slim camera to reduce weirdness/jitter
+        if isinstance(payload, dict) and payload.get("mode") == "3d" and "camera" in payload:
+            payload = dict(payload)
+            payload["camera"] = _camera_slim(payload["camera"])
+
+        if hasattr(self, "plot_view") and self.plot_view._id != source_id:
+            self.plot_view.apply_view(payload)
+
+        if self._multicolor_win is not None and self._multicolor_win.isVisible():
+            for base, view in self._multicolor_win._views.items():
+                if view._id == source_id:
+                    continue
+                view.apply_view(payload)
+
+    def _multicolor_update_base(self, base, reset_view=False):
+        if self._multicolor_win is None or not self._multicolor_win.isVisible():
+            return
+        arr = self._arr_by_base.get(base)
+        if arr is None:
+            return
+        fig = make_plotly_fig(arr, self.avg_tid.isChecked(), self.is3d.isChecked())
+        self._multicolor_win.update_one(base, fig, reset_view=reset_view, is3d=self.is3d.isChecked())
+
+    def _multicolor_rebuild_if_open(self):
+        if self._multicolor_win is None or not self._multicolor_win.isVisible():
+            return
+        bases = [os.path.splitext(os.path.basename(f))[0] for f in self._all_files]
+        self._multicolor_win.rebuild(bases)
+
+    def update_plotly_fig(self, fig, reset_view=False):
+        self.plot_view.update_fig(fig, reset_view=reset_view, is3d=self.is3d.isChecked())
+
     # ---------------- UI actions ----------------
     def browse_folder(self):
         path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select MINFLUX data folder")
@@ -792,6 +1099,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for f in self._all_files:
             self.file_combo.addItem(os.path.relpath(f, data_path))
         self.file_combo.blockSignals(False)
+        self._multicolor_rebuild_if_open()
 
         self._current_index = 0 if self._all_files else -1
         if self._all_files:
@@ -929,6 +1237,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # initial scatter - reset view for new file
         self.redraw_scatter(reset_view=True)
 
+        base = ctx["base"]
+        self._arr_by_base[base] = ctx["arr"]  # trace-filtered (initial)
+        self._multicolor_update_base(base, reset_view=True)
+
     def redraw_scatter(self, reset_view=False):
         if self._current_ctx is None:
             return
@@ -947,6 +1259,9 @@ class MainWindow(QtWidgets.QMainWindow):
         mask = (arr["efo"] >= xmin) & (arr["efo"] <= xmax)
         arr_efo = arr[mask]
 
+        base = self._current_ctx["base"]
+        self._arr_by_base[base] = arr_efo  # now filtered
+        self._multicolor_update_base(base, reset_view=False)
         # store as current plot data
         self._plot_arr = arr_efo
         self._plot_is_filtered = True
