@@ -10,7 +10,14 @@ Meeting on 2025-10-17 with the Advanced Light Microscopy facility at SciLifeLab,
 - Clone this repository
 - Install environment with conda env create -f environment.yml
 
-## Usage
+## ToDos
+
+- Settings button to change histogram bin size and scale factor to go from meters to nm
+
+## Bugs pyflux
+
+- js: Canvas2D: Multiple readback operations using getImageData are faster with the willReadFrequently attribute set to true. See: https://html.spec.whatwg.org/multipage/canvas.html#concept-canvas-will-read-frequently
+- js: Uncaught TypeError: Cannot read properties of undefined (reading 'setViewport') sometimes shows up when zooming
 
 ## License
 
