@@ -1,56 +1,104 @@
 name: Build desktop apps
 
 on:
-  # Lets you run it manually from the Actions tab (good for testing)
   workflow_dispatch:
-
-  # Automatically build when you push a version tag (v1.0.0, v1.2.3, ...)
   push:
     tags:
       - "v*.*.*"
 
 permissions:
-  contents: write  # required to create a Release + upload release assets
+  contents: write
 
 jobs:
-  build:
-    name: Build (${{ matrix.os }} / ${{ matrix.arch }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Windows 64-bit
-          - os: windows-latest
-            arch: x64
-            icon: assets/appicon.ico
-            target_arch: ""   # (not used on Windows here)
-
-          - os: macos-latest
-            arch: x86_64
-            icon: assets/appicon.icns
-            target_arch: x86_64
-
-          - os: macos-latest
-            arch: arm64
-            icon: assets/appicon.icns
-            target_arch: arm64
-
-    runs-on: ${{ matrix.os }}
-
+  windows_x64:
+    name: Build Windows x64
+    runs-on: windows-latest
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Compute version label
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: "x64"
+
+      - name: Install dependencies
         shell: bash
         run: |
-          # If this run is triggered by a tag (v1.0.0), use that version.
-          # Otherwise use a dev version label.
-          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            echo "APP_VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_ENV
-          else
-            echo "APP_VERSION=dev-${GITHUB_SHA::7}" >> $GITHUB_ENV
-          fi
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build (Windows)
+        shell: powershell
+        run: |
+          pyinstaller --clean --noconfirm --windowed `
+            --name "pyflux" `
+            --icon "assets/appicon.ico" `
+            src/pyflux/main.py
+
+      - name: Zip
+        shell: powershell
+        run: |
+          cd dist
+          $zipName = "pyflux-windows-x64.zip"
+          Compress-Archive -Path "pyflux" -DestinationPath $zipName
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pyflux-windows-x64
+          path: dist/pyflux-windows-x64.zip
+
+  macos_x86_64:
+    name: Build macOS x86_64 (Intel)
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python (Intel)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: "x64"
+
+      - name: Create Intel venv + install deps (x86_64)
+        shell: bash
+        run: |
+          arch -x86_64 python -m venv .venv-x86_64
+          source .venv-x86_64/bin/activate
+
+          arch -x86_64 python -m pip install --upgrade pip
+          arch -x86_64 pip install -r requirements.txt
+          arch -x86_64 pip install pyinstaller
+
+          arch -x86_64 python -c "import platform; print('python arch:', platform.machine())"
+
+      - name: Build (x86_64)
+        shell: bash
+        run: |
+          source .venv-x86_64/bin/activate
+          arch -x86_64 pyinstaller --clean --noconfirm --windowed \
+            --target-architecture x86_64 \
+            --name "pyflux" \
+            --icon "assets/appicon.icns" \
+            src/pyflux/main.py
+
+      - name: Zip
+        shell: bash
+        run: |
+          cd dist
+          ditto -c -k --sequesterRsrc --keepParent "pyflux.app" "pyflux-macos-x86_64.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pyflux-macos-x86_64
+          path: dist/pyflux-macos-x86_64.zip
+
+  macos_arm64:
+    name: Build macOS arm64
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -63,58 +111,35 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller
+          python -c "import platform; print('python arch:', platform.machine())"
 
-      - name: Build (macOS)
-        if: startsWith(matrix.os, 'macos')
+      - name: Build (arm64)
         shell: bash
         run: |
           pyinstaller --clean --noconfirm --windowed \
-            --target-architecture ${{ matrix.target_arch }} \
+            --target-architecture arm64 \
             --name "pyflux" \
-            --icon "${{ matrix.icon }}" \
+            --icon "assets/appicon.icns" \
             src/pyflux/main.py
 
-      - name: Build (Windows)
-        if: startsWith(matrix.os, 'windows')
-        shell: powershell
-        run: |
-          pyinstaller --clean --noconfirm --windowed `
-            --name "pyflux" `
-            --icon "${{ matrix.icon }}" `
-            src/pyflux/main.py
-
-      - name: Package ZIP (macOS)
-        if: startsWith(matrix.os, 'macos')
+      - name: Zip
         shell: bash
         run: |
           cd dist
-          ZIPNAME="pyflux-${APP_VERSION}-macos-${{ matrix.arch }}.zip"
-          ditto -c -k --sequesterRsrc --keepParent "pyflux.app" "$ZIPNAME"
-          echo "ASSET_PATH=dist/$ZIPNAME" >> $GITHUB_ENV
+          ditto -c -k --sequesterRsrc --keepParent "pyflux.app" "pyflux-macos-arm64.zip"
 
-      - name: Package ZIP (Windows)
-        if: startsWith(matrix.os, 'windows')
-        shell: powershell
-        run: |
-          cd dist
-          $zipName = "pyflux-$env:APP_VERSION-windows-${{ matrix.arch }}.zip"
-          Compress-Archive -Path "pyflux" -DestinationPath $zipName
-          echo "ASSET_PATH=dist/$zipName" >> $env:GITHUB_ENV
-
-      - name: Upload artifact (downloadable from Actions run)
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: pyflux-${{ env.APP_VERSION }}-${{ matrix.os }}-${{ matrix.arch }}
-          path: ${{ env.ASSET_PATH }}
+          name: pyflux-macos-arm64
+          path: dist/pyflux-macos-arm64.zip
 
   release:
     name: Create Release (only on tags)
     if: github.ref_type == 'tag'
-    needs: build
+    needs: [windows_x64, macos_x86_64, macos_arm64]
     runs-on: ubuntu-latest
-
     steps:
-      - name: Download all build artifacts
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
