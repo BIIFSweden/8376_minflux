@@ -1,0 +1,129 @@
+name: Build desktop apps
+
+on:
+  # Lets you run it manually from the Actions tab (good for testing)
+  workflow_dispatch:
+
+  # Automatically build when you push a version tag (v1.0.0, v1.2.3, ...)
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write  # required to create a Release + upload release assets
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }} / ${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Windows 64-bit
+          - os: windows-latest
+            arch: x64
+            icon: assets/appicon.ico
+            target_arch: ""   # (not used on Windows here)
+
+          # macOS Intel
+          - os: macos-13
+            arch: x86_64
+            icon: assets/appicon.icns
+            target_arch: x86_64
+
+          # macOS Apple Silicon (arm64 target)
+          - os: macos-13
+            arch: arm64
+            icon: assets/appicon.icns
+            target_arch: arm64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Compute version label
+        shell: bash
+        run: |
+          # If this run is triggered by a tag (v1.0.0), use that version.
+          # Otherwise use a dev version label.
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            echo "APP_VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_ENV
+          else
+            echo "APP_VERSION=dev-${GITHUB_SHA::7}" >> $GITHUB_ENV
+          fi
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build (macOS)
+        if: startsWith(matrix.os, 'macos')
+        shell: bash
+        run: |
+          pyinstaller --clean --noconfirm --windowed \
+            --target-architecture ${{ matrix.target_arch }} \
+            --name "pyflux" \
+            --icon "${{ matrix.icon }}" \
+            src/pyflux/main.py
+
+      - name: Build (Windows)
+        if: startsWith(matrix.os, 'windows')
+        shell: powershell
+        run: |
+          pyinstaller --clean --noconfirm --windowed `
+            --name "pyflux" `
+            --icon "${{ matrix.icon }}" `
+            src/pyflux/main.py
+
+      - name: Package ZIP (macOS)
+        if: startsWith(matrix.os, 'macos')
+        shell: bash
+        run: |
+          cd dist
+          ZIPNAME="pyflux-${APP_VERSION}-macos-${{ matrix.arch }}.zip"
+          ditto -c -k --sequesterRsrc --keepParent "pyflux.app" "$ZIPNAME"
+          echo "ASSET_PATH=dist/$ZIPNAME" >> $GITHUB_ENV
+
+      - name: Package ZIP (Windows)
+        if: startsWith(matrix.os, 'windows')
+        shell: powershell
+        run: |
+          cd dist
+          $zipName = "pyflux-$env:APP_VERSION-windows-${{ matrix.arch }}.zip"
+          Compress-Archive -Path "pyflux" -DestinationPath $zipName
+          echo "ASSET_PATH=dist/$zipName" >> $env:GITHUB_ENV
+
+      - name: Upload artifact (downloadable from Actions run)
+        uses: actions/upload-artifact@v4
+        with:
+          name: pyflux-${{ env.APP_VERSION }}-${{ matrix.os }}-${{ matrix.arch }}
+          path: ${{ env.ASSET_PATH }}
+
+  release:
+    name: Create Release (only on tags)
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub Release and upload ZIPs
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/**/**/*.zip
+          generate_release_notes: true
