@@ -25,14 +25,12 @@ jobs:
             icon: assets/appicon.ico
             target_arch: ""   # (not used on Windows here)
 
-          # macOS Intel
-          - os: macos-13
+          - os: macos-latest
             arch: x86_64
             icon: assets/appicon.icns
             target_arch: x86_64
 
-          # macOS Apple Silicon (arm64 target)
-          - os: macos-13
+          - os: macos-latest
             arch: arm64
             icon: assets/appicon.icns
             target_arch: arm64
