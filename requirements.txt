@@ -27,7 +27,7 @@ pandas==2.3.3
 parso==0.8.5
 pexpect==4.9.0
 pillow==12.0.0
-pip==25.3
+#pip==25.3
 platformdirs==4.5.1
 plotly==6.5.0
 prompt_toolkit==3.0.52
@@ -46,7 +46,7 @@ PySide6==6.9.2
 python-dateutil==2.9.0.post0
 pytz==2025.2
 pyzmq==27.1.0
-setuptools==80.10.1
+#setuptools==80.10.1
 shiboken6==6.9.2
 six==1.17.0
 stack_data==0.6.3
@@ -55,4 +55,4 @@ traitlets==5.14.3
 typing_extensions==4.15.0
 tzdata==2025.3
 wcwidth==0.5.3
-wheel==0.46.3
+#wheel==0.46.3
