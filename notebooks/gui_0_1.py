@@ -1,4 +1,3 @@
-from PySide6.QtWebEngineCore import QWebEngineProfile
 import tempfile
 import os
 from PySide6.QtCore import QUrl
@@ -6,7 +5,6 @@ import glob
 import numpy as np
 import pandas as pd
 import sys
-from PySide6 import QtWebEngineCore
 from PySide6 import QtCore, QtWidgets
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -22,6 +20,8 @@ from PySide6.QtWebChannel import QWebChannel
 import plotly.graph_objects as go
 import plotly.io as pio
 import json
+from PySide6.QtGui import QColor
+import hashlib
 
 # -------------------- helpers --------------------
 def save_to_csv(df, save_path):
@@ -74,7 +74,7 @@ def preview_localization_precision(arr):
 def scatter_points_and_color(arr, avg_tid: bool):
     """
     Returns xyz (N,3), vals (N,), tids_plot (N,)
-    Coloring: end-to-end distance per tid.
+    Coloring: end-to-end per tid.
     """
     if arr is None or len(arr) == 0:
         return None, None, None
@@ -113,142 +113,159 @@ def scatter_points_and_color(arr, avg_tid: bool):
     vals = np.array([end_to_end[tid] for tid in tids_plot], dtype=float)
     return loc_mean, vals, tids_plot
 
-def make_plotly_fig(arr, avg_tid: bool, is3d: bool, color_mode: str = "end-to-end distance"):
+
+def tid_to_color(tid, alpha=1.0):
+    """
+    Deterministic pseudo-random color per tid.
+    Returns CSS rgba(...) string.
+    """
+    # hash -> 3 bytes
+    h = hashlib.md5(str(int(tid)).encode("utf-8")).digest()
+    r, g, b = h[0], h[1], h[2]
+    # soften a bit (avoid too-dark)
+    r = int(0.25 * 255 + 0.75 * r)
+    g = int(0.25 * 255 + 0.75 * g)
+    b = int(0.25 * 255 + 0.75 * b)
+    a = max(0.0, min(1.0, float(alpha)))
+    return f"rgba({r},{g},{b},{a})"
+
+
+def make_plotly_fig(arr, avg_tid: bool, is3d: bool, color_settings: dict = None):
+    """
+    Build a Plotly figure for one dataset.
+
+    color_settings dict (per file), expected keys:
+      - mode: "solid" | "end-to-end" | "depth" | "tid"
+      - solid: "cyan" | "green" | "magenta"              (used if mode=="solid")
+      - lut: "Turbo" | "Viridis"                         (used if mode in {"end-to-end","depth"})
+      - alpha: float [0..1]
+      - size: int
+    """
+    if color_settings is None:
+        color_settings = {
+            "mode": DEFAULT_MODE,
+            "solid": DEFAULT_SOLID,
+            "lut": DEFAULT_LUT,
+            "alpha": DEFAULT_ALPHA,
+            "size": DEFAULT_SIZE_2D,
+        }
+
     xyz, vals, tids_plot = scatter_points_and_color(arr, avg_tid)
 
-    # Defensive conversion to plain numeric numpy arrays
+    # No data
     if xyz is None or len(xyz) == 0:
         fig = go.Figure()
-        layout_kwargs = dict(
-            template="plotly_white",
-            margin=dict(l=0, r=0, t=20, b=0),
+        fig.update_layout(
             annotations=[dict(text="No data", x=0.5, y=0.5, showarrow=False)]
         )
+        # minimal axis titles; theme will handle colors/background
         if is3d:
-            layout_kwargs["scene"] = dict(
-                aspectmode="data",      # aspect mo
-                xaxis_title="X", yaxis_title="Y", zaxis_title="Z",
-            )
-        fig.update_layout(**layout_kwargs)
+            fig.update_layout(scene=dict(aspectmode="data", xaxis_title="X", yaxis_title="Y", zaxis_title="Z"))
+        apply_plot_theme(fig, is3d=is3d)
         return fig
 
+    # Defensive conversion
     xyz = np.asarray(xyz, dtype=float)
-    vals = np.asarray(vals, dtype=float)
+    vals = np.asarray(vals, dtype=float) if vals is not None else None
     tids_plot = np.asarray(tids_plot)
 
-    # Ensure correct shapes
+    # Ensure correct shape
     if xyz.ndim != 2 or xyz.shape[1] < 2:
         fig = go.Figure()
         fig.update_layout(
-            template="plotly_white",
-            margin=dict(l=0, r=0, t=20, b=0),
             annotations=[dict(text=f"Bad loc shape: {xyz.shape}", x=0.5, y=0.5, showarrow=False)]
         )
+        apply_plot_theme(fig, is3d=is3d)
         return fig
 
     x = xyz[:, 0].astype(float)
     y = xyz[:, 1].astype(float)
-    
-    # Handle z coordinate BEFORE sanitization
-    if xyz.shape[1] >= 3:
-        z = xyz[:, 2].astype(float)
-    else:
-        z = np.zeros(len(x), dtype=float)
+    z = xyz[:, 2].astype(float) if xyz.shape[1] >= 3 else np.zeros(len(x), dtype=float)
 
-    # Sanitize data - remove non-finite values
+    # Sanitize - remove non-finite
+    finite = np.isfinite(x) & np.isfinite(y)
     if is3d:
-        finite = np.isfinite(x) & np.isfinite(y) & np.isfinite(z) & np.isfinite(vals)
-    else:
-        finite = np.isfinite(x) & np.isfinite(y) & np.isfinite(vals)
-    
+        finite = finite & np.isfinite(z)
+    if vals is not None:
+        finite = finite & np.isfinite(vals)
+
     if not np.all(finite):
         x = x[finite]
         y = y[finite]
         z = z[finite]
-        vals = vals[finite]
+        if vals is not None:
+            vals = vals[finite]
         tids_plot = tids_plot[finite]
 
-    # if everything got removed, show "No data"
     if len(x) == 0:
         fig = go.Figure()
-        layout_kwargs = dict(
-            template="plotly_white",
-            margin=dict(l=0, r=0, t=20, b=0),
+        fig.update_layout(
             annotations=[dict(text="No valid data after filtering", x=0.5, y=0.5, showarrow=False)]
         )
         if is3d:
-            layout_kwargs["scene"] = dict(
-                aspectmode="data",
-                xaxis_title="X", yaxis_title="Y", zaxis_title="Z",
-            )
-        fig.update_layout(**layout_kwargs)
-        return fig  # <-- THIS RETURN WAS MISSING!
+            fig.update_layout(scene=dict(aspectmode="data", xaxis_title="X", yaxis_title="Y", zaxis_title="Z"))
+        apply_plot_theme(fig, is3d=is3d)
+        return fig
 
-    # IMPORTANT: send plain lists to Plotly
-    xL = x.tolist()
-    yL = y.tolist()
-    zL = z.tolist()
-    cL = vals.tolist()
+    trace = make_trace_for_arr(
+        arr,
+        avg_tid=avg_tid,
+        is3d=is3d,
+        color_settings=color_settings,
+        name=None,
+        show_colorbar=True,
+    )
 
-    text = [f"tid={int(t)}<br>end2end={float(v):.3f}" for t, v in zip(tids_plot, vals)]
+    if trace is None:
+        fig = go.Figure()
+        fig.update_layout(annotations=[dict(text="No data", x=0.5, y=0.5, showarrow=False)])
+        apply_plot_theme(fig, is3d=is3d)
+        return fig
 
+    fig = go.Figure([trace])
+
+    # Keep your functional layout bits separate from theme
     if is3d:
-        trace = make_trace_for_arr(arr, avg_tid=avg_tid, is3d=is3d, color_mode=color_mode, name=None)
-        if trace is None:
-            return go.Figure()
-        fig = go.Figure([trace])
         fig.update_layout(
-            template="plotly_white",
-            margin=dict(l=0, r=0, t=20, b=0),
             scene=dict(
-                aspectmode="data",      # or "cube"
+                aspectmode="data",
                 xaxis_title="X",
                 yaxis_title="Y",
                 zaxis_title="Z",
             )
         )
     else:
-        trace = make_trace_for_arr(arr, avg_tid=avg_tid, is3d=is3d, color_mode=color_mode, name=None)
-        if trace is None:
-            return go.Figure()
-        fig = go.Figure([trace])
-        fig.update_layout(
-            template="plotly_white",
-            margin=dict(l=0, r=0, t=20, b=0),
-            dragmode="pan",
-        )
+        fig.update_layout(dragmode="pan")
         fig.layout.margin.autoexpand = False
-        # after x,y computed and filtered, before returning fig (2D case)
+
+        # Equal aspect ratio if non-degenerate
         dx = float(np.nanmax(x) - np.nanmin(x)) if len(x) else 0.0
         dy = float(np.nanmax(y) - np.nanmin(y)) if len(y) else 0.0
         if dx > 0 and dy > 0:
             fig.update_yaxes(scaleanchor="x", scaleratio=1)
-    
-    print("xyz shape:", xyz.shape, "vals shape:", vals.shape, "is3d:", is3d)
+
+    apply_plot_theme(fig, is3d=is3d)
     return fig
 
-def make_plotly_fig_merged(arr_by_base: dict, avg_tid: bool, is3d: bool, color_mode_by_base: dict):
+
+def make_plotly_fig_merged(arr_by_base: dict, avg_tid: bool, is3d: bool, color_settings_by_base: dict):
     """
     Build one Plotly figure containing traces for every base in arr_by_base.
 
-    Coloring is controlled per dataset via color_mode_by_base[base], where mode is one of:
-      - "cyan", "green", "magenta"  -> solid marker color for all points
-      - "end-to-end distance"       -> per-point color by end-to-end distance (Turbo scale)
-
-    Notes:
-      - If multiple datasets use "end-to-end distance", each trace will create its own colorbar.
-        (If you want only one global colorbar, tell me and I’ll adjust.)
+    color_settings_by_base[base] is a dict with keys:
+      mode: "solid" | "end-to-end" | "depth"
+      solid: "cyan"/"green"/"magenta"        (if mode=="solid")
+      lut: "Turbo"/"Viridis"                (if mode in {"end-to-end","depth"})
+      alpha: float [0..1]
+      size: int
     """
     traces = []
 
     bases = list(arr_by_base.keys())
     if not bases:
         fig = go.Figure()
-        fig.update_layout(
-            template="plotly_white",
-            margin=dict(l=0, r=0, t=20, b=0),
-            annotations=[dict(text="No data", x=0.5, y=0.5, showarrow=False)],
-        )
+        fig.update_layout(annotations=[dict(text="No data", x=0.5, y=0.5, showarrow=False)])
+        apply_plot_theme(fig, is3d=is3d)
         return fig
 
     for base in bases:
@@ -256,33 +273,47 @@ def make_plotly_fig_merged(arr_by_base: dict, avg_tid: bool, is3d: bool, color_m
         if arr is None or len(arr) == 0:
             continue
 
-        mode = (color_mode_by_base or {}).get(base, "end-to-end distance")
+        cs = (color_settings_by_base or {}).get(base, None)
+        if cs is None:
+            cs = {
+                "mode": DEFAULT_MODE,
+                "solid": DEFAULT_SOLID,
+                "lut": DEFAULT_LUT,
+                "alpha": DEFAULT_ALPHA,
+                "size": DEFAULT_SIZE_2D,
+            }
+        else:
+            # ensure missing keys get defaults
+            cs = {
+                "mode": cs.get("mode", DEFAULT_MODE),
+                "solid": cs.get("solid", DEFAULT_SOLID),
+                "lut": cs.get("lut", DEFAULT_LUT),
+                "alpha": cs.get("alpha", DEFAULT_ALPHA),
+                "size": cs.get("size", DEFAULT_SIZE_2D),
+            }
 
         tr = make_trace_for_arr(
             arr,
             avg_tid=avg_tid,
             is3d=is3d,
-            color_mode=mode,
+            color_settings=cs,
             name=base,
+            show_colorbar=True,  # NOTE: can cause overlapping bars if many traces have a colorbar
         )
         if tr is not None:
             traces.append(tr)
 
     if not traces:
         fig = go.Figure()
-        fig.update_layout(
-            template="plotly_white",
-            margin=dict(l=0, r=0, t=20, b=0),
-            annotations=[dict(text="No data", x=0.5, y=0.5, showarrow=False)],
-        )
+        fig.update_layout(annotations=[dict(text="No data", x=0.5, y=0.5, showarrow=False)])
+        apply_plot_theme(fig, is3d=is3d)
         return fig
 
     fig = go.Figure(traces)
 
+    # Functional layout bits (legend placement, pan, aspect)
     if is3d:
         fig.update_layout(
-            template="plotly_white",
-            margin=dict(l=0, r=0, t=20, b=0),
             scene=dict(
                 aspectmode="data",
                 xaxis_title="X",
@@ -299,8 +330,6 @@ def make_plotly_fig_merged(arr_by_base: dict, avg_tid: bool, is3d: bool, color_m
         )
     else:
         fig.update_layout(
-            template="plotly_white",
-            margin=dict(l=0, r=0, t=20, b=0),
             dragmode="pan",
             legend=dict(
                 orientation="h",
@@ -313,12 +342,10 @@ def make_plotly_fig_merged(arr_by_base: dict, avg_tid: bool, is3d: bool, color_m
         fig.layout.margin.autoexpand = False
 
         # keep equal aspect ratio only if ranges are non-degenerate
-        # (prevents occasional Plotly "axis scaling" issues)
         try:
             all_x = []
             all_y = []
             for tr in fig.data:
-                # Scattergl/Scatter store x/y in arrays
                 all_x.extend(list(tr.x) if tr.x is not None else [])
                 all_y.extend(list(tr.y) if tr.y is not None else [])
             all_x = np.asarray(all_x, dtype=float)
@@ -333,15 +360,12 @@ def make_plotly_fig_merged(arr_by_base: dict, avg_tid: bool, is3d: bool, color_m
             if dx > 0 and dy > 0:
                 fig.update_yaxes(scaleanchor="x", scaleratio=1)
         except Exception:
-            # if anything goes wrong, just skip the constraint
             pass
 
+    apply_plot_theme(fig, is3d=is3d)
     return fig
 
-def make_trace_for_arr(arr, avg_tid: bool, is3d: bool, color_mode: str, name: str = None):
-    """
-    Build one Plotly trace for an array with either solid color or end-to-end distance coloring.
-    """
+def make_trace_for_arr(arr, avg_tid: bool, is3d: bool, color_settings: dict, name: str = None, show_colorbar: bool = True):
     xyz, vals, tids_plot = scatter_points_and_color(arr, avg_tid)
     if xyz is None or len(xyz) == 0:
         return None
@@ -354,6 +378,7 @@ def make_trace_for_arr(arr, avg_tid: bool, is3d: bool, color_mode: str, name: st
     y = xyz[:, 1].astype(float)
     z = xyz[:, 2].astype(float) if xyz.shape[1] >= 3 else np.zeros(len(x), dtype=float)
 
+    # --- finite filtering ---
     if is3d:
         finite = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
     else:
@@ -371,26 +396,67 @@ def make_trace_for_arr(arr, avg_tid: bool, is3d: bool, color_mode: str, name: st
     if len(x) == 0:
         return None
 
-    text = [f"{name or ''}tid={int(t)}" for t in tids_plot]
+    cs = color_settings or {}
+    mode = cs.get("mode", DEFAULT_MODE)
 
-    use_e2e = (color_mode == "end-to-end distance")
-    if use_e2e:
+    alpha = float(cs.get("alpha", DEFAULT_ALPHA))
+    alpha = max(0.0, min(1.0, alpha))
+
+    size = int(cs.get("size", DEFAULT_SIZE_2D))
+    size = max(1, size)
+
+    # hover text
+    text = [f"{name + ' ' if name else ''}tid={int(t)}" for t in tids_plot]
+
+    # --- marker selection ---
+    if mode == "solid":
+        solid = cs.get("solid", DEFAULT_SOLID)
+        col = SOLID_COLOR_MAP.get(solid, SOLID_COLOR_MAP[DEFAULT_SOLID])
+        marker = dict(size=size, opacity=alpha, color=col)
+
+    elif mode == "depth":
+        lut = cs.get("lut", DEFAULT_LUT)
+        if lut not in LUT_CHOICES:
+            lut = DEFAULT_LUT
+
+        marker = dict(
+            size=size,
+            opacity=alpha,
+            color=z.tolist(),
+            colorscale=lut,
+            showscale=bool(show_colorbar),
+        )
+        if show_colorbar:
+            marker["colorbar"] = dict(title="z")
+
+    elif mode == "tid":
+        # one color per point based on its tid (deterministic random)
+        # note: Plotly accepts list of color strings for marker.color
+        color_list = [tid_to_color(t, alpha=alpha) for t in tids_plot]
+
+        marker = dict(
+            size=size,
+            opacity=1.0,     # alpha already baked into rgba(); keep opacity=1 to avoid double-multiplying
+            color=color_list,
+        )
+
+    else:  # "end-to-end"
+        lut = cs.get("lut", DEFAULT_LUT)
+        if lut not in LUT_CHOICES:
+            lut = DEFAULT_LUT
+
         cL = np.asarray(vals, dtype=float).tolist()
         marker = dict(
-            size=4 if is3d else 6,
-            opacity=0.85,
+            size=size,
+            opacity=alpha,
             color=cL,
-            colorscale="Turbo",
-            colorbar=dict(title="end-to-end"),
+            colorscale=lut,
+            showscale=bool(show_colorbar),
         )
-    else:
-        col = SOLID_COLOR_MAP.get(color_mode, "#00FFFF")
-        marker = dict(
-            size=4 if is3d else 6,
-            opacity=0.85,
-            color=col
-        )
+        if show_colorbar:
+            marker["colorbar"] = dict(title="end-to-end")
 
+    # --- traces ---
     if is3d:
         return go.Scatter3d(
             x=x.tolist(), y=y.tolist(), z=z.tolist(),
@@ -401,83 +467,616 @@ def make_trace_for_arr(arr, avg_tid: bool, is3d: bool, color_mode: str, name: st
             hovertemplate="x=%{x:.3f}<br>y=%{y:.3f}<br>z=%{z:.3f}<br>%{text}<extra></extra>",
         )
     else:
+        # When coloring by depth, include z in hover even in 2D
+        if mode == "depth":
+            customdata = z.reshape(-1, 1)
+            hovertemplate = "x=%{x:.3f}<br>y=%{y:.3f}<br>z=%{customdata[0]:.3f}<br>%{text}<extra></extra>"
+        else:
+            customdata = None
+            hovertemplate = "x=%{x:.3f}<br>y=%{y:.3f}<br>%{text}<extra></extra>"
+
         return go.Scattergl(
             x=x.tolist(), y=y.tolist(),
             mode="markers",
             name=name,
             marker=marker,
             text=text,
-            hovertemplate="x=%{x:.3f}<br>y=%{y:.3f}<br>%{text}<extra></extra>",
+            customdata=customdata,
+            hovertemplate=hovertemplate,
         )
+
+def apply_plot_theme(fig: go.Figure, *, is3d: bool):
+    th = PLOT_THEME
+
+    fig.update_layout(
+        template=th.get("template", "none"),
+        paper_bgcolor=th.get("paper_bg", "white"),
+        font=dict(
+            family=th.get("font_family", "Arial"),
+            size=th.get("font_size", 12),
+            color=th.get("font_color", "black"),
+        ),
+        margin=th.get("margin", dict(l=0, r=0, t=20, b=0)),
+        legend=dict(
+            bgcolor=th.get("legend_bg", "rgba(0,0,0,0)"),
+            bordercolor=th.get("legend_border", "rgba(0,0,0,0)"),
+            borderwidth=0 if th.get("legend_border", None) in (None, "rgba(0,0,0,0)") else 1,
+        ),
+    )
+
+    if is3d:
+        title_col = th.get("scene_axis_title_color", th.get("font_color", "black"))
+        tick_col = th.get("scene_tick_color", "#888888")
+
+        scene_axis_common = dict(
+            showbackground=False,
+            gridcolor=th.get("scene_grid_color", "#DDDDDD"),
+            zerolinecolor=th.get("scene_zeroline_color", "#BBBBBB"),
+            linecolor=th.get("scene_axis_line_color", "#888888"),
+            tickcolor=tick_col,
+            tickfont=dict(color=tick_col),
+            title=dict(font=dict(color=title_col)),
+        )
+
+        fig.update_layout(
+            scene=dict(
+                bgcolor=th.get("scene_bg", th.get("paper_bg", "white")),
+                xaxis=scene_axis_common,
+                yaxis=scene_axis_common,
+                zaxis=scene_axis_common,
+            )
+        )
+
+    else:
+        fig.update_layout(plot_bgcolor=th.get("plot_bg", th.get("paper_bg", "white")))
+
+        fig.update_xaxes(
+            gridcolor=th.get("grid_color", "#DDDDDD"),
+            zerolinecolor=th.get("zeroline_color", "#BBBBBB"),
+            linecolor=th.get("axis_line_color", "#888888"),
+            tickcolor=th.get("tick_color", "#888888"),
+            tickfont=dict(color=th.get("tick_color", "#888888")),
+            title_font=dict(color=th.get("axis_title_color", th.get("font_color", "black"))),
+        )
+        fig.update_yaxes(
+            gridcolor=th.get("grid_color", "#DDDDDD"),
+            zerolinecolor=th.get("zeroline_color", "#BBBBBB"),
+            linecolor=th.get("axis_line_color", "#888888"),
+            tickcolor=th.get("tick_color", "#888888"),
+            tickfont=dict(color=th.get("tick_color", "#888888")),
+            title_font=dict(color=th.get("axis_title_color", th.get("font_color", "black"))),
+        )
+
+    return fig
+
+def apply_hist_theme(fig: Figure, ax):
+    th = HIST_THEME
+
+    fig.patch.set_facecolor(th["fig_bg"])
+    ax.set_facecolor(th["ax_bg"])
+
+    ax.set_axisbelow(True)  # grid behind bars/patches
+
+    ax.title.set_color(th["text"])
+    ax.xaxis.label.set_color(th["text"])
+    ax.yaxis.label.set_color(th["text"])
+
+    ax.tick_params(axis="both", colors=th["ticks"])
+
+    for spine in ax.spines.values():
+        spine.set_color(th["spines"])
+
+    ax.grid(True, color=th["grid"], alpha=0.6, linewidth=0.8)
+
+def apply_gui_theme(app: QtWidgets.QApplication):
+    t = GUI_THEME
+    qss = f"""
+    /* Base */
+    QWidget {{
+        background-color: {t["bg"]};
+        color: {t["text"]};
+        selection-background-color: {t["selection_bg"]};
+        selection-color: {t["selection_text"]};
+    }}
+
+    QMainWindow::separator {{
+        background: {t["border"]};
+        width: 1px;
+        height: 1px;
+    }}
+
+    /* Group boxes */
+    QGroupBox {{
+        background-color: {t["panel_bg"]};
+        border: 1px solid {t["border"]};
+        border-radius: 6px;
+        margin-top: 10px;
+        padding: 8px;
+    }}
+    QGroupBox::title {{
+        subcontrol-origin: margin;
+        subcontrol-position: top left;
+        padding: 0 6px;
+        color: {t["text"]};
+    }}
+
+    /* Matplotlib toolbar */
+    QToolBar {{
+        background-color: #25272A;   /* or GUI_THEME["panel_bg"] */
+        border: 1px solid #3C4043;   /* or GUI_THEME["border"] */
+        spacing: 4px;
+        padding: 2px;
+    }}
+
+    QToolButton {{
+        background-color: #303134;   /* button bg */
+        border: 1px solid #5F6368;
+        border-radius: 4px;
+        padding: 2px;
+        margin: 1px;
+    }}
+
+    QToolButton:hover {{
+        background-color: #3A3B3C;
+    }}
+
+    QToolButton:pressed {{
+        background-color: #2B2C2D;
+    }}
+
+    QToolBar QToolButton {{
+        background-color: #919191;      /* your custom color */
+        border: 1px solid #6e6e6e;
+    }}
+
+    QToolBar QToolButton:hover {{
+        background-color: #24466c;
+    }}   
+
+    /* Inputs */
+    QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {{
+        background-color: {t["input_bg"]};
+        color: {t["input_text"]};
+        border: 1px solid {t["input_border"]};
+        border-radius: 5px;
+        padding: 3px 6px;
+    }}
+
+    QComboBox {{
+        background-color: {t["input_bg"]};
+        color: {t["input_text"]};
+        border: 1px solid {t["input_border"]};
+        border-radius: 5px;
+        padding: 3px 18px 3px 8px;   /* right padding leaves room for arrow */
+        min-height: 24px;            /* prevents cropping */
+    }}
+
+    QComboBox::drop-down {{
+        subcontrol-origin: padding;
+        subcontrol-position: top right;
+        width: 16px;                 /* was 18; 24–30 is usually safe */
+        border-left: 1px solid {t["input_border"]};
+    }}
+
+    /* style the popup list */
+    QComboBox QAbstractItemView {{
+        background-color: {t["panel_bg"]};
+        color: {t["text"]};
+        selection-background-color: {t["selection_bg"]};
+        selection-color: {t["selection_text"]};
+        outline: 0;
+        padding: 4px;
+    }}
+
+    /* Buttons */
+    QPushButton {{
+        background-color: {t["button_bg"]};
+        color: {t["button_text"]};
+        border: 1px solid {t["button_border"]};
+        border-radius: 6px;
+        padding: 5px 10px;
+    }}
+    QPushButton:hover {{
+        background-color: {t["button_bg_hover"]};
+    }}
+    QPushButton:pressed {{
+        background-color: {t["button_bg_pressed"]};
+    }}
+    QPushButton:disabled {{
+        color: {t["muted_text"]};
+        border-color: {t["border"]};
+        background-color: {t["panel_bg"]};
+    }}
+
+    /* Tables */
+    QTableWidget {{
+        background-color: {t["panel_bg"]};
+        gridline-color: {t["border"]};
+        border: 1px solid {t["border"]};
+    }}
+    QHeaderView::section {{
+        background-color: {t["panel_bg"]};
+        color: {t["text"]};
+        border: 1px solid {t["border"]};
+        padding: 4px 6px;
+    }}
+
+    /* Scroll areas */
+    QScrollArea {{
+        border: none;
+        background-color: {t["panel_bg"]};
+    }}
+
+    """
+    app.setStyleSheet(qss)
+
+# -------------------- Qt (GUI) theme --------------------
+
+GUI_THEME = {
+    "bg": "#202122",          # main window background
+    "panel_bg": "#25272A",    # groupboxes / panels
+    "text": "#E8EAED",
+    "muted_text": "#B0B3B8",
+    "border": "#3C4043",
+
+    "input_bg": "#1F1F1F",
+    "input_text": "#E8EAED",
+    "input_border": "#4A4D50",
+
+    "button_bg": "#303134",
+    "button_text": "#E8EAED",
+    "button_border": "#5F6368",
+    "button_bg_hover": "#3A3B3C",
+    "button_bg_pressed": "#2B2C2D",
+
+    "selection_bg": "#4C8BF5",
+    "selection_text": "#FFFFFF",
+}
 
 # -------------------- constants --------------------
 
-COLOR_CHOICES = ["cyan", "green", "magenta", "end-to-end distance"]
+DEFAULT_ALPHA = 0.85
+DEFAULT_SIZE_2D = 6
+DEFAULT_SIZE_3D = 6
+
+MODE_SOLID = "solid"
+MODE_DEPTH = "depth"
+MODE_TID = "tid"
+MODE_E2E = "end-to-end"
+
+MODE_CHOICES = [MODE_SOLID, MODE_DEPTH, MODE_TID, MODE_E2E]
+
 SOLID_COLOR_MAP = {
     "cyan": "#00FFFF",
+    "blue": "#0000FF",
+    "red": "#FF0000",
+    "yellow": "#FFFF00", 
+    "orange": "#FF8800",
+    "darkgreen": "#008800",
     "green": "#00CC00",
     "magenta": "#FF00FF",
+}
+SOLID_COLOR_CHOICES = list(SOLID_COLOR_MAP.keys())
+
+LUT_CHOICES = ["turbo", "viridis", "cividis", "inferno", "magma", "plasma", 
+               "electric", "hot", "hsv", "jet", "rainbow", "twilight", "icefire", 
+               "piyg", "brbg", "rdbu", "brwnyl", "reds", "rdpu", "ylgn", "ylorbr", 
+               "thermal","gray", "ice", "algae", "speed", "temps",
+               ]  # Plotly colorscale names
+LUT_CHOICES = sorted(LUT_CHOICES)
+
+DEFAULT_SOLID = "darkgreen"
+DEFAULT_LUT = "twilight"
+DEFAULT_MODE = "depth"
+
+# -------------------- Plot theme --------------------
+
+PLOT_THEME = {
+    # overall
+    "template": "none",                 # "none" to rely on your explicit colors; or "plotly_dark"/"plotly_white"
+    "font_family": "Arial",
+    "font_size": 12,
+    "font_color": "#E6E6E6",
+
+    # backgrounds
+    "paper_bg": "#1E1E1E",              # outside plotting area
+    "plot_bg":  "#1E1E1E",              # 2D plotting area
+    "scene_bg": "#1E1E1E",              # 3D scene background
+
+    # axes/grid (2D)
+    "axis_line_color": "#8A8A8A",
+    "grid_color": "#2F2F2F",
+    "zeroline_color": "#444444",
+    "tick_color": "#CFCFCF",
+    "axis_title_color": "#E6E6E6",
+
+    # axes/grid (3D)
+    "scene_grid_color": "#2F2F2F",
+    "scene_zeroline_color": "#444444",
+    "scene_axis_line_color": "#8A8A8A",
+    "scene_tick_color": "#CFCFCF",
+    "scene_axis_title_color": "#E6E6E6",
+
+    # legend
+    "legend_bg": "rgba(0,0,0,0)",       # transparent
+    "legend_border": "#666666",
+
+    # margins
+    "margin": dict(l=0, r=0, t=20, b=0),
+}
+
+PLOTLY_HTML_BG = PLOT_THEME["paper_bg"]   # or PLOT_THEME["plot_bg"]
+
+# -------------------- Matplotlib theme (histogram) --------------------
+
+HIST_THEME = {
+    "fig_bg":   "#1E1E1E",   # matches PLOT_THEME["paper_bg"]
+    "ax_bg":    "#1E1E1E",   # matches PLOT_THEME["plot_bg"]
+    "text":     "#E6E6E6",
+    "grid":     "#2F2F2F",
+    "spines":   "#8A8A8A",
+    "ticks":    "#CFCFCF",
+
+    # histogram style
+    "hist_face": "#b8b8ff",
+    "hist_edge": "#b8b8ff",
+
+    # selection span style (SpanSelector)
+    "span_face": "#f8f7ff",
+    "span_alpha": 0.15,
+    "span_edge":  "black",
+    "span_lw":    2,
 }
 
 # -------------------- GUI components --------------------
 
-class ColorSettingsWindow(QtWidgets.QMainWindow):
+class ColorSettingsPanel(QtWidgets.QGroupBox):
     """
-    Modeless top-level window: one row per file base, with a dropdown to choose coloring mode.
-    Emits changed(base, mode).
+    Embedded color settings:
+      base : [mode combo] [palette combo] alpha: [0..1] size: [int]
+
+    mode:
+      - "solid"                 -> palette is SOLID_COLOR_CHOICES
+      - "end-to-end"   -> palette is LUT_CHOICES
+      - "depth"                 -> palette is LUT_CHOICES
+
+    Emits changed(base, settings_dict).
+    settings_dict keys:
+      - mode: str
+      - solid: str
+      - lut: str
+      - alpha: float
+      - size: int
     """
-    changed = Signal(str, str)
+    changed = Signal(str, object)  # (base, settings dict)
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Color settings")
-        self.resize(520, 600)
+    def __init__(self, title="Color settings", parent=None):
+        super().__init__(title, parent)
 
-        central = QtWidgets.QWidget()
-        self.setCentralWidget(central)
-        root = QtWidgets.QVBoxLayout(central)
-        root.setContentsMargins(8, 8, 8, 8)
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(8, 8, 8, 8)
 
         self.scroll = QtWidgets.QScrollArea()
         self.scroll.setWidgetResizable(True)
-        root.addWidget(self.scroll, 1)
+        outer.addWidget(self.scroll, 1)
 
         self.inner = QtWidgets.QWidget()
         self.form = QtWidgets.QFormLayout(self.inner)
         self.form.setLabelAlignment(Qt.AlignLeft)
         self.form.setFormAlignment(Qt.AlignTop)
-        self.form.setVerticalSpacing(10)
+        self.form.setVerticalSpacing(8)
         self.scroll.setWidget(self.inner)
 
-        self._combo_by_base = {}
+        # base -> (mode_combo, palette_combo, alpha_spin, size_spin)
+        self._widgets_by_base = {}
 
-    def rebuild(self, base_names, current_modes: dict):
-        # clear existing rows
+        # show ~3 rows before scrolling; adjust to taste
+        self.setMinimumHeight(160)
+        self.setMaximumHeight(220)
+
+    def _make_row_widget(self, base: str, settings: dict):
+        row = QtWidgets.QWidget()
+        h = QtWidgets.QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(4)
+
+        mode_combo = QtWidgets.QComboBox()
+        mode_combo.addItems(MODE_CHOICES)
+
+        palette_combo = QtWidgets.QComboBox()
+
+        alpha_lbl = QtWidgets.QLabel("\u03B1:")  # Greek letter alpha
+        alpha_spin = QtWidgets.QDoubleSpinBox()
+        alpha_spin.setRange(0.0, 1.0)
+        alpha_spin.setDecimals(2)
+        alpha_spin.setSingleStep(0.05)
+
+        size_lbl = QtWidgets.QLabel("size:")
+        size_spin = QtWidgets.QSpinBox()
+        size_spin.setRange(1, 50)  # adjust if you want larger
+        size_spin.setSingleStep(1)
+
+        # ---- apply initial settings ----
+        s = settings or {}
+        mode = s.get("mode", DEFAULT_MODE)
+        if mode not in MODE_CHOICES:
+            mode = DEFAULT_MODE
+
+        solid = s.get("solid", DEFAULT_SOLID)
+        if solid not in SOLID_COLOR_CHOICES:
+            solid = DEFAULT_SOLID
+
+        lut = s.get("lut", DEFAULT_LUT)
+        if lut not in LUT_CHOICES:
+            lut = DEFAULT_LUT
+
+        alpha = float(s.get("alpha", DEFAULT_ALPHA))
+        alpha = max(0.0, min(1.0, alpha))
+
+        size = int(s.get("size", DEFAULT_SIZE_2D))
+        size = max(1, min(50, size))
+
+        mode_combo.setCurrentText(mode)
+        alpha_spin.setValue(alpha)
+        size_spin.setValue(size)
+
+        def fill_palette_for_mode(m: str):
+            palette_combo.blockSignals(True)
+            palette_combo.clear()
+
+            if m == MODE_SOLID:
+                palette_combo.setEnabled(True)
+                palette_combo.addItems(SOLID_COLOR_CHOICES)
+                palette_combo.setCurrentText(solid if solid in SOLID_COLOR_CHOICES else DEFAULT_SOLID)
+
+            elif m == MODE_TID:
+                palette_combo.setEnabled(False)
+                palette_combo.addItem("—")
+
+            else:  # MODE_DEPTH or MODE_E2E
+                palette_combo.setEnabled(True)
+                palette_combo.addItems(LUT_CHOICES)
+                palette_combo.setCurrentText(lut if lut in LUT_CHOICES else DEFAULT_LUT)
+
+            palette_combo.blockSignals(False)
+
+        fill_palette_for_mode(mode)
+
+        def emit_changed():
+            m = mode_combo.currentText()
+            a = float(alpha_spin.value())
+            sz = int(size_spin.value())
+
+            if m == MODE_SOLID:
+                payload = {
+                    "mode": MODE_SOLID,
+                    "solid": palette_combo.currentText(),
+                    "lut": DEFAULT_LUT,
+                    "alpha": a,
+                    "size": sz,
+                }
+            elif m == MODE_DEPTH:
+                payload = {
+                    "mode": MODE_DEPTH,
+                    "solid": DEFAULT_SOLID,
+                    "lut": palette_combo.currentText(),
+                    "alpha": a,
+                    "size": sz,
+                }
+            elif m == MODE_TID:
+                payload = {
+                    "mode": MODE_TID,
+                    "solid": DEFAULT_SOLID,
+                    "lut": DEFAULT_LUT,   # ignored
+                    "alpha": a,
+                    "size": sz,
+                }
+            else:  # MODE_E2E
+                payload = {
+                    "mode": MODE_E2E,
+                    "solid": DEFAULT_SOLID,
+                    "lut": palette_combo.currentText(),
+                    "alpha": a,
+                    "size": sz,
+                }
+
+            self.changed.emit(base, payload)
+
+        def on_mode_changed(m: str):
+            fill_palette_for_mode(m)
+            emit_changed()
+
+        # ---- wire signals ----
+        mode_combo.currentTextChanged.connect(on_mode_changed)
+        palette_combo.currentTextChanged.connect(lambda _: emit_changed())
+        alpha_spin.valueChanged.connect(lambda _: emit_changed())
+        size_spin.valueChanged.connect(lambda _: emit_changed())
+
+        # ---- layout row ----
+        h.addWidget(mode_combo, 1)
+        h.addWidget(palette_combo, 2)
+        h.addSpacing(4)
+        h.addWidget(alpha_lbl)
+        h.addWidget(alpha_spin)
+        h.addSpacing(4)
+        h.addWidget(size_lbl)
+        h.addWidget(size_spin)
+
+        self._widgets_by_base[base] = (mode_combo, palette_combo, alpha_spin, size_spin)
+        return row
+
+    def rebuild(self, base_names, current_settings_by_base: dict):
         while self.form.rowCount():
             self.form.removeRow(0)
-        self._combo_by_base.clear()
+        self._widgets_by_base.clear()
 
         for base in base_names:
-            combo = QtWidgets.QComboBox()
-            combo.addItems(COLOR_CHOICES)
+            settings = (current_settings_by_base or {}).get(base, None)
+            row_widget = self._make_row_widget(base, settings)
+            self.form.addRow(f"{base}:", row_widget)
 
-            mode = (current_modes or {}).get(base, "end-to-end distance")
-            combo.setCurrentText(mode if mode in COLOR_CHOICES else "end-to-end distance")
-
-            combo.currentTextChanged.connect(lambda m, b=base: self.changed.emit(b, m))
-
-            self._combo_by_base[base] = combo
-            self.form.addRow(f"{base}:", combo)
-
-    def set_mode(self, base: str, mode: str):
-        combo = self._combo_by_base.get(base)
-        if combo is None:
+    def set_settings(self, base: str, settings: dict):
+        pair = self._widgets_by_base.get(base)
+        if not pair:
             return
-        if mode not in COLOR_CHOICES:
-            mode = "end-to-end distance"
-        combo.blockSignals(True)
-        combo.setCurrentText(mode)
-        combo.blockSignals(False)
+
+        mode_combo, palette_combo, alpha_spin, size_spin = pair
+        s = settings or {}
+
+        # normalize
+        mode = s.get("mode", DEFAULT_MODE)
+        if mode not in MODE_CHOICES:
+            mode = DEFAULT_MODE
+
+        solid = s.get("solid", DEFAULT_SOLID)
+        if solid not in SOLID_COLOR_CHOICES:
+            solid = DEFAULT_SOLID
+
+        lut = s.get("lut", DEFAULT_LUT)
+        if lut not in LUT_CHOICES:
+            lut = DEFAULT_LUT
+
+        alpha = float(s.get("alpha", DEFAULT_ALPHA))
+        alpha = max(0.0, min(1.0, alpha))
+
+        size = int(s.get("size", DEFAULT_SIZE_2D))
+        size = max(1, min(50, size))
+
+        # set mode first (this controls palette content)
+        mode_combo.blockSignals(True)
+        mode_combo.setCurrentText(mode)
+        mode_combo.blockSignals(False)
+
+        # set palette according to mode (solid vs LUT vs disabled for tid)
+        palette_combo.blockSignals(True)
+        palette_combo.clear()
+
+        if mode == "solid":
+            palette_combo.setEnabled(True)
+            palette_combo.addItems(SOLID_COLOR_CHOICES)
+            palette_combo.setCurrentText(solid if solid in SOLID_COLOR_CHOICES else DEFAULT_SOLID)
+
+        elif mode == "tid":
+            palette_combo.setEnabled(False)
+            palette_combo.addItem("—")
+
+        else:
+            # "depth" or "end-to-end"
+            palette_combo.setEnabled(True)
+            palette_combo.addItems(LUT_CHOICES)
+            palette_combo.setCurrentText(lut if lut in LUT_CHOICES else DEFAULT_LUT)
+
+        palette_combo.blockSignals(False)
+
+        # alpha/size
+        alpha_spin.blockSignals(True)
+        alpha_spin.setValue(alpha)
+        alpha_spin.blockSignals(False)
+
+        size_spin.blockSignals(True)
+        size_spin.setValue(size)
+        size_spin.blockSignals(False)
+
 
 class ParametersDialog(QtWidgets.QDialog):
     """Dialog to edit analysis parameters, bound to MainWindow spinboxes."""
@@ -516,6 +1115,14 @@ class ParametersDialog(QtWidgets.QDialog):
         form.addWidget(self.scale, 1, 1)
         form.addWidget(QtWidgets.QLabel("EFO histogram bin size:"), 1, 2)
         form.addWidget(self.bin_size, 1, 3)
+
+        note = QtWidgets.QLabel("Data is usually recorded in meters, set scale factor to 1e9 to convert to nanometers.")
+        note.setWordWrap(True)
+        # optional: make it look like a hint
+        note.setStyleSheet("color: #B0B3B8;")  # or remove if you don't want styling
+
+        # row 2, start at column 0, span 1 row x 4 columns
+        form.addWidget(note, 2, 0, 1, 4)
 
         # buttons
         btns = QtWidgets.QDialogButtonBox(
@@ -672,8 +1279,13 @@ class PlotlyView(QtWidgets.QWidget):
 
         self.web.page().loadFinished.connect(self._on_load_finished)
 
+
+        self.web.page().setBackgroundColor(QColor(PLOTLY_HTML_BG))
+        self.ensure_page()
+
     def _bootstrap_html(self):
-        return """<!doctype html>
+        bg = PLOTLY_HTML_BG  # uses your constant
+        return f"""<!doctype html>
 <html>
 <head>
 <meta charset="utf-8"/>
@@ -681,89 +1293,98 @@ class PlotlyView(QtWidgets.QWidget):
 <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
 <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
 <style>
-html, body { margin:0; padding:0; width:100%; height:100%; overflow:hidden; }
-#container { width:100%; height:100%; }
-#plot { width:100%; height:100%; }
+html, body {{
+  margin:0; padding:0;
+  width:100%; height:100%;
+  overflow:hidden;
+  background: {bg};
+}}
+#container {{
+  width:100%; height:100%;
+  background: {bg};
+}}
+#plot {{
+  width:100%; height:100%;
+  background: {bg};
+}}
 </style>
 </head>
 <body>
 <div id="container"><div id="plot"></div></div>
 
 <script>
-window._plotSync = { ready:false, bridge:null, sourceId:null, ignore:false };
+window._plotSync = {{ ready:false, bridge:null, sourceId:null, ignore:false }};
 
-new QWebChannel(qt.webChannelTransport, function(channel) {
+new QWebChannel(qt.webChannelTransport, function(channel) {{
   window._plotSync.bridge = channel.objects.plotSync;
   window._plotSync.ready = true;
-});
+}});
 
-function installRelayoutHandler() {
+function installRelayoutHandler() {{
   const gd = document.getElementById('plot');
   if (!gd) return;
 
-  // Avoid multiple handlers if we rebuild/react
   if (gd.removeAllListeners) gd.removeAllListeners('plotly_relayout');
 
-    let _lastSent = 0;
-    let _timer = null;
-    let _pending = null;
+  let _lastSent = 0;
+  let _timer = null;
+  let _pending = null;
 
-    function buildPayload(gd) {
+  function buildPayload(gd) {{
     const is3d = !!(gd._fullLayout && gd._fullLayout.scene);
-    const payload = { mode: is3d ? "3d" : "2d" };
+    const payload = {{ mode: is3d ? "3d" : "2d" }};
 
-    if (is3d) {
-        const cam = gd._fullLayout.scene && gd._fullLayout.scene.camera;
-        if (cam) payload.camera = cam;
-    } else {
-        const xa = gd._fullLayout.xaxis, ya = gd._fullLayout.yaxis;
-        if (xa && xa.range && ya && ya.range) {
+    if (is3d) {{
+      const cam = gd._fullLayout.scene && gd._fullLayout.scene.camera;
+      if (cam) payload.camera = cam;
+    }} else {{
+      const xa = gd._fullLayout.xaxis, ya = gd._fullLayout.yaxis;
+      if (xa && xa.range && ya && ya.range) {{
         payload.xRange = xa.range;
         payload.yRange = ya.range;
-        }
-    }
+      }}
+    }}
     return payload;
-    }
+  }}
 
-    function maybeSend() {
+  function maybeSend() {{
     _timer = null;
     if (!_pending) return;
-    if (window._plotSync.ignore) { _pending = null; return; }
+    if (window._plotSync.ignore) {{ _pending = null; return; }}
 
     const payload = _pending;
     _pending = null;
 
-    if (window._plotSync.ready && window._plotSync.bridge) {
-        window._plotSync.bridge.relayView(window._plotSync.sourceId || "unknown", payload);
-    }
-    }
+    if (window._plotSync.ready && window._plotSync.bridge) {{
+      window._plotSync.bridge.relayView(window._plotSync.sourceId || "unknown", payload);
+    }}
+  }}
 
-    gd.on('plotly_relayout', function(e) {
-    try {
-        if (window._plotSync.ignore) return;
+  gd.on('plotly_relayout', function(e) {{
+    try {{
+      if (window._plotSync.ignore) return;
 
-        const now = Date.now();
-        _pending = buildPayload(gd);
+      const now = Date.now();
+      _pending = buildPayload(gd);
 
-        // throttle to ~40ms (25fps). adjust if you like.
-        const minInterval = 40;
-        const dt = now - _lastSent;
+      const minInterval = 40;
+      const dt = now - _lastSent;
 
-        if (dt >= minInterval) {
+      if (dt >= minInterval) {{
         _lastSent = now;
         maybeSend();
-        } else {
+      }} else {{
         if (_timer) clearTimeout(_timer);
-        _timer = setTimeout(() => {
-            _lastSent = Date.now();
-            maybeSend();
-        }, minInterval - dt);
-        }
-    } catch(err) {
-        console.log("relayout hook error", err);
-    }
-    });
-}
+        _timer = setTimeout(() => {{
+          _lastSent = Date.now();
+          maybeSend();
+        }}, minInterval - dt);
+      }}
+    }} catch(err) {{
+      console.log("relayout hook error", err);
+    }}
+  }});
+}}
 </script>
 </body>
 </html>"""
@@ -1066,7 +1687,17 @@ class FileWorker(QtCore.QThread):
                 meds.append(float(s.median()) if len(s) else float("nan"))
             loc_prec = tuple(float(f"{v:.2f}") for v in meds)
             ratio_loc_per_trace = avg_df["n"].sum() / len(avg_df)
+            avg_df['ratio_loc_per_trace'] = ""
+            if len(avg_df) > 0:
+                avg_df.iloc[0, avg_df.columns.get_loc("ratio_loc_per_trace")] = f"{ratio_loc_per_trace:.6f}"
 
+        # add loc prec to avg_df
+        if loc_prec is not None:
+            for i, dim in enumerate(dims):
+                avg_df[f"loc_{dim}_prec"] = ""
+                if len(avg_df) > 0:
+                    avg_df.iloc[0, avg_df.columns.get_loc(f"loc_{dim}_prec")] = f"{loc_prec[i]:.4f}"
+        
         save_path = os.path.join(p["save_folder"], f"{base}.csv")
         avg_save_path = os.path.join(p["save_folder"], f"{base}_stats.csv")
         save_to_csv(df, save_path)
@@ -1075,13 +1706,13 @@ class FileWorker(QtCore.QThread):
         items = [
             ("File", base),
             ("Total imaging time (min)", f"{total_tim/60:.2f}"),
-            ("Total raw localizations", str(total_loc)),
+            #("Total raw localizations", str(total_loc)),
             ("Last iteration localizations", str(last_iteration_loc)),
             ("After trace filtering", str(after_trace)),
             ("After EFO filtering", str(len(df))),
             ("Localization precision (x, y, z)", str(loc_prec) if loc_prec is not None else "—"),
             ("Ratio loc per trace", f"{ratio_loc_per_trace:.4f}"),
-            ("% remaining", f"{(len(df)/total_loc*100):.2f}%"),
+            ("% remaining", f"{(len(df)/last_iteration_loc*100):.2f}%"),
             ("Saved filtered CSV", save_path),
             ("Saved stats CSV", avg_save_path),
         ]
@@ -1144,8 +1775,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._plotly_loaded = False
         self._pending_fig = None
 
-        self._color_settings_win = None
-        self._color_mode_by_base = {}  # base -> one of COLOR_CHOICES
+        # base -> dict(mode="solid"/"end-to-end", solid="cyan"/..., lut="Turbo"/...)
+        self._color_settings_by_base = {}
 
         # params
         # ---- parameters (stored on MainWindow, edited via dialog) ----
@@ -1186,29 +1817,40 @@ class MainWindow(QtWidgets.QMainWindow):
         self.file_combo.currentIndexChanged.connect(self.on_file_changed)
         runrow.addWidget(self.file_combo, 1)
 
-        current_row = QtWidgets.QHBoxLayout()
+        # --- color settings panel + right-side controls row (under Parameters/Run) ---
+        color_and_controls = QtWidgets.QHBoxLayout()
+        left.addLayout(color_and_controls)
 
-        self.color_btn = QtWidgets.QPushButton("color settings")
-        self.color_btn.clicked.connect(self.open_color_settings)
-        current_row.addWidget(self.color_btn)
+        # Left: embedded color settings (scrollable)
+        self.color_panel = ColorSettingsPanel(parent=self)
+        self.color_panel.changed.connect(self.on_color_settings_changed)
+        color_and_controls.addWidget(self.color_panel, 5)   # change here the width of the color settings panel
+
+        # Right: stack the other controls vertically
+        right_controls = QtWidgets.QVBoxLayout()
+        color_and_controls.addLayout(right_controls, 1)
 
         self.multi_btn = QtWidgets.QPushButton("multicolor")
         self.multi_btn.clicked.connect(self.open_multicolor)
-        current_row.addWidget(self.multi_btn)   # <-- between label and checkboxes
+        # make button smaller
+        self.multi_btn.setMaximumWidth(110)
+        self.multi_btn.setMinimumHeight(22)
+        right_controls.addWidget(self.multi_btn)
 
         self.merged_chk = QtWidgets.QCheckBox("merged")
         self.merged_chk.setChecked(False)
         self.merged_chk.stateChanged.connect(self.on_merged_toggled)
-        current_row.addWidget(self.merged_chk)
-        
+        right_controls.addWidget(self.merged_chk)
+
         self.avg_tid = QtWidgets.QCheckBox("avg loc (tid)")
         self.avg_tid.stateChanged.connect(lambda _: self._refresh_all_plots_same_data())
-        current_row.addWidget(self.avg_tid)
+        right_controls.addWidget(self.avg_tid)
 
         self.is3d = QtWidgets.QCheckBox("3D")
         self.is3d.stateChanged.connect(lambda _: self._refresh_all_plots_same_data())
-        current_row.addWidget(self.is3d)
-        left.addLayout(current_row)
+        right_controls.addWidget(self.is3d)
+
+        right_controls.addStretch(1)
 
         # output table
         outbox = QtWidgets.QGroupBox("Output")
@@ -1241,8 +1883,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.fig = Figure(figsize=(5, 4.5), dpi=100)
         self.ax = self.fig.add_subplot(111)
         self.canvas = FigureCanvas(self.fig)
+        apply_hist_theme(self.fig, self.ax)
+        self.canvas.draw()
         hv.addWidget(self.canvas)
-        hv.addWidget(NavigationToolbar2QT(self.canvas, self))
+        self.nav_toolbar = NavigationToolbar2QT(self.canvas, self)
+        self.nav_toolbar.setIconSize(QtCore.QSize(16, 16))   # try 12, 14, 16
+        self.nav_toolbar.setFixedHeight(28)                  # try 24–30
+        hv.addWidget(self.nav_toolbar)
 
         ctrl = QtWidgets.QHBoxLayout()
         hv.addLayout(ctrl)
@@ -1309,24 +1956,40 @@ class MainWindow(QtWidgets.QMainWindow):
             self._pending_fig = None
             self.update_plotly_fig(fig)
 
-    def open_color_settings(self):
-        if self._color_settings_win is None:
-            self._color_settings_win = ColorSettingsWindow(self)
-            self._color_settings_win.changed.connect(self.on_color_mode_changed)
 
-        bases = [os.path.splitext(os.path.basename(f))[0] for f in self._all_files]
-        self._color_settings_win.rebuild(bases, self._color_mode_by_base)
+    def on_color_settings_changed(self, base: str, settings: dict):
+        if not isinstance(settings, dict):
+            return
 
-        self._color_settings_win.show()
-        self._color_settings_win.raise_()
-        self._color_settings_win.activateWindow()
+        mode = settings.get("mode", DEFAULT_MODE)
+        if mode not in MODE_CHOICES:
+            mode = DEFAULT_MODE
 
-    def on_color_mode_changed(self, base: str, mode: str):
-        self._color_mode_by_base[base] = mode
+        solid = settings.get("solid", DEFAULT_SOLID)
+        if solid not in SOLID_COLOR_CHOICES:
+            solid = DEFAULT_SOLID
 
-        # live update everywhere
+        lut = settings.get("lut", DEFAULT_LUT)
+        if lut not in LUT_CHOICES:
+            lut = DEFAULT_LUT
+
+        alpha = float(settings.get("alpha", DEFAULT_ALPHA))
+        alpha = max(0.0, min(1.0, alpha))
+
+        size = int(settings.get("size", DEFAULT_SIZE_2D))
+        size = max(1, min(50, size))
+
+        self._color_settings_by_base[base] = {
+            "mode": mode,
+            "solid": solid,
+            "lut": lut,
+            "alpha": alpha,
+            "size": size,
+        }
+
         self.redraw_scatter(reset_view=False)
         self._refresh_multicolor_contents(reset_view=False)
+
         
     def open_parameters_dialog(self):
         dlg = ParametersDialog(self)
@@ -1398,17 +2061,22 @@ class MainWindow(QtWidgets.QMainWindow):
                 if arr is not None:
                     arr_by_base[base] = arr
 
-            fig = make_plotly_fig_merged(arr_by_base, avg_tid=avg, is3d=is3d, color_mode_by_base=self._color_mode_by_base)
+            fig = make_plotly_fig_merged(
+                arr_by_base,
+                avg_tid=avg,
+                is3d=is3d,
+                color_settings_by_base=self._color_settings_by_base
+            )
             self._multicolor_win.update_merged(fig, reset_view=reset_view, is3d=is3d)
         else:
             figs = {}
             for f in self._all_files:
                 base = os.path.splitext(os.path.basename(f))[0]
-                mode = self._color_mode_by_base.get(base, "end-to-end distance")
+                cs = self._color_settings_by_base.get(base, {"mode": DEFAULT_MODE, "solid": DEFAULT_SOLID, "lut": DEFAULT_LUT, "alpha": DEFAULT_ALPHA, "size": DEFAULT_SIZE_2D})
                 arr = self._get_arr_for_base(base)
                 if arr is None:
                     continue
-                figs[base] = make_plotly_fig(arr, avg, is3d, color_mode=mode)
+                figs[base] = make_plotly_fig(arr, avg, is3d, color_settings=cs)
 
             self._multicolor_win.update_all(figs, reset_view=reset_view, is3d=is3d)
 
@@ -1448,8 +2116,8 @@ class MainWindow(QtWidgets.QMainWindow):
         arr = self._arr_by_base.get(base)
         if arr is None:
             return
-        mode = self._color_mode_by_base.get(base, "end-to-end distance")
-        fig = make_plotly_fig(arr, self.avg_tid.isChecked(), self.is3d.isChecked(), color_mode=mode)
+        cs = self._color_settings_by_base.get(base, {"mode": DEFAULT_MODE, "solid": DEFAULT_SOLID, "lut": DEFAULT_LUT, "alpha": DEFAULT_ALPHA, "size": DEFAULT_SIZE_2D})
+        fig = make_plotly_fig(arr, self.avg_tid.isChecked(), self.is3d.isChecked(), color_settings=cs)
         self._multicolor_win.update_one(base, fig, reset_view=reset_view, is3d=self.is3d.isChecked())
 
     def _multicolor_rebuild_if_open(self):
@@ -1525,9 +2193,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._current_index = 0 if self._all_files else -1
         if self._all_files:
             self.file_combo.setCurrentIndex(0)
-        if self._color_settings_win is not None and self._color_settings_win.isVisible():
-            bases = [os.path.splitext(os.path.basename(f))[0] for f in self._all_files]
-            self._color_settings_win.rebuild(bases, self._color_mode_by_base)
+        bases = [os.path.splitext(os.path.basename(f))[0] for f in self._all_files]
+        self.color_panel.rebuild(bases, self._color_settings_by_base)
+
 
     def on_file_changed(self, idx):
         if getattr(self, "_closing", False):
@@ -1627,10 +2295,17 @@ class MainWindow(QtWidgets.QMainWindow):
         # histogram
         self.ax.clear()
         bins = np.arange(efo_vals.min(), efo_vals.max() + bin_size, bin_size)
-        self.ax.hist(efo_vals, bins=bins, edgecolor="darkorange", color="darkorange")
+        self.ax.hist(
+            efo_vals,
+            bins=bins,
+            edgecolor=HIST_THEME["hist_edge"],
+            color=HIST_THEME["hist_face"],
+        )
         self.ax.set_xlabel("EFO")
         self.ax.set_ylabel("Count")
         self.ax.set_title(base)
+
+        apply_hist_theme(self.fig, self.ax)
         self.canvas.draw()
 
         self._span_xmin = float(efo_vals.min())
@@ -1645,7 +2320,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._span = SpanSelector(
             self.ax, onselect, direction="horizontal", useblit=True,
-            props=dict(facecolor="yellow", alpha=0.3, edgecolor="black", linewidth=2),
+            props=dict(
+                facecolor=HIST_THEME["span_face"],
+                alpha=HIST_THEME["span_alpha"],
+                edgecolor=HIST_THEME["span_edge"],
+                linewidth=HIST_THEME["span_lw"],
+            ),
             interactive=True, drag_from_anywhere=True
         )
         self._span.extents = (self._span_xmin, self._span_xmax)
@@ -1669,8 +2349,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._plot_arr = self._current_ctx["arr"]
             self._plot_is_filtered = False
         base = self._current_ctx["base"] if self._current_ctx else None
-        mode = self._color_mode_by_base.get(base, "end-to-end distance") if base else "end-to-end distance"
-        fig = make_plotly_fig(self._plot_arr, self.avg_tid.isChecked(), self.is3d.isChecked(), color_mode=mode)
+        cs = self._color_settings_by_base.get(base, {"mode": DEFAULT_MODE, "solid": DEFAULT_SOLID, "lut": DEFAULT_LUT, "alpha": DEFAULT_ALPHA, "size": DEFAULT_SIZE_2D})
+        fig = make_plotly_fig(self._plot_arr, self.avg_tid.isChecked(), self.is3d.isChecked(), color_settings=cs)
         self.update_plotly_fig(fig, reset_view=reset_view)
 
     def apply_preview(self):
@@ -1682,7 +2362,7 @@ class MainWindow(QtWidgets.QMainWindow):
         arr_efo = arr[mask]
 
         base = self._current_ctx["base"] if self._current_ctx else None
-        mode = self._color_mode_by_base.get(base, "end-to-end distance") if base else "end-to-end distance"
+        cs = self._color_settings_by_base.get(base, {"mode": DEFAULT_MODE, "solid": DEFAULT_SOLID, "lut": DEFAULT_LUT, "alpha": DEFAULT_ALPHA, "size": DEFAULT_SIZE_2D})
 
         self._arr_by_base[base] = arr_efo  # now filtered
         self._multicolor_update_base(base, reset_view=False)
@@ -1692,7 +2372,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._plot_is_filtered = True
 
         # update scatter
-        fig = make_plotly_fig(self._plot_arr, self.avg_tid.isChecked(), self.is3d.isChecked(), color_mode=mode)
+        fig = make_plotly_fig(self._plot_arr, self.avg_tid.isChecked(), self.is3d.isChecked(), color_settings=cs)
         self.update_plotly_fig(fig)
 
         # preview localization precision
@@ -1710,13 +2390,13 @@ class MainWindow(QtWidgets.QMainWindow):
         items = [
             ("File", self._current_ctx["base"]),
             ("Total imaging time (min)", f"{self._current_ctx['total_tim']/60:.2f}"),
-            ("Total raw localizations", str(self._current_ctx["total_loc"])),
+            #("Total raw localizations", str(self._current_ctx["total_loc"])),
             ("Last iteration localizations", str(self._current_ctx["last_iteration_loc"])),
             ("After trace filtering", str(self._current_ctx["after_trace"])),
             ("After EFO filtering", str(int(np.count_nonzero(mask)))),
             ("Localization precision (x, y, z)", str(lp) if lp is not None else "—"),
             ("Ratio loc per trace", f"{ratio_loc_per_trace:.4f}"),
-            ("% remaining", f"{(int(np.count_nonzero(mask))/self._current_ctx['total_loc']*100):.2f}%"),
+            ("% remaining", f"{(int(np.count_nonzero(mask)) / self._current_ctx['last_iteration_loc'] * 100):.2f}%"),
             ("Note", "Preview only. Click Continue to save + advance."),
         ]
         self.set_output(items)
@@ -1763,7 +2443,8 @@ class MainWindow(QtWidgets.QMainWindow):
 def main():
     app = QtWidgets.QApplication(sys.argv)
 
-    # Initialize WebEngine AFTER QApplication exists
+    apply_gui_theme(app)   # <<< add this line
+
     from PySide6.QtWebEngineCore import QWebEngineProfile
     QWebEngineProfile.defaultProfile()
 
