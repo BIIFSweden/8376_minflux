@@ -2327,40 +2327,78 @@ class MainWindow(QtWidgets.QMainWindow):
         color_and_controls.addLayout(right_controls, 1)
         right_controls.setContentsMargins(0, 18, 0, 0)  # push down; tweak 18->24 etc
 
+        row = QtWidgets.QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(10)
+
         self.avg_tid = QtWidgets.QCheckBox("avg loc (tid)")
         self.avg_tid.stateChanged.connect(lambda _: self._refresh_all_plots_same_data())
-        right_controls.addWidget(self.avg_tid)
+        row.addWidget(self.avg_tid, 1)
 
         self.is3d = QtWidgets.QCheckBox("3D")
         self.is3d.stateChanged.connect(lambda _: self._refresh_all_plots_same_data())
-        right_controls.addWidget(self.is3d)
+        row.addWidget(self.is3d, 0)
 
-        right_controls.addWidget(make_labeled_separator("Multicolor"))
+        right_controls.addLayout(row)
 
+        # --- Multicolor buttons ---
+        mc = QtWidgets.QWidget()
+        mc_lay = QtWidgets.QVBoxLayout(mc)
+        mc_lay.setContentsMargins(0, 6, 0, 6)
+        mc_lay.setSpacing(12)
+
+        VIEWER_W = 150          # pick what looks good on your UI
+        BTN_H    = 34
+        GAP_H    = 10
+
+        def tune_btn(b, w):
+            b.setFixedHeight(BTN_H)
+            b.setFixedWidth(w)
+
+        # Viewer (full width)
         self.multi_btn = QtWidgets.QPushButton("Viewer")
         self.multi_btn.clicked.connect(self.open_multicolor)
-        # make button smaller
-        self.multi_btn.setMaximumWidth(110)
-        self.multi_btn.setMinimumHeight(22)
-        right_controls.addWidget(self.multi_btn)
+        tune_btn(self.multi_btn, VIEWER_W)
+        mc_lay.addWidget(self.multi_btn, 0, Qt.AlignHCenter)
+
+        mc_lay.addSpacing(GAP_H)
+
+        # Row: Align + Reset (half width each)
+        roww = QtWidgets.QWidget()
+        row = QtWidgets.QHBoxLayout(roww)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(12)
+
+        half_w = (VIEWER_W - row.spacing()) // 2  # ensures the pair matches viewer width
 
         self.mbm_align_btn = QtWidgets.QPushButton("Align mbm")
         self.mbm_align_btn.clicked.connect(self.on_mbm_align_clicked)
-        right_controls.addWidget(self.mbm_align_btn)
+        tune_btn(self.mbm_align_btn, (VIEWER_W - row.spacing()) // 1.5)
 
-        self.mbm_reset_btn = QtWidgets.QPushButton("Reset align")
+        self.mbm_reset_btn = QtWidgets.QPushButton("Reset")
         self.mbm_reset_btn.clicked.connect(self.on_mbm_reset_clicked)
-        right_controls.addWidget(self.mbm_reset_btn)
+        tune_btn(self.mbm_reset_btn, (VIEWER_W - row.spacing()) // 2.5)
+
+        row.addWidget(self.mbm_align_btn)
+        row.addWidget(self.mbm_reset_btn)
+
+        mc_lay.addWidget(roww, 0, Qt.AlignHCenter)
+
+        # Center the checkbox as a whole (indicator + text)
+        chk_wrap = QtWidgets.QWidget()
+        chk_lay = QtWidgets.QHBoxLayout(chk_wrap)
+        chk_lay.setContentsMargins(0, 0, 0, 0)
+        chk_lay.addStretch(1)
 
         self.merged_chk = QtWidgets.QCheckBox("Merged")
         self.merged_chk.setChecked(False)
         self.merged_chk.stateChanged.connect(self.on_merged_toggled)
-        right_controls.addWidget(self.merged_chk)
+        chk_lay.addWidget(self.merged_chk, 0)
 
-        for b in (self.mbm_align_btn, self.mbm_reset_btn):
-            b.setMaximumWidth(110)
-            b.setMinimumHeight(22)
-        right_controls.addStretch(1)
+        chk_lay.addStretch(1)
+        mc_lay.addWidget(chk_wrap)
+
+        right_controls.addWidget(mc)
 
         # output table
         outbox = QtWidgets.QGroupBox("Output")
