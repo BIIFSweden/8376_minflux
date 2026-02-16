@@ -266,7 +266,7 @@ def tid_to_color(tid, alpha=1.0):
     return f"rgba({r},{g},{b},{a})"
 
 
-def make_plotly_fig(arr, avg_tid: bool, is3d: bool, color_settings: dict = None):
+def make_plotly_fig(arr, avg_tid: bool, is3d: bool, color_settings: dict = None, scalebar_nm = 100.0):
     """
     Build a Plotly figure for one dataset.
 
@@ -379,13 +379,13 @@ def make_plotly_fig(arr, avg_tid: bool, is3d: bool, color_settings: dict = None)
         dy = float(np.nanmax(y) - np.nanmin(y)) if len(y) else 0.0
         if dx > 0 and dy > 0:
             fig.update_yaxes(scaleanchor="x", scaleratio=1)
-        add_scalebar_2d(fig, SCALEBAR_LENGTH_NM)
+        add_scalebar_2d(fig, scalebar_nm)
 
     apply_plot_theme(fig, is3d=is3d)
     return fig
 
 
-def make_plotly_fig_merged(arr_by_base: dict, avg_tid: bool, is3d: bool, color_settings_by_base: dict):
+def make_plotly_fig_merged(arr_by_base: dict, avg_tid: bool, is3d: bool, color_settings_by_base: dict, scalebar_nm = 100):
     """
     Build one Plotly figure containing traces for every base in arr_by_base.
 
@@ -466,7 +466,7 @@ def make_plotly_fig_merged(arr_by_base: dict, avg_tid: bool, is3d: bool, color_s
             ),
         )
     else:
-        add_scalebar_2d(fig, SCALEBAR_LENGTH_NM)
+        add_scalebar_2d(fig, scalebar_nm)
         fig.update_layout(
             dragmode="pan",
             legend=dict(
@@ -501,6 +501,148 @@ def make_plotly_fig_merged(arr_by_base: dict, avg_tid: bool, is3d: bool, color_s
             pass
 
     apply_plot_theme(fig, is3d=is3d)
+    return fig
+
+def pointcloud_to_image(x_nm, y_nm, pixel_size_nm=5.0, padding_nm=0.0):
+    """
+    Bin a 2D point cloud (x_nm, y_nm) into an image where each pixel is
+    pixel_size_nm wide/tall. Pixel intensity = number of points in that pixel.
+
+    Returns
+    -------
+    H : (ny, nx) ndarray
+        2D histogram (counts per pixel). Row 0 corresponds to lowest y-bin.
+    extent : (xmin, xmax, ymin, ymax)
+        Extent in nm for plotting.
+    """
+    x_nm = np.asarray(x_nm).ravel()
+    y_nm = np.asarray(y_nm).ravel()
+    if x_nm.size == 0:
+        return np.zeros((1, 1), dtype=float), (0.0, 1.0, 0.0, 1.0)
+    if x_nm.size != y_nm.size:
+        raise ValueError("x_nm and y_nm must have the same length")
+
+    xmin, xmax = float(np.min(x_nm)), float(np.max(x_nm))
+    ymin, ymax = float(np.min(y_nm)), float(np.max(y_nm))
+
+    xmin -= padding_nm; xmax += padding_nm
+    ymin -= padding_nm; ymax += padding_nm
+
+    # avoid degenerate ranges
+    if xmax == xmin:
+        xmax = xmin + pixel_size_nm
+    if ymax == ymin:
+        ymax = ymin + pixel_size_nm
+
+    nx = int(np.ceil((xmax - xmin) / pixel_size_nm))
+    ny = int(np.ceil((ymax - ymin) / pixel_size_nm))
+    nx = max(nx, 1)
+    ny = max(ny, 1)
+
+    x_edges = xmin + np.arange(nx + 1) * pixel_size_nm
+    y_edges = ymin + np.arange(ny + 1) * pixel_size_nm
+
+    # histogram2d: first arg = y, second = x so H[ybin, xbin]
+    H, _, _ = np.histogram2d(y_nm, x_nm, bins=(y_edges, x_edges))
+    extent = (x_edges[0], x_edges[-1], y_edges[0], y_edges[-1])
+    return H, extent
+
+def make_plotly_heatmap_from_arr(
+    arr,
+    pixel_size_nm: float,
+    lut: str,
+    title: str = None,
+    *,
+    scale_mode: str = "linear",   # "linear" (default) or "log"
+):
+    """
+    Build a single Plotly heatmap for the array's loc_x/loc_y (assumes nm units already).
+
+    Parameters
+    ----------
+    arr : structured ndarray with field "loc" shaped (N, >=2)
+    pixel_size_nm : float
+        Binning pixel size in nm (global setting).
+    lut : str
+        Plotly colorscale name (must be in LUT_CHOICES).
+    title : str
+        Figure title.
+    scale_mode : str
+        "linear" or "log" (log uses log10(count+1)).
+    """
+    if arr is None or len(arr) == 0:
+        fig = go.Figure()
+        fig.update_layout(annotations=[dict(text="No data", x=0.5, y=0.5, showarrow=False)])
+        apply_plot_theme(fig, is3d=False)
+        return fig
+
+    loc = np.asarray(arr["loc"], dtype=float)
+    if loc.ndim != 2 or loc.shape[1] < 2:
+        fig = go.Figure()
+        fig.update_layout(annotations=[dict(text="Bad loc shape", x=0.5, y=0.5, showarrow=False)])
+        apply_plot_theme(fig, is3d=False)
+        return fig
+
+    x = loc[:, 0]
+    y = loc[:, 1]
+    m = np.isfinite(x) & np.isfinite(y)
+    x = x[m]
+    y = y[m]
+    if len(x) == 0:
+        fig = go.Figure()
+        fig.update_layout(annotations=[dict(text="No valid points", x=0.5, y=0.5, showarrow=False)])
+        apply_plot_theme(fig, is3d=False)
+        return fig
+
+    pixel_size_nm = float(pixel_size_nm)
+    pixel_size_nm = max(pixel_size_nm, 0.1)
+
+    H, extent = pointcloud_to_image(x, y, pixel_size_nm=pixel_size_nm, padding_nm=0.0)
+    xmin, xmax, ymin, ymax = extent
+    ny, nx = H.shape
+
+    # pixel center coordinates
+    x_centers = xmin + (np.arange(nx) + 0.5) * pixel_size_nm
+    y_centers = ymin + (np.arange(ny) + 0.5) * pixel_size_nm
+
+    if lut not in LUT_CHOICES:
+        lut = DEFAULT_LUT_BIN
+
+    scale_mode = (scale_mode or "linear").strip().lower()
+    if scale_mode not in ("linear", "log10(count+1)"):
+        scale_mode = "linear"
+
+    if scale_mode == "log10(count+1)":
+        Z = np.log10(H + 1.0)
+        cb_title = "log"#10(count+1)"
+        zmin = 0
+    else:
+        Z = H.astype(float, copy=False)
+        cb_title = "count"
+        zmin = 0
+
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=Z.tolist(),                 # JSON-safe
+            x=x_centers.tolist(),
+            y=y_centers.tolist(),
+            colorscale=lut,
+            colorbar=dict(title=cb_title),
+            zmin=zmin,
+        )
+    )
+
+    fig.update_layout(
+        title=title,
+        xaxis_title="x (nm)",
+        yaxis_title="y (nm)",
+        dragmode="pan",
+    )
+    fig.update_yaxes(scaleanchor="x", scaleratio=1)
+    apply_plot_theme(fig, is3d=False)
+    fig.update_xaxes(showline=False, ticks="", showticklabels=False)
+    fig.update_yaxes(showline=False, ticks="", showticklabels=False)
+
     return fig
 
 def make_trace_for_arr(arr, avg_tid: bool, is3d: bool, color_settings: dict, name: str = None, show_colorbar: bool = True):
@@ -1007,6 +1149,7 @@ LUT_CHOICES = sorted(LUT_CHOICES)
 
 DEFAULT_SOLID = "darkgreen"
 DEFAULT_LUT = "twilight"
+DEFAULT_LUT_BIN = "hot"
 DEFAULT_MODE = "depth"
 
 # -------------------- Plot theme --------------------
@@ -1045,7 +1188,8 @@ PLOT_THEME = {
     "margin": dict(l=0, r=0, t=20, b=0),
 }
 
-SCALEBAR_LENGTH_NM = 100.0
+DEFAULT_SCALEBAR_LENGTH_NM = 100.0
+SCALEBAR_LENGTH_NM = DEFAULT_SCALEBAR_LENGTH_NM  
 SCALEBAR_MARGIN_FRACTION = 0.05   # distance from lower-left as fraction of current view range
 SCALEBAR_LINE_WIDTH = 4
 SCALEBAR_COLOR = "#E6E6E6"
@@ -1357,13 +1501,23 @@ class ParametersDialog(QtWidgets.QDialog):
         form.addWidget(QtWidgets.QLabel("EFO histogram bin size:"), 1, 2)
         form.addWidget(self.bin_size, 1, 3)
 
+        self.scalebar_nm = QtWidgets.QDoubleSpinBox()
+        self.scalebar_nm.setDecimals(1)
+        self.scalebar_nm.setRange(1, 1e9)
+        self.scalebar_nm.setSingleStep(10.0)
+
+        form.addWidget(QtWidgets.QLabel("Scale bar size (nm):"), 2, 0)
+        form.addWidget(self.scalebar_nm, 2, 1)
+        form.addWidget(QtWidgets.QLabel(""), 2, 2)
+        form.addWidget(QtWidgets.QLabel(""), 2, 3)
+
         note = QtWidgets.QLabel("Data is usually recorded in meters, set scale factor to 1e9 to convert to nanometers.")
         note.setWordWrap(True)
         # optional: make it look like a hint
         note.setStyleSheet("color: #B0B3B8;")  # or remove if you don't want styling
 
         # row 2, start at column 0, span 1 row x 4 columns
-        form.addWidget(note, 2, 0, 1, 4)
+        form.addWidget(note, 3, 0, 1, 4)
 
         self.mbm_table = QtWidgets.QTableWidget(0, 3)
         self.mbm_table.setHorizontalHeaderLabels(["File", "MBM folder", ""])
@@ -1386,11 +1540,12 @@ class ParametersDialog(QtWidgets.QDialog):
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
 
-    def set_values(self, *, min_trace_len, z_corr, scale, bin_size):
+    def set_values(self, *, min_trace_len, z_corr, scale, bin_size, scalebar_nm):
         self.min_trace.setValue(int(min_trace_len))
         self.zcorr.setValue(float(z_corr))
         self.scale.setValue(float(scale))
         self.bin_size.setValue(float(bin_size))
+        self.scalebar_nm.setValue(float(scalebar_nm))
 
     def values(self):
         return dict(
@@ -1398,6 +1553,7 @@ class ParametersDialog(QtWidgets.QDialog):
             z_corr=float(self.zcorr.value()),
             scale=float(self.scale.value()),
             bin_size=float(self.bin_size.value()),
+            scalebar_nm=float(self.scalebar_nm.value()),
         )
 
     def set_mbm_rows(self, file_paths):
@@ -1430,6 +1586,231 @@ class ParametersDialog(QtWidgets.QDialog):
             le = self.mbm_table.cellWidget(r, 1)
             out[base] = le.text().strip() if le else ""
         return out
+
+class BinningWindow(QtWidgets.QMainWindow):
+    """
+    One window, one plot.
+    Table: File | XX (single selection) | LUT | Pixel size (nm)
+    Shows heatmap for the selected file, using the SAVED array:
+      - if MBM enabled -> aligned saved array if available
+      - else -> saved array
+    """
+    def __init__(self, main_window: "MainWindow", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Binning")
+        self.resize(1100, 700)
+
+        self._mw = main_window
+        self._widgets_by_base = {}
+        self._selected_base = None
+
+        central = QtWidgets.QWidget()
+        self.setCentralWidget(central)
+        root = QtWidgets.QVBoxLayout(central)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(8)
+
+        # top bar: table + plot
+        top = QtWidgets.QHBoxLayout()
+        root.addLayout(top, 2)
+
+        # --- left: table ---
+        left = QtWidgets.QVBoxLayout()
+        top.addLayout(left, 1)
+
+        self.table = QtWidgets.QTableWidget(0, 3, self)
+        self.table.setHorizontalHeaderLabels(["File", "XX", "LUT"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+
+        hdr = self.table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+        hdr.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeToContents)
+
+        self.table.setMinimumWidth(420)
+        self.table.setMaximumWidth(520)
+        left.addWidget(self.table, 1)
+
+        # --- controls under table (global) ---
+        ctrl = QtWidgets.QHBoxLayout()
+        left.addLayout(ctrl)
+
+        ctrl.addWidget(QtWidgets.QLabel("Scale:"))
+        self.scale_combo = QtWidgets.QComboBox()
+        self.scale_combo.addItems(["linear", "log10(count+1)"])
+        self.scale_combo.setCurrentText("linear")  # DEFAULT = linear
+        self.scale_combo.currentTextChanged.connect(lambda _: self.refresh_plot(keep_view=True))
+        ctrl.addWidget(self.scale_combo)
+
+        ctrl.addSpacing(12)
+
+        ctrl.addWidget(QtWidgets.QLabel("Pixel size (nm):"))
+        self.px_spin = QtWidgets.QDoubleSpinBox()
+        self.px_spin.setDecimals(1)
+        self.px_spin.setRange(0.1, 1e6)
+        self.px_spin.setSingleStep(1.0)
+        self.px_spin.setValue(5.0)
+        self.px_spin.valueChanged.connect(lambda _: self.refresh_plot(keep_view=True))
+        ctrl.addWidget(self.px_spin)
+
+        ctrl.addStretch(1)
+
+        # --- right: plot ---
+        self.view = PlotlyView()
+        top.addWidget(self.view, 3)
+
+        # bottom buttons
+        btnrow = QtWidgets.QHBoxLayout()
+        root.addLayout(btnrow)
+        btnrow.addStretch(1)
+
+        self.refresh_btn = QtWidgets.QPushButton("Refresh")
+        self.refresh_btn.clicked.connect(self.refresh_plot)
+        btnrow.addWidget(self.refresh_btn)
+
+        self.close_btn = QtWidgets.QPushButton("Close")
+        self.close_btn.clicked.connect(self.close)
+        btnrow.addWidget(self.close_btn)
+
+    def rebuild(self, base_names):
+        self.table.setRowCount(0)
+        self._widgets_by_base.clear()
+
+        for r, base in enumerate(base_names):
+            self.table.insertRow(r)
+
+            item = QtWidgets.QTableWidgetItem(base)
+            self.table.setItem(r, 0, item)
+
+            # XX checkbox (single selection)
+            xx = QtWidgets.QCheckBox()
+            xx.toggled.connect(lambda checked, b=base: self._on_xx_toggled(b, checked))
+            xx_cell = QtWidgets.QWidget()
+            xx_lay = QtWidgets.QHBoxLayout(xx_cell)
+            xx_lay.setContentsMargins(0, 0, 0, 0)
+            xx_lay.setAlignment(Qt.AlignCenter)
+            xx_lay.addWidget(xx)
+            self.table.setCellWidget(r, 1, xx_cell)
+
+            # LUT combo
+            lut = QtWidgets.QComboBox()
+            lut.addItems(LUT_CHOICES)
+            lut.setCurrentText(DEFAULT_LUT_BIN)
+            lut.currentTextChanged.connect(lambda _, b=base: self._on_settings_changed(b))
+            self.table.setCellWidget(r, 2, lut)
+
+            self._widgets_by_base[base] = dict(xx=xx, lut=lut)
+
+        self.table.resizeRowsToContents()
+
+        # optionally auto-select first file if any
+        if base_names and self._selected_base is None:
+            first = base_names[0]
+            self._select_base(first, do_refresh=True)
+
+    def _on_settings_changed(self, base: str):
+        if base == self._selected_base:
+            self.refresh_plot(keep_view=True)
+
+    def _select_base(self, base: str, do_refresh: bool):
+        # enforce single selection
+        for b, w in self._widgets_by_base.items():
+            chk = w["xx"]
+            chk.blockSignals(True)
+            chk.setChecked(b == base)
+            chk.blockSignals(False)
+
+        self._selected_base = base
+        if do_refresh:
+            self.refresh_plot(keep_view=False)  # autorange for new file
+
+    def _on_xx_toggled(self, base: str, checked: bool):
+        if checked:
+            self._select_base(base, do_refresh=True)
+        else:
+            if self._selected_base == base:
+                self._selected_base = None
+                fig = go.Figure()
+                fig.update_layout(annotations=[dict(text="No file selected", x=0.5, y=0.5, showarrow=False)])
+                apply_plot_theme(fig, is3d=False)
+                self.view.update_fig(fig, reset_view=True, is3d=False)
+
+    def _on_zmax_checked(self, state: int):
+            on = (state == Qt.Checked)
+            self.zmax_spin.setEnabled(on)
+
+            if on:
+                # try to set a reasonable default based on current selection
+                base, lut, px = self._get_selected_settings()
+                if base:
+                    arr = self._mw._filtered_by_base.get(base)
+                    if getattr(self._mw, "_mbm_enabled", False):
+                        arr = self._mw._aligned_arr_by_base.get(base, arr)
+                    if arr is not None and len(arr):
+                        loc = np.asarray(arr["loc"], dtype=float)
+                        x = loc[:, 0]; y = loc[:, 1]
+                        m = np.isfinite(x) & np.isfinite(y)
+                        x = x[m]; y = y[m]
+                        if len(x):
+                            H, _ = pointcloud_to_image(x, y, pixel_size_nm=float(px), padding_nm=0.0)
+                            if self.scale_combo.currentText() == "log":
+                                Z = np.log10(H + 1.0)
+                            else:
+                                Z = H.astype(float, copy=False)
+                            if self.minmax_chk.isChecked():
+                                # normalized => zmax should be 1
+                                self.zmax_spin.setValue(1.0)
+                            else:
+                                vmax = float(np.nanmax(Z)) if np.size(Z) else 1.0
+                                self.zmax_spin.setValue(vmax)
+
+            self.refresh_plot()
+
+    def _get_selected_settings(self):
+        base = self._selected_base
+        if not base:
+            return None, None
+        w = self._widgets_by_base.get(base)
+        if not w:
+            return base, DEFAULT_LUT_BIN
+        return base, w["lut"].currentText()
+
+    def refresh_plot(self, keep_view: bool = True):
+        base, lut = self._get_selected_settings()
+        if not base:
+            return
+
+        # saved array (EFO-filtered), aligned if enabled
+        arr = self._mw._filtered_by_base.get(base)
+        if arr is None:
+            fig = go.Figure()
+            fig.update_layout(annotations=[dict(
+                text=f"No saved (EFO-filtered) data for: {base}<br>Apply EFO first.",
+                x=0.5, y=0.5, showarrow=False
+            )])
+            apply_plot_theme(fig, is3d=False)
+            self.view.update_fig(fig, reset_view=True, is3d=False)
+            return
+
+        if getattr(self._mw, "_mbm_enabled", False):
+            arr = self._mw._aligned_arr_by_base.get(base, arr)
+
+        # global settings
+        pixel_size_nm = float(self.px_spin.value()) if hasattr(self, "px_spin") else 5.0
+        scale_mode = self.scale_combo.currentText().strip().lower() if hasattr(self, "scale_combo") else "linear"
+
+        fig = make_plotly_heatmap_from_arr(
+            arr,
+            pixel_size_nm=pixel_size_nm,
+            lut=lut,
+            title=None,
+            scale_mode=scale_mode,
+        )
+
+        # keep current zoom if requested
+        self.view.update_fig(fig, reset_view=not keep_view, is3d=False)
 
 
 class PlotSyncBridge(QtCore.QObject):
@@ -2236,6 +2617,7 @@ class MainWindow(QtWidgets.QMainWindow):
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
         root = QtWidgets.QVBoxLayout(central)
+        self._binning_win = None
 
         # ---- top area: controls + output ----
         top = QtWidgets.QHBoxLayout()
@@ -2273,6 +2655,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # base -> dict(mode="solid"/"end-to-end", solid="cyan"/..., lut="Turbo"/...)
         self._color_settings_by_base = {}
+
+        self._scalebar_nm = 100.0
 
         # params
         # ---- parameters (stored on MainWindow, edited via dialog) ----
@@ -2398,6 +2782,12 @@ class MainWindow(QtWidgets.QMainWindow):
         chk_lay.addStretch(1)
         mc_lay.addWidget(chk_wrap)
 
+        # --- Binning button (under Merged checkbox) ---
+        self.binning_btn = QtWidgets.QPushButton("Binning")
+        self.binning_btn.clicked.connect(self.open_binning_window)
+        tune_btn(self.binning_btn, VIEWER_W)
+        mc_lay.addWidget(self.binning_btn, 0, Qt.AlignHCenter)
+
         right_controls.addWidget(mc)
 
         # output table
@@ -2515,12 +2905,82 @@ class MainWindow(QtWidgets.QMainWindow):
         self._plotly_ready = False
         self.web.setHtml(self._plotly_bootstrap_html(), QUrl("about:blank"))
 
+    def open_binning_window(self):
+            if self._binning_win is None:
+                self._binning_win = BinningWindow(self, self)
+
+            bases = [os.path.splitext(os.path.basename(f))[0] for f in self._all_files]
+            self._binning_win.rebuild(bases)
+
+            self._binning_win.show()
+            self._binning_win.raise_()
+            self._binning_win.activateWindow()
+
     def _on_plotly_load_finished(self, ok: bool):
         self._plotly_ready = bool(ok)
         if ok and self._pending_fig is not None:
             fig = self._pending_fig
             self._pending_fig = None
             self.update_plotly_fig(fig)
+
+    def reset_session(self):
+        """Reset all analysis state so a new folder starts from scratch."""
+        # cancel any running worker
+        try:
+            if self._current_worker is not None and self._current_worker.isRunning():
+                self._current_worker.cancel()
+                self._current_worker.wait(1000)
+        except Exception:
+            pass
+        self._current_worker = None
+
+        # clear state caches
+        self._current_index = 0
+        self._current_ctx = None
+        self._plot_arr = None
+        self._plot_is_filtered = False
+
+        self._ctx_by_base.clear()
+        self._efo_range_by_base.clear()
+        self._filtered_by_base.clear()
+
+        self._raw_arr_by_base.clear()
+        self._arr_by_base.clear()
+        self._aligned_arr_by_base.clear()
+        self._T_by_base.clear()
+
+        self._mbm_enabled = False
+        self._mbm_source_base = None
+
+        # reset UI controls
+        self.apply_btn.setEnabled(False)
+        self.back_btn.setEnabled(False)
+        self.next_btn.setEnabled(False)
+        self.save_all_btn.setEnabled(False)
+
+        self.range_lbl.setText("Selected range: —")
+        self.set_output([])
+
+        # clear histogram
+        try:
+            self.ax.clear()
+            apply_hist_theme(self.fig, self.ax)
+            self.canvas.draw()
+        except Exception:
+            pass
+
+        # clear main plot
+        try:
+            fig = go.Figure()
+            fig.update_layout(annotations=[dict(text="No data", x=0.5, y=0.5, showarrow=False)])
+            apply_plot_theme(fig, is3d=False)
+            self.plot_view.update_fig(fig, reset_view=True, is3d=False)
+        except Exception:
+            pass
+
+        # re-enable Run
+        self.run_btn.setEnabled(True)
+        self.statusBar().showMessage("Ready.")
 
     def on_mbm_align_clicked(self):
         # infer source if needed
@@ -2651,6 +3111,7 @@ class MainWindow(QtWidgets.QMainWindow):
             z_corr=self.zcorr.value(),
             scale=self.scale.value(),
             bin_size=self.bin_size.value(),
+            scalebar_nm=getattr(self, "_scalebar_nm", 100.0),
         )
 
         dlg.set_mbm_rows(self._all_files)   # <-- required
@@ -2661,6 +3122,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.zcorr.setValue(vals["z_corr"])
             self.scale.setValue(vals["scale"])
             self.bin_size.setValue(vals["bin_size"])
+            self._scalebar_nm = float(vals["scalebar_nm"])
+            
+            self.redraw_scatter(reset_view=False)
+            self._refresh_multicolor_contents(reset_view=False)
 
             # if a histogram is currently shown, refreshing it to new bin size can be helpful:
             if self._current_ctx is not None:
@@ -2721,7 +3186,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 arr_by_base,
                 avg_tid=avg,
                 is3d=is3d,
-                color_settings_by_base=self._color_settings_by_base
+                color_settings_by_base=self._color_settings_by_base,
+                scalebar_nm=getattr(self, "_scalebar_nm", 100.0)
             )
             self._multicolor_win.update_merged(fig, reset_view=reset_view, is3d=is3d)
         else:
@@ -2732,7 +3198,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 arr = self._get_arr_for_base(base)
                 if arr is None:
                     continue
-                figs[base] = make_plotly_fig(arr, avg, is3d, color_settings=cs)
+                figs[base] = make_plotly_fig(arr, avg, is3d, color_settings=cs, scalebar_nm=getattr(self, "_scalebar_nm", 100.0))
 
             self._multicolor_win.update_all(figs, reset_view=reset_view, is3d=is3d)
 
@@ -2787,8 +3253,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---------------- UI actions ----------------
     def browse_folder(self):
+        old = self.data_edit.text().strip()
         path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select MINFLUX data folder")
         if path:
+            path = os.path.normpath(path)
+            if os.path.normpath(old) != path:
+                self.reset_session()   # <-- key line
+
             self.data_edit.setText(path)
             self.set_default_output()
             self.refresh_files()
@@ -2813,6 +3284,11 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             if self._multicolor_win is not None:
                 self._multicolor_win.close()
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_binning_win", None) is not None:
+                self._binning_win.close()
         except Exception:
             pass
 
@@ -3153,7 +3629,13 @@ class MainWindow(QtWidgets.QMainWindow):
             },
         )
 
-        fig = make_plotly_fig(arr_to_plot, self.avg_tid.isChecked(), self.is3d.isChecked(), color_settings=cs)
+        fig = make_plotly_fig(
+            arr_to_plot,
+            self.avg_tid.isChecked(),
+            self.is3d.isChecked(),
+            color_settings=cs,
+            scalebar_nm=getattr(self, "_scalebar_nm", 100.0),
+        )
         self.update_plotly_fig(fig, reset_view=reset_view)
 
     def apply_preview(self):
@@ -3167,6 +3649,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # if alignment is enabled, recompute it on the *filtered* datasets
         if self._mbm_enabled:
             self._apply_mbm_alignment()
+        if self._binning_win is not None and self._binning_win.isVisible():
+            self._binning_win.refresh_plot()
 
     def on_mbm_align_toggled(self, state):
         enabled = (state == Qt.Checked)
@@ -3272,6 +3756,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.redraw_scatter(reset_view=False)
         self._refresh_multicolor_contents(reset_view=False)
+        if self._binning_win is not None and self._binning_win.isVisible():
+            self._binning_win.refresh_plot()
 
     def go_next(self):
         if not self._all_files:
