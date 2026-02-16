@@ -1617,6 +1617,191 @@ class PlotlyView(QtWidgets.QWidget):
         download.accept()
 
     def _bootstrap_html(self):
+        bg = PLOTLY_HTML_BG
+
+        # scalebar constants
+        L = float(SCALEBAR_LENGTH_NM)
+        mfrac = float(SCALEBAR_MARGIN_FRACTION)
+        sb_color = str(SCALEBAR_COLOR)
+        sb_lw = int(SCALEBAR_LINE_WIDTH)
+        sb_label = f"{int(round(L))} nm"
+
+        return f"""<!doctype html>
+    <html>
+    <head>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+    <style>
+    html, body {{
+    margin:0; padding:0;
+    width:100%; height:100%;
+    overflow:hidden;
+    background: {bg};
+    }}
+    #container {{
+    width:100%; height:100%;
+    background: {bg};
+    }}
+    #plot {{
+    width:100%; height:100%;
+    background: {bg};
+    }}
+    </style>
+    </head>
+    <body>
+    <div id="container"><div id="plot"></div></div>
+
+    <script>
+    window._plotSync = {{ ready:false, bridge:null, sourceId:null, ignore:false, _scalebarUpdating:false }};
+
+    new QWebChannel(qt.webChannelTransport, function(channel) {{
+    window._plotSync.bridge = channel.objects.plotSync;
+    window._plotSync.ready = true;
+    }});
+
+    function updateScaleBar2D(gd) {{
+    try {{
+        if (!gd || !gd._fullLayout) return;
+        if (gd._fullLayout.scene) return; // only 2D
+
+        const xa = gd._fullLayout.xaxis;
+        const ya = gd._fullLayout.yaxis;
+        if (!xa || !ya || !xa.range || !ya.range) return;
+
+        const xMin = xa.range[0], xMax = xa.range[1];
+        const yMin = ya.range[0], yMax = ya.range[1];
+
+        const dx = xMax - xMin;
+        const dy = yMax - yMin;
+        if (!isFinite(dx) || !isFinite(dy) || dx === 0 || dy === 0) return;
+
+        const L = {L};
+        const m = {mfrac};
+
+        const x0 = xMin + m * dx;
+        const y0 = yMin + m * dy;
+        const x1 = x0 + L;
+
+        const sbName = "scalebar";
+        const sbLabelName = "scalebar_label";
+
+        const shapes = (gd.layout && gd.layout.shapes) ? gd.layout.shapes.slice() : [];
+        const anns = (gd.layout && gd.layout.annotations) ? gd.layout.annotations.slice() : [];
+
+        const shapes2 = shapes.filter(s => !(s && s.name === sbName));
+        const anns2 = anns.filter(a => !(a && a.name === sbLabelName));
+
+        shapes2.push({{
+        type: "line",
+        xref: "x",
+        yref: "y",
+        x0: x0, y0: y0,
+        x1: x1, y1: y0,
+        line: {{ color: "{sb_color}", width: {sb_lw} }},
+        name: sbName
+        }});
+
+        anns2.push({{
+        x: (x0 + x1) / 2.0,
+        y: y0 + 0.03 * dy,
+        xref: "x",
+        yref: "y",
+        text: "{sb_label}",
+        showarrow: false,
+        font: {{ color: "{sb_color}", size: 12 }},
+        name: sbLabelName
+        }});
+
+        window._plotSync._scalebarUpdating = true;
+        Plotly.relayout(gd, {{ shapes: shapes2, annotations: anns2 }})
+        .then(() => {{ window._plotSync._scalebarUpdating = false; }})
+        .catch(() => {{ window._plotSync._scalebarUpdating = false; }});
+
+    }} catch (e) {{
+        console.log("updateScaleBar2D error", e);
+    }}
+    }}
+
+    function installRelayoutHandler() {{
+    const gd = document.getElementById('plot');
+    if (!gd) return;
+
+    if (gd.removeAllListeners) gd.removeAllListeners('plotly_relayout');
+
+    let _lastSent = 0;
+    let _timer = null;
+    let _pending = null;
+
+    function buildPayload(gd) {{
+        const is3d = !!(gd._fullLayout && gd._fullLayout.scene);
+        const payload = {{ mode: is3d ? "3d" : "2d" }};
+
+        if (is3d) {{
+        const cam = gd._fullLayout.scene && gd._fullLayout.scene.camera;
+        if (cam) payload.camera = cam;
+        }} else {{
+        const xa = gd._fullLayout.xaxis, ya = gd._fullLayout.yaxis;
+        if (xa && xa.range && ya && ya.range) {{
+            payload.xRange = xa.range;
+            payload.yRange = ya.range;
+        }}
+        }}
+        return payload;
+    }}
+
+    function maybeSend() {{
+        _timer = null;
+        if (!_pending) return;
+
+        if (window._plotSync.ignore || window._plotSync._scalebarUpdating) {{
+        _pending = null;
+        return;
+        }}
+
+        const payload = _pending;
+        _pending = null;
+
+        if (window._plotSync.ready && window._plotSync.bridge) {{
+        window._plotSync.bridge.relayView(window._plotSync.sourceId || "unknown", payload);
+        }}
+    }}
+
+    gd.on('plotly_relayout', function(e) {{
+        try {{
+        // ALWAYS update scalebar for user pan/zoom (skip only if we are updating it ourselves)
+        if (!window._plotSync._scalebarUpdating) {{
+            updateScaleBar2D(gd);
+        }}
+
+        // broadcasting part
+        if (window._plotSync.ignore || window._plotSync._scalebarUpdating) return;
+
+        const now = Date.now();
+        _pending = buildPayload(gd);
+
+        const minInterval = 40;
+        const dt = now - _lastSent;
+
+        if (dt >= minInterval) {{
+            _lastSent = now;
+            maybeSend();
+        }} else {{
+            if (_timer) clearTimeout(_timer);
+            _timer = setTimeout(() => {{
+            _lastSent = Date.now();
+            maybeSend();
+            }}, minInterval - dt);
+        }}
+        }} catch(err) {{
+        console.log("relayout hook error", err);
+        }}
+    }});
+    }}
+    </script>
+    </body>
+    </html>"""
         bg = PLOTLY_HTML_BG  # uses your constant
         return f"""<!doctype html>
 <html>
@@ -1693,30 +1878,37 @@ function installRelayoutHandler() {{
     }}
   }}
 
-  gd.on('plotly_relayout', function(e) {{
+    gd.on('plotly_relayout', function(e) {{
     try {{
-      if (window._plotSync.ignore) return;
+        // Always keep scalebar in bottom-left of current view.
+        // Skip if this relayout is the one we triggered to set the scalebar.
+        if (!window._plotSync._scalebarUpdating) {{
+        updateScaleBar2D(gd);
+        }}
 
-      const now = Date.now();
-      _pending = buildPayload(gd);
+        // Everything below is only for broadcasting view sync
+        if (window._plotSync.ignore || window._plotSync._scalebarUpdating) return;
 
-      const minInterval = 40;
-      const dt = now - _lastSent;
+        const now = Date.now();
+        _pending = buildPayload(gd);
 
-      if (dt >= minInterval) {{
+        const minInterval = 40;
+        const dt = now - _lastSent;
+
+        if (dt >= minInterval) {{
         _lastSent = now;
         maybeSend();
-      }} else {{
+        }} else {{
         if (_timer) clearTimeout(_timer);
         _timer = setTimeout(() => {{
-          _lastSent = Date.now();
-          maybeSend();
+            _lastSent = Date.now();
+            maybeSend();
         }}, minInterval - dt);
-      }}
+        }}
     }} catch(err) {{
-      console.log("relayout hook error", err);
+        console.log("relayout hook error", err);
     }}
-  }});
+    }});
 }}
 </script>
 </body>
@@ -1862,6 +2054,9 @@ function installRelayoutHandler() {{
         }} else {{
         await Plotly.react(gd, fig.data, fig.layout, config);
         }}
+
+        // ensure scalebar placed for current initial view
+        updateScaleBar2D(gd);
 
         // Install relayout handler after plot exists
         installRelayoutHandler();
