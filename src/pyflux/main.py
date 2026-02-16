@@ -22,13 +22,149 @@ import plotly.io as pio
 import json
 from PySide6.QtGui import QColor
 import hashlib
+from scipy.spatial import cKDTree
+import zarr
+from functools import partial
 
 # -------------------- helpers --------------------
 def save_to_csv(df, save_path):
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     df.to_csv(save_path, index=False)
 
+def moving_average_1d(a, n=4):
+    a = np.asarray(a, dtype=float)
+    if len(a) < n:
+        return a
+    ret = np.cumsum(a)
+    ret[n:] = ret[n:] - ret[:-n]
+    return ret[n-1:] / n
 
+def best_rigid_transform(A, B):
+    centroid_A = A.mean(axis=0)
+    centroid_B = B.mean(axis=0)
+    AA = A - centroid_A
+    BB = B - centroid_B
+    H = AA.T @ BB
+    U, S, Vt = np.linalg.svd(H)
+    R = Vt.T @ U.T
+    if np.linalg.det(R) < 0:
+        Vt[-1, :] *= -1
+        R = Vt.T @ U.T
+    t = centroid_B - R @ centroid_A
+    return R, t
+
+def apply_T(points, T):
+    ones = np.ones((points.shape[0], 1))
+    P = np.hstack([points, ones])
+    return (P @ T.T)[:, :3]
+
+def icp(source, target, max_iterations=50, tolerance=0.5e-9):
+    src = source.copy()
+    T_total = np.eye(4)
+    prev_err = np.inf
+    tree = cKDTree(target)
+    for _ in range(max_iterations):
+        dists, idx = tree.query(src, k=1)
+        corr = target[idx]
+        R, t = best_rigid_transform(src, corr)
+        T = np.eye(4)
+        T[:3,:3] = R
+        T[:3, 3] = t
+        src = apply_T(src, T)
+        T_total = T @ T_total
+        mean_err = float(np.mean(dists))
+        if abs(prev_err - mean_err) < tolerance:
+            break
+        prev_err = mean_err
+    return src, T_total
+
+def load_mbm_points(grd_mbm_path):
+    g = zarr.open_group(grd_mbm_path, mode="r")
+    points = g["points"][:]
+    return points
+
+def bead_initial_positions(points, k=4, min_count=10):
+    gri_vals = np.asarray(points["gri"])
+    xyz = np.asarray(points["xyz"])
+    out = {}
+    for gri in np.unique(gri_vals):
+        mask = (gri_vals == gri)
+        if mask.sum() <= min_count:
+            continue
+        bead_xyz = xyz[mask]
+        x = moving_average_1d(bead_xyz[:,0], n=k)
+        y = moving_average_1d(bead_xyz[:,1], n=k)
+        z = moving_average_1d(bead_xyz[:,2], n=k)
+        if len(x) == 0:
+            continue
+        out[int(gri)] = np.array([x[0], y[0], z[0]], dtype=float)
+    return out
+
+def match_and_filter_beads(beads_ref, beads_mov):
+    common = sorted(set(beads_ref.keys()) & set(beads_mov.keys()))
+    if len(common) < 3:
+        raise ValueError(f"Need >=3 common beads, got {len(common)}")
+
+    ref = np.vstack([beads_ref[g] for g in common])
+    mov = np.vstack([beads_mov[g] for g in common])
+
+    z = ref[:,2]
+    if np.std(z) > 100e-9:
+        keep = (z < np.median(z) + 1.5*np.std(z))
+    else:
+        keep = (z < np.median(z) + 100e-9)
+
+    common_kept = [g for g,k in zip(common, keep) if k]
+    if len(common_kept) < 3:
+        raise ValueError(f"After z-filter need >=3 beads, got {len(common_kept)}")
+
+    ref_kept = np.vstack([beads_ref[g] for g in common_kept])
+    mov_kept = np.vstack([beads_mov[g] for g in common_kept])
+    return ref_kept, mov_kept, common_kept
+
+def make_labeled_separator(text: str):
+    w = QtWidgets.QWidget()
+    h = QtWidgets.QHBoxLayout(w)
+    h.setContentsMargins(0, 6, 0, 6)
+    h.setSpacing(8)
+
+    line1 = QtWidgets.QFrame()
+    line1.setFrameShape(QtWidgets.QFrame.HLine)
+    line1.setFrameShadow(QtWidgets.QFrame.Plain)
+
+    lbl = QtWidgets.QLabel(text)
+    lbl.setAlignment(Qt.AlignCenter)
+
+    line2 = QtWidgets.QFrame()
+    line2.setFrameShape(QtWidgets.QFrame.HLine)
+    line2.setFrameShadow(QtWidgets.QFrame.Plain)
+
+    h.addWidget(line1, 1)
+    h.addWidget(lbl, 0)
+    h.addWidget(line2, 1)
+    return w
+
+def compute_mbm_transform(mbm_ref_dir, mbm_mov_dir, k=4, scale=1.0):
+    pts_ref = load_mbm_points(mbm_ref_dir)
+    pts_mov = load_mbm_points(mbm_mov_dir)
+
+    beads_ref = bead_initial_positions(pts_ref, k=k)
+    beads_mov = bead_initial_positions(pts_mov, k=k)
+
+    ref_pts, mov_pts, common = match_and_filter_beads(beads_ref, beads_mov)
+
+    # IMPORTANT: match units to MINFLUX loc units
+    ref_pts = ref_pts * scale
+    mov_pts = mov_pts * scale
+
+    _, T_total = icp(mov_pts, ref_pts, max_iterations=50, tolerance=0.5e-9 * scale)
+    return T_total, common
+
+def apply_transform_to_arr(arr, T):
+    out = arr.copy()
+    out_loc = apply_T(np.asarray(out["loc"], dtype=float), T)
+    out["loc"] = out_loc
+    return out
 
 def np_to_df(np_data):
     df = pd.DataFrame(np_data.tolist(), columns=np_data.dtype.names)
@@ -243,6 +379,7 @@ def make_plotly_fig(arr, avg_tid: bool, is3d: bool, color_settings: dict = None)
         dy = float(np.nanmax(y) - np.nanmin(y)) if len(y) else 0.0
         if dx > 0 and dy > 0:
             fig.update_yaxes(scaleanchor="x", scaleratio=1)
+        add_scalebar_2d(fig, SCALEBAR_LENGTH_NM)
 
     apply_plot_theme(fig, is3d=is3d)
     return fig
@@ -329,12 +466,13 @@ def make_plotly_fig_merged(arr_by_base: dict, avg_tid: bool, is3d: bool, color_s
             ),
         )
     else:
+        add_scalebar_2d(fig, SCALEBAR_LENGTH_NM)
         fig.update_layout(
             dragmode="pan",
             legend=dict(
                 orientation="h",
                 yanchor="bottom",
-                y=1.02,
+                y=0.99,
                 xanchor="left",
                 x=0.0,
             ),
@@ -549,6 +687,73 @@ def apply_plot_theme(fig: go.Figure, *, is3d: bool):
 
     return fig
 
+def add_scalebar_2d(fig: go.Figure, length_nm: float = 100.0):
+    """
+    Adds a data-anchored scale bar of `length_nm` (same units as x/y) to the
+    lower-left of the current data range.
+    Works for 2D figures with numeric x/y.
+    """
+    if fig is None or not fig.data:
+        return fig
+
+    # collect all x/y from traces
+    xs, ys = [], []
+    for tr in fig.data:
+        if hasattr(tr, "x") and tr.x is not None:
+            xs.extend(tr.x)
+        if hasattr(tr, "y") and tr.y is not None:
+            ys.extend(tr.y)
+
+    if not xs or not ys:
+        return fig
+
+    xs = np.asarray(xs, dtype=float)
+    ys = np.asarray(ys, dtype=float)
+    m = np.isfinite(xs) & np.isfinite(ys)
+    xs, ys = xs[m], ys[m]
+    if len(xs) == 0:
+        return fig
+
+    xmin, xmax = float(xs.min()), float(xs.max())
+    ymin, ymax = float(ys.min()), float(ys.max())
+
+    dx = xmax - xmin
+    dy = ymax - ymin
+    if dx <= 0 or dy <= 0:
+        return fig
+
+    # position: a bit inset from lower-left of data extent
+    x0 = xmin + SCALEBAR_MARGIN_FRACTION * dx
+    y0 = ymin + SCALEBAR_MARGIN_FRACTION * dy
+    x1 = x0 + float(length_nm)
+
+    # remove previous scalebar (if any)
+    fig.layout.shapes = tuple(s for s in (fig.layout.shapes or []) if s.get("name") != "scalebar")
+    fig.layout.annotations = tuple(a for a in (fig.layout.annotations or []) if a.get("name") != "scalebar_label")
+
+    # add line
+    fig.add_shape(
+        type="line",
+        xref="x", yref="y",
+        x0=x0, y0=y0,
+        x1=x1, y1=y0,
+        line=dict(color=SCALEBAR_COLOR, width=SCALEBAR_LINE_WIDTH),
+        name="scalebar",
+    )
+
+    # add label centered above line
+    fig.add_annotation(
+        x=(x0 + x1) / 2.0,
+        y=y0 + 0.02 * dy,
+        xref="x", yref="y",
+        text=f"{length_nm:.0f} nm",
+        showarrow=False,
+        font=dict(color=SCALEBAR_COLOR, size=12),
+        name="scalebar_label",
+    )
+
+    return fig
+
 def apply_hist_theme(fig: Figure, ax):
     th = HIST_THEME
 
@@ -583,6 +788,13 @@ def apply_gui_theme(app: QtWidgets.QApplication):
         background: {t["border"]};
         width: 1px;
         height: 1px;
+    }}
+
+    QFrame[role="separator"] {{
+    color: #3C4043;
+    background-color: #3C4043;
+    min-height: 1px;
+    max-height: 1px;
     }}
 
     /* Group boxes */
@@ -668,6 +880,34 @@ def apply_gui_theme(app: QtWidgets.QApplication):
         padding: 4px;
     }}
 
+    /* Spinbox buttons (up/down) */
+    QSpinBox::up-button, QDoubleSpinBox::up-button,
+    QSpinBox::down-button, QDoubleSpinBox::down-button {{
+        background-color: #303134;              /* choose */
+        border-left: 1px solid #4A4D50;
+        width: 16px;
+    }}
+
+    QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
+    QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {{
+        background-color: #3A3B3C;
+    }}
+
+    /* Arrow color */
+    QSpinBox::up-arrow, QDoubleSpinBox::up-arrow,
+    QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {{
+        width: 8px;
+        height: 8px;
+        /* this controls the arrow glyph color */
+        color: #ffffff;
+    }}
+
+    /* Optional: pressed */
+    QSpinBox::up-button:pressed, QDoubleSpinBox::up-button:pressed,
+    QSpinBox::down-button:pressed, QDoubleSpinBox::down-button:pressed {{
+        background-color: #2B2C2D;
+    }}
+
     /* Buttons */
     QPushButton {{
         background-color: {t["button_bg"]};
@@ -714,7 +954,7 @@ def apply_gui_theme(app: QtWidgets.QApplication):
 
 GUI_THEME = {
     "bg": "#202122",          # main window background
-    "panel_bg": "#25272A",    # groupboxes / panels
+    "panel_bg": "#202122",    # groupboxes / panels
     "text": "#E8EAED",
     "muted_text": "#B0B3B8",
     "border": "#3C4043",
@@ -736,8 +976,8 @@ GUI_THEME = {
 # -------------------- constants --------------------
 
 DEFAULT_ALPHA = 0.85
-DEFAULT_SIZE_2D = 6
-DEFAULT_SIZE_3D = 6
+DEFAULT_SIZE_2D = 5
+DEFAULT_SIZE_3D = 5
 
 MODE_SOLID = "solid"
 MODE_DEPTH = "depth"
@@ -779,9 +1019,9 @@ PLOT_THEME = {
     "font_color": "#E6E6E6",
 
     # backgrounds
-    "paper_bg": "#1E1E1E",              # outside plotting area
-    "plot_bg":  "#1E1E1E",              # 2D plotting area
-    "scene_bg": "#1E1E1E",              # 3D scene background
+    "paper_bg": "#202122",              # outside plotting area
+    "plot_bg":  "#202122",              # 2D plotting area
+    "scene_bg": "#202122",              # 3D scene background
 
     # axes/grid (2D)
     "axis_line_color": "#8A8A8A",
@@ -805,13 +1045,19 @@ PLOT_THEME = {
     "margin": dict(l=0, r=0, t=20, b=0),
 }
 
+SCALEBAR_LENGTH_NM = 100.0
+SCALEBAR_MARGIN_FRACTION = 0.05   # distance from lower-left as fraction of current view range
+SCALEBAR_LINE_WIDTH = 4
+SCALEBAR_COLOR = "#E6E6E6"
+
+
 PLOTLY_HTML_BG = PLOT_THEME["paper_bg"]   # or PLOT_THEME["plot_bg"]
 
 # -------------------- Matplotlib theme (histogram) --------------------
 
 HIST_THEME = {
-    "fig_bg":   "#1E1E1E",   # matches PLOT_THEME["paper_bg"]
-    "ax_bg":    "#1E1E1E",   # matches PLOT_THEME["plot_bg"]
+    "fig_bg":   "#202122",   # matches PLOT_THEME["paper_bg"]
+    "ax_bg":    "#202122",   # matches PLOT_THEME["plot_bg"]
     "text":     "#E6E6E6",
     "grid":     "#2F2F2F",
     "spines":   "#8A8A8A",
@@ -832,17 +1078,13 @@ HIST_THEME = {
 
 class ColorSettingsPanel(QtWidgets.QGroupBox):
     """
-    Embedded color settings:
-      base : [mode combo] [palette combo] alpha: [0..1] size: [int]
-
-    mode:
-      - "solid"                 -> palette is SOLID_COLOR_CHOICES
-      - "end-to-end"   -> palette is LUT_CHOICES
-      - "depth"                 -> palette is LUT_CHOICES
+    Table-based color settings:
+      Columns: File | Mode | LUT/Solid | α | Size
+      One row per file base.
 
     Emits changed(base, settings_dict).
     settings_dict keys:
-      - mode: str
+      - mode: str  ("solid"|"depth"|"tid"|"end-to-end")
       - solid: str
       - lut: str
       - alpha: float
@@ -850,233 +1092,232 @@ class ColorSettingsPanel(QtWidgets.QGroupBox):
     """
     changed = Signal(str, object)  # (base, settings dict)
 
+    COL_FILE  = 0
+    COL_MODE  = 1
+    COL_PALETTE = 2
+    COL_ALPHA = 3
+    COL_SIZE  = 4
+    COL_MBM_SOURCE = 5
+
     def __init__(self, title="Color settings", parent=None):
         super().__init__(title, parent)
 
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(8, 8, 8, 8)
 
-        self.scroll = QtWidgets.QScrollArea()
-        self.scroll.setWidgetResizable(True)
-        outer.addWidget(self.scroll, 1)
+        self.table = QtWidgets.QTableWidget(0, 6, self)
+        self.table.setHorizontalHeaderLabels(["File", "Mode", "LUT / Solid", "α", "Size", "mbm source"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        
+        self.table.setAlternatingRowColors(False)
 
-        self.inner = QtWidgets.QWidget()
-        self.form = QtWidgets.QFormLayout(self.inner)
-        self.form.setLabelAlignment(Qt.AlignLeft)
-        self.form.setFormAlignment(Qt.AlignTop)
-        self.form.setVerticalSpacing(8)
-        self.scroll.setWidget(self.inner)
+        hdr = self.table.horizontalHeader()
+        hdr.setStretchLastSection(False)
 
-        # base -> (mode_combo, palette_combo, alpha_spin, size_spin)
-        self._widgets_by_base = {}
+        hdr.setSectionResizeMode(self.COL_FILE, QtWidgets.QHeaderView.Interactive)
+        self.table.setColumnWidth(self.COL_FILE, 260)
 
-        # show ~3 rows before scrolling; adjust to taste
-        self.setMinimumHeight(160)
-        self.setMaximumHeight(220)
+        hdr.setSectionResizeMode(self.COL_MODE, QtWidgets.QHeaderView.Stretch)
+        hdr.setSectionResizeMode(self.COL_PALETTE, QtWidgets.QHeaderView.Stretch)
+        hdr.setSectionResizeMode(self.COL_ALPHA, QtWidgets.QHeaderView.Stretch)
+        hdr.setSectionResizeMode(self.COL_SIZE, QtWidgets.QHeaderView.Stretch)
 
-    def _make_row_widget(self, base: str, settings: dict):
-        row = QtWidgets.QWidget()
-        h = QtWidgets.QHBoxLayout(row)
-        h.setContentsMargins(0, 0, 0, 0)
-        h.setSpacing(4)
+        # make it scroll when many rows
+        self.table.setMinimumHeight(170)
+        self.table.setMaximumHeight(260)
 
-        mode_combo = QtWidgets.QComboBox()
-        mode_combo.addItems(MODE_CHOICES)
+        outer.addWidget(self.table, 1)
 
-        palette_combo = QtWidgets.QComboBox()
+        # base -> dict of widgets
+        self._row_by_base = {}  # base -> row index
+        self._widgets_by_base = {}  # base -> dict(mode=..., palette=..., alpha=..., size=...)
 
-        alpha_lbl = QtWidgets.QLabel("\u03B1:")  # Greek letter alpha
-        alpha_spin = QtWidgets.QDoubleSpinBox()
-        alpha_spin.setRange(0.0, 1.0)
-        alpha_spin.setDecimals(2)
-        alpha_spin.setSingleStep(0.05)
-
-        size_lbl = QtWidgets.QLabel("size:")
-        size_spin = QtWidgets.QSpinBox()
-        size_spin.setRange(1, 50)  # adjust if you want larger
-        size_spin.setSingleStep(1)
-
-        # ---- apply initial settings ----
-        s = settings or {}
-        mode = s.get("mode", DEFAULT_MODE)
-        if mode not in MODE_CHOICES:
-            mode = DEFAULT_MODE
-
-        solid = s.get("solid", DEFAULT_SOLID)
-        if solid not in SOLID_COLOR_CHOICES:
-            solid = DEFAULT_SOLID
-
-        lut = s.get("lut", DEFAULT_LUT)
-        if lut not in LUT_CHOICES:
-            lut = DEFAULT_LUT
-
-        alpha = float(s.get("alpha", DEFAULT_ALPHA))
-        alpha = max(0.0, min(1.0, alpha))
-
-        size = int(s.get("size", DEFAULT_SIZE_2D))
-        size = max(1, min(50, size))
-
-        mode_combo.setCurrentText(mode)
-        alpha_spin.setValue(alpha)
-        size_spin.setValue(size)
-
-        def fill_palette_for_mode(m: str):
-            palette_combo.blockSignals(True)
-            palette_combo.clear()
-
-            if m == MODE_SOLID:
-                palette_combo.setEnabled(True)
-                palette_combo.addItems(SOLID_COLOR_CHOICES)
-                palette_combo.setCurrentText(solid if solid in SOLID_COLOR_CHOICES else DEFAULT_SOLID)
-
-            elif m == MODE_TID:
-                palette_combo.setEnabled(False)
-                palette_combo.addItem("—")
-
-            else:  # MODE_DEPTH or MODE_E2E
-                palette_combo.setEnabled(True)
-                palette_combo.addItems(LUT_CHOICES)
-                palette_combo.setCurrentText(lut if lut in LUT_CHOICES else DEFAULT_LUT)
-
-            palette_combo.blockSignals(False)
-
-        fill_palette_for_mode(mode)
-
-        def emit_changed():
-            m = mode_combo.currentText()
-            a = float(alpha_spin.value())
-            sz = int(size_spin.value())
-
-            if m == MODE_SOLID:
-                payload = {
-                    "mode": MODE_SOLID,
-                    "solid": palette_combo.currentText(),
-                    "lut": DEFAULT_LUT,
-                    "alpha": a,
-                    "size": sz,
-                }
-            elif m == MODE_DEPTH:
-                payload = {
-                    "mode": MODE_DEPTH,
-                    "solid": DEFAULT_SOLID,
-                    "lut": palette_combo.currentText(),
-                    "alpha": a,
-                    "size": sz,
-                }
-            elif m == MODE_TID:
-                payload = {
-                    "mode": MODE_TID,
-                    "solid": DEFAULT_SOLID,
-                    "lut": DEFAULT_LUT,   # ignored
-                    "alpha": a,
-                    "size": sz,
-                }
-            else:  # MODE_E2E
-                payload = {
-                    "mode": MODE_E2E,
-                    "solid": DEFAULT_SOLID,
-                    "lut": palette_combo.currentText(),
-                    "alpha": a,
-                    "size": sz,
-                }
-
-            self.changed.emit(base, payload)
-
-        def on_mode_changed(m: str):
-            fill_palette_for_mode(m)
-            emit_changed()
-
-        # ---- wire signals ----
-        mode_combo.currentTextChanged.connect(on_mode_changed)
-        palette_combo.currentTextChanged.connect(lambda _: emit_changed())
-        alpha_spin.valueChanged.connect(lambda _: emit_changed())
-        size_spin.valueChanged.connect(lambda _: emit_changed())
-
-        # ---- layout row ----
-        h.addWidget(mode_combo, 1)
-        h.addWidget(palette_combo, 2)
-        h.addSpacing(4)
-        h.addWidget(alpha_lbl)
-        h.addWidget(alpha_spin)
-        h.addSpacing(4)
-        h.addWidget(size_lbl)
-        h.addWidget(size_spin)
-
-        self._widgets_by_base[base] = (mode_combo, palette_combo, alpha_spin, size_spin)
-        return row
-
-    def rebuild(self, base_names, current_settings_by_base: dict):
-        while self.form.rowCount():
-            self.form.removeRow(0)
-        self._widgets_by_base.clear()
-
-        for base in base_names:
-            settings = (current_settings_by_base or {}).get(base, None)
-            row_widget = self._make_row_widget(base, settings)
-            self.form.addRow(f"{base}:", row_widget)
-
-    def set_settings(self, base: str, settings: dict):
-        pair = self._widgets_by_base.get(base)
-        if not pair:
+    def _emit_row(self, base: str):
+        w = self._widgets_by_base.get(base)
+        if not w:
             return
 
-        mode_combo, palette_combo, alpha_spin, size_spin = pair
-        s = settings or {}
+        mode = w["mode"].currentText()
+        alpha = float(w["alpha"].value())
+        size = int(w["size"].value())
 
-        # normalize
-        mode = s.get("mode", DEFAULT_MODE)
-        if mode not in MODE_CHOICES:
-            mode = DEFAULT_MODE
+        # palette meaning depends on mode
+        if mode == "solid":
+            payload = {
+                "mode": "solid",
+                "solid": w["palette"].currentText(),
+                "lut": DEFAULT_LUT,
+                "alpha": alpha,
+                "size": size,
+            }
+        elif mode == "tid":
+            payload = {
+                "mode": "tid",
+                "solid": DEFAULT_SOLID,
+                "lut": DEFAULT_LUT,
+                "alpha": alpha,
+                "size": size,
+            }
+        elif mode == "depth":
+            payload = {
+                "mode": "depth",
+                "solid": DEFAULT_SOLID,
+                "lut": w["palette"].currentText(),
+                "alpha": alpha,
+                "size": size,
+            }
+        else:  # "end-to-end"
+            payload = {
+                "mode": "end-to-end",
+                "solid": DEFAULT_SOLID,
+                "lut": w["palette"].currentText(),
+                "alpha": alpha,
+                "size": size,
+            }
 
-        solid = s.get("solid", DEFAULT_SOLID)
-        if solid not in SOLID_COLOR_CHOICES:
-            solid = DEFAULT_SOLID
+        self.changed.emit(base, payload)
 
-        lut = s.get("lut", DEFAULT_LUT)
-        if lut not in LUT_CHOICES:
-            lut = DEFAULT_LUT
+    def _fill_palette_for_mode(self, base: str, mode: str, *, solid_default: str, lut_default: str):
+        w = self._widgets_by_base[base]
+        palette = w["palette"]
 
-        alpha = float(s.get("alpha", DEFAULT_ALPHA))
-        alpha = max(0.0, min(1.0, alpha))
-
-        size = int(s.get("size", DEFAULT_SIZE_2D))
-        size = max(1, min(50, size))
-
-        # set mode first (this controls palette content)
-        mode_combo.blockSignals(True)
-        mode_combo.setCurrentText(mode)
-        mode_combo.blockSignals(False)
-
-        # set palette according to mode (solid vs LUT vs disabled for tid)
-        palette_combo.blockSignals(True)
-        palette_combo.clear()
+        palette.blockSignals(True)
+        palette.clear()
 
         if mode == "solid":
-            palette_combo.setEnabled(True)
-            palette_combo.addItems(SOLID_COLOR_CHOICES)
-            palette_combo.setCurrentText(solid if solid in SOLID_COLOR_CHOICES else DEFAULT_SOLID)
+            palette.setEnabled(True)
+            palette.addItems(SOLID_COLOR_CHOICES)
+            palette.setCurrentText(solid_default if solid_default in SOLID_COLOR_CHOICES else DEFAULT_SOLID)
 
         elif mode == "tid":
-            palette_combo.setEnabled(False)
-            palette_combo.addItem("—")
+            palette.setEnabled(False)
+            palette.addItem("—")
 
-        else:
-            # "depth" or "end-to-end"
-            palette_combo.setEnabled(True)
-            palette_combo.addItems(LUT_CHOICES)
-            palette_combo.setCurrentText(lut if lut in LUT_CHOICES else DEFAULT_LUT)
+        else:  # "depth" or "end-to-end"
+            palette.setEnabled(True)
+            palette.addItems(LUT_CHOICES)
+            palette.setCurrentText(lut_default if lut_default in LUT_CHOICES else DEFAULT_LUT)
 
-        palette_combo.blockSignals(False)
+        palette.blockSignals(False)
 
-        # alpha/size
-        alpha_spin.blockSignals(True)
-        alpha_spin.setValue(alpha)
-        alpha_spin.blockSignals(False)
+    def rebuild(self, base_names, current_settings_by_base: dict):
+        self.table.setRowCount(0)
+        self._row_by_base.clear()
+        self._widgets_by_base.clear()
 
-        size_spin.blockSignals(True)
-        size_spin.setValue(size)
-        size_spin.blockSignals(False)
+        for row, base in enumerate(base_names):
+            self.table.insertRow(row)
+            self._row_by_base[base] = row
 
+            s = (current_settings_by_base or {}).get(base, {}) or {}
+            mode = s.get("mode", DEFAULT_MODE)
+            if mode not in MODE_CHOICES:
+                mode = DEFAULT_MODE
+
+            solid = s.get("solid", DEFAULT_SOLID)
+            lut = s.get("lut", DEFAULT_LUT)
+
+            alpha = float(s.get("alpha", DEFAULT_ALPHA))
+            alpha = max(0.0, min(1.0, alpha))
+
+            size = int(s.get("size", DEFAULT_SIZE_2D))
+            size = max(1, min(50, size))
+
+            # --- File cell (text) ---
+            item = QtWidgets.QTableWidgetItem(base)
+            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            self.table.setItem(row, self.COL_FILE, item)
+
+            # --- Mode combo ---
+            mode_combo = QtWidgets.QComboBox()
+            mode_combo.addItems(MODE_CHOICES)
+            mode_combo.setCurrentText(mode)
+
+            # --- Palette combo ---
+            palette_combo = QtWidgets.QComboBox()
+
+            # --- Alpha spin ---
+            alpha_spin = QtWidgets.QDoubleSpinBox()
+            alpha_spin.setRange(0.0, 1.0)
+            alpha_spin.setDecimals(2)
+            alpha_spin.setSingleStep(0.05)
+            alpha_spin.setValue(alpha)
+
+            # --- Size spin ---
+            size_spin = QtWidgets.QSpinBox()
+            size_spin.setRange(1, 50)
+            size_spin.setValue(size)
+
+            # --- mbm source ---
+            src_chk = QtWidgets.QCheckBox()
+            src_chk.setChecked(bool(s.get("mbm_source", False)))
+            src_chk.stateChanged.connect(partial(self._on_source_toggled, base))
+
+            cell = QtWidgets.QWidget()
+            lay = QtWidgets.QHBoxLayout(cell)
+            lay.setContentsMargins(0, 0, 0, 0)
+            lay.setAlignment(Qt.AlignCenter)
+            lay.addWidget(src_chk)
+
+            self.table.setCellWidget(row, self.COL_MBM_SOURCE, cell)
+
+            self._widgets_by_base[base] = dict(
+                mode=mode_combo,
+                palette=palette_combo,
+                alpha=alpha_spin,
+                size=size_spin,
+                mbm_source=src_chk,     # self._widgets_by_base[base]["mbm_source"] = src_chk # Different??
+            )
+
+            # initial palette fill based on mode
+            self._fill_palette_for_mode(base, mode, solid_default=solid, lut_default=lut)
+
+            # connect signals (avoid lambda capturing row; capture base)
+            mode_combo.currentTextChanged.connect(lambda m, b=base: self._on_mode_changed(b, m))
+            palette_combo.currentTextChanged.connect(lambda _, b=base: self._emit_row(b))
+            alpha_spin.valueChanged.connect(lambda _, b=base: self._emit_row(b))
+            size_spin.valueChanged.connect(lambda _, b=base: self._emit_row(b))
+
+            self.table.setCellWidget(row, self.COL_MODE, mode_combo)
+            self.table.setCellWidget(row, self.COL_PALETTE, palette_combo)
+            self.table.setCellWidget(row, self.COL_ALPHA, alpha_spin)
+            self.table.setCellWidget(row, self.COL_SIZE, size_spin)
+
+        self.table.resizeRowsToContents()
+
+    def _on_mode_changed(self, base: str, mode: str):
+        # keep existing palette selection if possible, otherwise fall back
+        w = self._widgets_by_base.get(base)
+        if not w:
+            return
+
+        current_palette = w["palette"].currentText()
+
+        # infer defaults from stored current_palette when switching
+        solid_default = current_palette if current_palette in SOLID_COLOR_CHOICES else DEFAULT_SOLID
+        lut_default = current_palette if current_palette in LUT_CHOICES else DEFAULT_LUT
+
+        self._fill_palette_for_mode(base, mode, solid_default=solid_default, lut_default=lut_default)
+        self._emit_row(base)
+
+    def _on_source_toggled(self, base: str, state: int):
+        if state != Qt.Checked:
+            self.changed.emit(base, {"mbm_source": False})
+            return
+
+        # uncheck all others
+        for b, w in self._widgets_by_base.items():
+            chk = w.get("mbm_source")
+            if chk is None:
+                continue
+            if b != base:
+                chk.blockSignals(True)
+                chk.setChecked(False)
+                chk.blockSignals(False)
+
+        self.changed.emit(base, {"mbm_source": True, "mbm_source_base": base})
 
 class ParametersDialog(QtWidgets.QDialog):
     """Dialog to edit analysis parameters, bound to MainWindow spinboxes."""
@@ -1084,7 +1325,7 @@ class ParametersDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self.setWindowTitle("Parameters")
         self.setModal(True)
-        self.resize(520, 180)
+        self.resize(900, 400)
 
         root = QtWidgets.QVBoxLayout(self)
 
@@ -1124,6 +1365,19 @@ class ParametersDialog(QtWidgets.QDialog):
         # row 2, start at column 0, span 1 row x 4 columns
         form.addWidget(note, 2, 0, 1, 4)
 
+        self.mbm_table = QtWidgets.QTableWidget(0, 3)
+        self.mbm_table.setHorizontalHeaderLabels(["File", "MBM folder", ""])
+        self.mbm_table.verticalHeader().setVisible(False)
+        self.mbm_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.mbm_table.horizontalHeader().setStretchLastSection(False)
+        self.mbm_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
+        self.mbm_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
+        self.mbm_table.setColumnWidth(2, 120)
+        self.mbm_table.setMinimumHeight(180)   # adjust (e.g. 300–450)
+
+        root.addWidget(QtWidgets.QLabel("MBM folders (per file):"))
+        root.addWidget(self.mbm_table)
+
         # buttons
         btns = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
@@ -1145,6 +1399,37 @@ class ParametersDialog(QtWidgets.QDialog):
             scale=float(self.scale.value()),
             bin_size=float(self.bin_size.value()),
         )
+
+    def set_mbm_rows(self, file_paths):
+        self.mbm_table.setRowCount(0)
+        for r, fp in enumerate(file_paths):
+            base = os.path.splitext(os.path.basename(fp))[0]
+            default_mbm = os.path.join(os.path.dirname(fp), "grd", "mbm")
+
+            self.mbm_table.insertRow(r)
+            self.mbm_table.setItem(r, 0, QtWidgets.QTableWidgetItem(base))
+
+            le = QtWidgets.QLineEdit(default_mbm)
+            self.mbm_table.setCellWidget(r, 1, le)
+
+            btn = QtWidgets.QPushButton("Browse mbm…")
+            btn.clicked.connect(lambda _, rr=r: self._browse_mbm(rr))
+            self.mbm_table.setCellWidget(r, 2, btn)
+
+    def _browse_mbm(self, row):
+        le = self.mbm_table.cellWidget(row, 1)
+        start = le.text().strip() if le else ""
+        p = QtWidgets.QFileDialog.getExistingDirectory(self, "Select MBM folder", start)
+        if p and le:
+            le.setText(p)
+
+    def mbm_map(self):
+        out = {}
+        for r in range(self.mbm_table.rowCount()):
+            base = self.mbm_table.item(r, 0).text()
+            le = self.mbm_table.cellWidget(r, 1)
+            out[base] = le.text().strip() if le else ""
+        return out
 
 
 class PlotSyncBridge(QtCore.QObject):
@@ -1168,9 +1453,16 @@ class MultiColorWindow(QtWidgets.QMainWindow):
         outer = QtWidgets.QVBoxLayout(central)
         outer.setContentsMargins(6, 6, 6, 6)
 
-        # Stacked: page 0 = grid, page 1 = merged
+        # --- stacked widget with plots (create ONCE) ---
         self.stack = QtWidgets.QStackedWidget()
         outer.addWidget(self.stack, 1)
+
+        # --- export button overlaid bottom-right ---
+        self._export_btn = QtWidgets.QPushButton("Export (SVG/PDF)", central)
+        self._export_btn.clicked.connect(self._export_current)
+        self._export_btn.setFixedHeight(24)
+        self._export_btn.setMaximumWidth(140)
+        self._export_btn.raise_()
 
         # --- grid page ---
         self.grid_page = QtWidgets.QWidget()
@@ -1191,13 +1483,21 @@ class MultiColorWindow(QtWidgets.QMainWindow):
         self.stack.addWidget(self.merged_page)
 
         # state
-        self._views = {}   # base -> PlotlyView
-        self._mode = "grid"  # or "merged"
+        self._views = {}    # base -> PlotlyView
+        self._mode = "grid" # or "merged"
 
     def set_mode(self, mode: str):
         mode = "merged" if mode == "merged" else "grid"
         self._mode = mode
         self.stack.setCurrentIndex(1 if mode == "merged" else 0)
+
+    def _export_current(self):
+        if self.mode() == "merged":
+            self.merged_view.export_vector()
+        else:
+            # export the first grid view (or you can choose)
+            if self._views:
+                next(iter(self._views.values())).export_vector()
 
     def mode(self):
         return self._mode
@@ -1243,6 +1543,16 @@ class MultiColorWindow(QtWidgets.QMainWindow):
         for base, fig in figs_by_base.items():
             self.update_one(base, fig, reset_view=reset_view, is3d=is3d)
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "_export_btn") and self._export_btn is not None:
+            m = 12  # margin from edges
+            btn = self._export_btn
+            btn.adjustSize()
+            x = self.centralWidget().width() - btn.width() - m
+            y = self.centralWidget().height() - btn.height() - m
+            btn.move(x, y)
+
     def update_merged(self, fig, reset_view=False, is3d=False):
         self.merged_view.update_fig(fig, reset_view=reset_view, is3d=is3d)
 
@@ -1279,9 +1589,32 @@ class PlotlyView(QtWidgets.QWidget):
 
         self.web.page().loadFinished.connect(self._on_load_finished)
 
+        self._last_fig = None
 
         self.web.page().setBackgroundColor(QColor(PLOTLY_HTML_BG))
         self.ensure_page()
+
+    def _on_download_requested(self, download: "QtWebEngineCore.QWebEngineDownloadRequest"):
+        # Suggest a filename
+        suggested = download.suggestedFileName() or "plot.png"
+
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save Plot",
+            suggested,
+            "PNG Image (*.png);;All Files (*)"
+        )
+        if not path:
+            download.cancel()
+            return
+
+        # Ensure .png extension if user omitted it
+        if not os.path.splitext(path)[1]:
+            path += ".png"
+
+        download.setDownloadDirectory(os.path.dirname(path))
+        download.setDownloadFileName(os.path.basename(path))
+        download.accept()
 
     def _bootstrap_html(self):
         bg = PLOTLY_HTML_BG  # uses your constant
@@ -1403,12 +1736,49 @@ function installRelayoutHandler() {{
             self._pending_fig = None
             self.update_fig(fig, reset_view=reset_view, is3d=is3d)
 
+    def export_vector(self):
+        if self._last_fig is None:
+            QtWidgets.QMessageBox.information(self, "Export", "No figure to export yet.")
+            return
+
+        path, filt = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Export figure",
+            "plot.svg",
+            "SVG (*.svg);;PDF (*.pdf)"
+        )
+        if not path:
+            return
+
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in (".svg", ".pdf"):
+            # infer from filter if user omitted extension
+            if "PDF" in filt:
+                path += ".pdf"
+            else:
+                path += ".svg"
+            ext = os.path.splitext(path)[1].lower()
+
+        fmt = ext.lstrip(".")  # "svg" or "pdf"
+
+        try:
+            pio.write_image(self._last_fig, path, format=fmt, scale=1)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(
+                self, "Export failed",
+                f"Could not export {fmt.upper()}.\n\n"
+                f"Make sure kaleido is installed.\n\nError:\n{e}"
+            )
+            return
+
+        QtWidgets.QMessageBox.information(self, "Export", f"Saved:\n{path}")
+
     def update_fig(self, fig, reset_view=False, is3d=False):
         self.ensure_page()
         if not self._plotly_ready:
             self._pending_fig = (fig, reset_view, is3d)
             return
-
+        self._last_fig = fig
         fig_json = pio.to_json(fig, validate=False)
         source_id = self._id
 
@@ -1643,81 +2013,7 @@ class FileWorker(QtCore.QThread):
             after_trace=after_trace,
         )
         self.need_efo.emit(ctx)
-        self._check_cancel()
-        # wait for range or cancel
-        # in FileWorker._process_one_file, replace the "wait for range or cancel" block with:
-
-        self._mutex.lock()
-        try:
-            while (not self._cancelled) and (self._chosen_range is None):
-                if self.isInterruptionRequested():
-                    self._cancelled = True
-                    break
-                # timed wait so we can re-check interruption regularly
-                self._wait.wait(self._mutex, 100)  # 100 ms
-            chosen = self._chosen_range
-            cancelled = self._cancelled
-        finally:
-            self._mutex.unlock()
-
-        if cancelled or chosen is None:
-            self.status.emit(f"Cancelled/Skipped: {base}")
-            return None
-        xmin, xmax = chosen
-
-        MFX_filtered = MFX_Data_vld_fnl_filt[
-            (MFX_Data_vld_fnl_filt["efo"] >= xmin) & (MFX_Data_vld_fnl_filt["efo"] <= xmax)
-        ]
-        df = np_to_df(MFX_filtered)
-
-        dims = [c.replace("loc_", "") for c in df.columns if c.startswith("loc_")]
-        avg_df = pd.DataFrame()
-        if len(df) > 0 and dims:
-            for dim in dims:
-                avg_df[f"loc_{dim}_mean"] = df.groupby("tid")[f"loc_{dim}"].mean()
-                avg_df[f"loc_{dim}_std"] = df.groupby("tid")[f"loc_{dim}"].std()
-            avg_df["n"] = df.groupby("tid")[f"loc_{dims[0]}"].count()
-            avg_df["tim_tot"] = df.groupby("tid")["tim"].sum()
-
-        loc_prec = None
-        if len(avg_df) > 0 and dims:
-            meds = []
-            for dim in dims:
-                s = avg_df[f"loc_{dim}_std"].dropna()
-                meds.append(float(s.median()) if len(s) else float("nan"))
-            loc_prec = tuple(float(f"{v:.2f}") for v in meds)
-            ratio_loc_per_trace = avg_df["n"].sum() / len(avg_df)
-            avg_df['ratio_loc_per_trace'] = ""
-            if len(avg_df) > 0:
-                avg_df.iloc[0, avg_df.columns.get_loc("ratio_loc_per_trace")] = f"{ratio_loc_per_trace:.6f}"
-
-        # add loc prec to avg_df
-        if loc_prec is not None:
-            for i, dim in enumerate(dims):
-                avg_df[f"loc_{dim}_prec"] = ""
-                if len(avg_df) > 0:
-                    avg_df.iloc[0, avg_df.columns.get_loc(f"loc_{dim}_prec")] = f"{loc_prec[i]:.4f}"
-        
-        save_path = os.path.join(p["save_folder"], f"{base}.csv")
-        avg_save_path = os.path.join(p["save_folder"], f"{base}_stats.csv")
-        save_to_csv(df, save_path)
-        avg_df.to_csv(avg_save_path, index=True)
-
-        items = [
-            ("File", base),
-            ("Total imaging time (min)", f"{total_tim/60:.2f}"),
-            #("Total raw localizations", str(total_loc)),
-            ("Last iteration localizations", str(last_iteration_loc)),
-            ("After trace filtering", str(after_trace)),
-            ("After EFO filtering", str(len(df))),
-            ("Localization precision (x, y, z)", str(loc_prec) if loc_prec is not None else "—"),
-            ("Ratio loc per trace", f"{ratio_loc_per_trace:.4f}"),
-            ("% remaining", f"{(len(df)/last_iteration_loc*100):.2f}%"),
-            ("Saved filtered CSV", save_path),
-            ("Saved stats CSV", avg_save_path),
-        ]
-        self.status.emit(f"Saved: {base}")
-        return dict(display_name=base, items=items, ctx=ctx, chosen=chosen)
+        return dict(display_name=base, ctx=ctx)
 
 # -------------------- main window --------------------
 class MainWindow(QtWidgets.QMainWindow):
@@ -1736,6 +2032,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._arr_by_base = {}        # base -> currently active array for plotting (trace-filtered or EFO-filtered)
         self._base_by_file = {}       # file_path -> base (optional convenience)
         self._multicolor_win = None
+
+        self._ctx_by_base = {}          # base -> ctx (from worker)
+        self._efo_range_by_base = {}    # base -> (xmin, xmax) selected
+        self._filtered_by_base = {}     # base -> array after EFO filter (what will be saved)
+
         # widgets
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -1829,18 +2130,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Right: stack the other controls vertically
         right_controls = QtWidgets.QVBoxLayout()
         color_and_controls.addLayout(right_controls, 1)
-
-        self.multi_btn = QtWidgets.QPushButton("multicolor")
-        self.multi_btn.clicked.connect(self.open_multicolor)
-        # make button smaller
-        self.multi_btn.setMaximumWidth(110)
-        self.multi_btn.setMinimumHeight(22)
-        right_controls.addWidget(self.multi_btn)
-
-        self.merged_chk = QtWidgets.QCheckBox("merged")
-        self.merged_chk.setChecked(False)
-        self.merged_chk.stateChanged.connect(self.on_merged_toggled)
-        right_controls.addWidget(self.merged_chk)
+        right_controls.setContentsMargins(0, 18, 0, 0)  # push down; tweak 18->24 etc
 
         self.avg_tid = QtWidgets.QCheckBox("avg loc (tid)")
         self.avg_tid.stateChanged.connect(lambda _: self._refresh_all_plots_same_data())
@@ -1850,6 +2140,31 @@ class MainWindow(QtWidgets.QMainWindow):
         self.is3d.stateChanged.connect(lambda _: self._refresh_all_plots_same_data())
         right_controls.addWidget(self.is3d)
 
+        right_controls.addWidget(make_labeled_separator("Multicolor"))
+
+        self.multi_btn = QtWidgets.QPushButton("Viewer")
+        self.multi_btn.clicked.connect(self.open_multicolor)
+        # make button smaller
+        self.multi_btn.setMaximumWidth(110)
+        self.multi_btn.setMinimumHeight(22)
+        right_controls.addWidget(self.multi_btn)
+
+        self.mbm_align_btn = QtWidgets.QPushButton("Align mbm")
+        self.mbm_align_btn.clicked.connect(self.on_mbm_align_clicked)
+        right_controls.addWidget(self.mbm_align_btn)
+
+        self.mbm_reset_btn = QtWidgets.QPushButton("Reset align")
+        self.mbm_reset_btn.clicked.connect(self.on_mbm_reset_clicked)
+        right_controls.addWidget(self.mbm_reset_btn)
+
+        self.merged_chk = QtWidgets.QCheckBox("Merged")
+        self.merged_chk.setChecked(False)
+        self.merged_chk.stateChanged.connect(self.on_merged_toggled)
+        right_controls.addWidget(self.merged_chk)
+
+        for b in (self.mbm_align_btn, self.mbm_reset_btn):
+            b.setMaximumWidth(110)
+            b.setMinimumHeight(22)
         right_controls.addStretch(1)
 
         # output table
@@ -1900,15 +2215,33 @@ class MainWindow(QtWidgets.QMainWindow):
         self.apply_btn.setEnabled(False)
         self.apply_btn.clicked.connect(self.apply_preview)
         ctrl.addWidget(self.apply_btn)
-        
-        self.continue_btn = QtWidgets.QPushButton("Save && Continue")
-        self.continue_btn.setEnabled(False)
-        self.continue_btn.clicked.connect(self.continue_file)
-        ctrl.addWidget(self.continue_btn)
+
+        self.back_btn = QtWidgets.QPushButton("Back")
+        self.back_btn.setEnabled(False)
+        self.back_btn.clicked.connect(self.go_back)
+        ctrl.addWidget(self.back_btn)
+
+        self.next_btn = QtWidgets.QPushButton("Next")
+        self.next_btn.setEnabled(False)
+        self.next_btn.clicked.connect(self.go_next)
+        ctrl.addWidget(self.next_btn)
+
+        self.save_all_btn = QtWidgets.QPushButton("Save all")
+        self.save_all_btn.setEnabled(False)
+        self.save_all_btn.clicked.connect(self.save_all)
+        ctrl.addWidget(self.save_all_btn)
 
         self._span = None
         self._span_xmin = None
         self._span_xmax = None
+
+        self._mbm_dir_by_base = {}          # base -> mbm folder
+        self._mbm_source_base = None        # selected source base
+        self._mbm_enabled = False
+
+        self._raw_arr_by_base = {}          # base -> current array (EFO-filtered if applied)
+        self._aligned_arr_by_base = {}      # base -> aligned array (same filtering), computed when enabled
+        self._T_by_base = {}                # base -> 4x4 transform to source
 
         # plotly panel
         # plotly panel
@@ -1956,9 +2289,93 @@ class MainWindow(QtWidgets.QMainWindow):
             self._pending_fig = None
             self.update_plotly_fig(fig)
 
+    def on_mbm_align_clicked(self):
+        # infer source if needed
+        if not self._mbm_source_base:
+            for b, w in self.color_panel._widgets_by_base.items():
+                chk = w.get("mbm_source")
+                if chk and chk.isChecked():
+                    self._mbm_source_base = b
+                    break
+
+        if not self._mbm_source_base:
+            self.statusBar().showMessage("MBM align: no source selected")
+            return
+
+        # ensure default MBM paths even if Parameters was never confirmed with OK
+        self._ensure_default_mbm_paths()
+
+        # validate source path exists
+        src = self._mbm_source_base
+        src_path = self._mbm_dir_by_base.get(src, "")
+        if not src_path or not os.path.isdir(src_path):
+            QtWidgets.QMessageBox.critical(
+                self,
+                "MBM alignment",
+                f"MBM path does not exist for source:\n\n{src}\n{src_path}\n\n"
+                "Open Parameters to set MBM folders, or ensure /grd/mbm exists."
+            )
+            return
+
+        # validate that every non-source dataset we might align has a valid path;
+        # we can either error-out immediately, or skip missing ones. You asked to prompt error.
+        missing = []
+        for base in self._filtered_by_base.keys() or self._raw_arr_by_base.keys():
+            if base == src:
+                continue
+            p = self._mbm_dir_by_base.get(base, "")
+            if not p or not os.path.isdir(p):
+                missing.append((base, p))
+
+        if missing:
+            msg = "MBM path does not exist for:\n\n" + "\n".join([f"{b}: {p}" for b, p in missing[:12]])
+            if len(missing) > 12:
+                msg += f"\n... and {len(missing) - 12} more"
+            QtWidgets.QMessageBox.critical(self, "MBM alignment", msg)
+            return
+
+        # require data loaded
+        if not (self._filtered_by_base or self._raw_arr_by_base):
+            self.statusBar().showMessage("MBM align: no data loaded yet")
+            return
+
+        self._apply_mbm_alignment()
+
+    def _ensure_default_mbm_paths(self):
+        """
+        Ensure self._mbm_dir_by_base has an entry for each base.
+        Default: <folder containing the .npy>/grd/mbm
+        """
+        if not hasattr(self, "_mbm_dir_by_base") or self._mbm_dir_by_base is None:
+            self._mbm_dir_by_base = {}
+
+        # build base -> file_path map from _all_files
+        for fp in self._all_files:
+            base = os.path.splitext(os.path.basename(fp))[0]
+            if base in self._mbm_dir_by_base and self._mbm_dir_by_base[base]:
+                continue
+            self._mbm_dir_by_base[base] = os.path.join(os.path.dirname(fp), "grd", "mbm")
+
+    def on_mbm_reset_clicked(self):
+        self._remove_mbm_alignment()
+        self.statusBar().showMessage("MBM alignment reset")
+
 
     def on_color_settings_changed(self, base: str, settings: dict):
         if not isinstance(settings, dict):
+            return
+
+        # --- MBM source selection event ---
+        if "mbm_source" in settings:
+            if settings.get("mbm_source"):
+                self._mbm_source_base = base
+            else:
+                if getattr(self, "_mbm_source_base", None) == base:
+                    self._mbm_source_base = None
+
+            # if user changes source while mbm is enabled, re-apply
+            if self._mbm_enabled:
+                self._apply_mbm_alignment()
             return
 
         mode = settings.get("mode", DEFAULT_MODE)
@@ -1992,14 +2409,20 @@ class MainWindow(QtWidgets.QMainWindow):
 
         
     def open_parameters_dialog(self):
+        if not self._all_files:
+            self.refresh_files()
         dlg = ParametersDialog(self)
+        dlg.move(self.geometry().center() - dlg.rect().center())
         dlg.set_values(
             min_trace_len=self.min_trace.value(),
             z_corr=self.zcorr.value(),
             scale=self.scale.value(),
             bin_size=self.bin_size.value(),
         )
+
+        dlg.set_mbm_rows(self._all_files)   # <-- required
         if dlg.exec() == QtWidgets.QDialog.Accepted:
+            self._mbm_dir_by_base = dlg.mbm_map()
             vals = dlg.values()
             self.min_trace.setValue(vals["min_trace_len"])
             self.zcorr.setValue(vals["z_corr"])
@@ -2143,20 +2566,25 @@ class MainWindow(QtWidgets.QMainWindow):
             self.out_edit.setText(p + "_filtered")
 
     def closeEvent(self, event):
-        print("closeEvent called")
         self._closing = True
 
-        # stop/cancel any running workers - with safe check
+        # cancel worker if running
         try:
             if self._current_worker is not None and self._current_worker.isRunning():
                 self._current_worker.cancel()
-        except RuntimeError:
-            # C++ object already deleted
-            self._current_worker = None
+                self._current_worker.wait(1000)  # wait up to 1s
+        except Exception:
+            pass
 
-        # give Qt/WebEngine a moment to shut down cleanly, then hard-exit
-        event.ignore()
-        QtCore.QTimer.singleShot(1500, lambda: os._exit(0))
+        # close multicolor window if open
+        try:
+            if self._multicolor_win is not None:
+                self._multicolor_win.close()
+        except Exception:
+            pass
+
+        event.accept()
+        QtCore.QTimer.singleShot(1000, lambda: os._exit(0))
         
     def _on_worker_finished(self, worker):
         """Clean up worker reference when it finishes."""
@@ -2195,7 +2623,45 @@ class MainWindow(QtWidgets.QMainWindow):
             self.file_combo.setCurrentIndex(0)
         bases = [os.path.splitext(os.path.basename(f))[0] for f in self._all_files]
         self.color_panel.rebuild(bases, self._color_settings_by_base)
+        self._ensure_default_mbm_paths()
 
+    def _update_output_for_base(self, base: str, arr_efo, n_after: int = None):
+        """
+        Update the Output table for the given base, using the currently stored ctx.
+        Call this after applying EFO (and/or alignment) so the table matches what you're viewing.
+        """
+        ctx = self._ctx_by_base.get(base) or self._current_ctx
+        if ctx is None:
+            return
+
+        if n_after is None:
+            n_after = int(len(arr_efo)) if arr_efo is not None else 0
+
+        # localization precision preview
+        lp = preview_localization_precision(arr_efo)
+        lp = tuple(float(f"{v:.2f}") for v in lp) if lp is not None else None
+
+        # ratio loc per trace
+        if arr_efo is None or len(arr_efo) == 0:
+            ratio_loc_per_trace = 0.0
+        else:
+            ut = np.unique(arr_efo["tid"])
+            ratio_loc_per_trace = float(len(arr_efo) / len(ut)) if len(ut) else 0.0
+
+        last_it = int(ctx.get("last_iteration_loc", max(1, ctx.get("total_loc", 1))))
+
+        items = [
+            ("File", base),
+            ("Total imaging time (min)", f"{ctx['total_tim']/60:.2f}"),
+            ("Last iteration localizations", str(last_it)),
+            ("After trace filtering", str(ctx.get("after_trace", "—"))),
+            ("After EFO filtering", str(n_after)),
+            ("Localization precision (x, y, z)", str(lp) if lp is not None else "—"),
+            ("Ratio loc per trace", f"{ratio_loc_per_trace:.4f}"),
+            ("% remaining", f"{(n_after / last_it * 100):.2f}%"),
+            ("Note", "In-memory preview. Use Save all to write files."),
+        ]
+        self.set_output(items)
 
     def on_file_changed(self, idx):
         if getattr(self, "_closing", False):
@@ -2203,28 +2669,45 @@ class MainWindow(QtWidgets.QMainWindow):
         if idx < 0 or idx >= len(self._all_files):
             return
 
-        # Safe check - worker might be deleted
-        try:
-            worker_running = (
-                self._current_worker is not None 
-                and self._current_worker.isRunning()
-            )
-        except RuntimeError:
-            # C++ object deleted
-            self._current_worker = None
-            worker_running = False
-
-        if worker_running:
-            self._current_worker.cancel()
-            # Wait for current worker to finish before switching
-            # Optionally queue the switch for after cancellation completes
-            return
-        
         self._current_index = idx
+        f = self._all_files[idx]
+        base = os.path.splitext(os.path.basename(f))[0]
 
+        # if already loaded -> display from memory
+        if base in self._ctx_by_base:
+            ctx = self._ctx_by_base[base]
+            self.on_need_efo(ctx)
+
+            if base in self._efo_range_by_base:
+                xmin, xmax = self._efo_range_by_base[base]
+                self._apply_efo_range_to_memory(base, xmin, xmax, update_view=True, reset_view=True)
+            return
+
+        # else: load it
         if self.run_btn.isEnabled() is False:
-            # if session running, start loading this file
             self.start_worker_for_current()
+
+    def _apply_efo_range_to_memory(self, base, xmin, xmax, *, update_view=True, reset_view=False):
+        arr = self._raw_arr_by_base.get(base)
+        if arr is None:
+            return
+
+        mask = (arr["efo"] >= xmin) & (arr["efo"] <= xmax)
+        arr_efo = arr[mask]
+
+        self._efo_range_by_base[base] = (float(xmin), float(xmax))
+        self._filtered_by_base[base] = arr_efo
+
+        # default plotted data is the filtered data (or aligned filtered if enabled)
+        if self._mbm_enabled and base in self._aligned_arr_by_base:
+            self._arr_by_base[base] = self._aligned_arr_by_base[base]
+        else:
+            self._arr_by_base[base] = arr_efo
+
+        if update_view:
+            self.redraw_scatter(reset_view=reset_view)
+            self._refresh_multicolor_contents(reset_view=False)
+            self._update_output_for_base(base, arr_efo, int(np.count_nonzero(mask)))
 
     def run_start(self):
         data_path = self.data_edit.text().strip()
@@ -2235,13 +2718,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if not save_folder:
             QtWidgets.QMessageBox.critical(self, "Error", "Please set an output folder.")
             return
-        os.makedirs(save_folder, exist_ok=True)
 
         if not self._all_files:
             self.refresh_files()
         if not self._all_files:
             QtWidgets.QMessageBox.critical(self, "Error", "No .npy files found.")
             return
+        os.makedirs(save_folder, exist_ok=True)
 
         self.run_btn.setEnabled(False)
         self.start_worker_for_current()
@@ -2265,7 +2748,6 @@ class MainWindow(QtWidgets.QMainWindow):
         f = self._all_files[self._current_index]
 
         self.apply_btn.setEnabled(False)
-        self.continue_btn.setEnabled(False)
 
         w = FileWorker(f, params, parent=self)
 
@@ -2285,22 +2767,52 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---------------- EFO selection ----------------
     def on_need_efo(self, ctx):
+        """
+        Called by FileWorker when a file is loaded and trace-filtered and the GUI should
+        display the EFO histogram + initial scatter preview.
+
+        This version also:
+        - caches the current dataset into _raw_arr_by_base (for MBM align enable/disable)
+        - updates _arr_by_base to either raw or aligned depending on mbm_align toggle
+        - refreshes main plot + multicolor plots
+        """
+        # ---- basic state ----
         self._plot_arr = ctx["arr"]          # start from trace-filtered data
         self._plot_is_filtered = False
         self._current_ctx = ctx
+
+        base = ctx.get("base")
+        if not base:
+            return
+
+        arr = ctx.get("arr")
+        if arr is None:
+            return
+
         efo_vals = np.asarray(ctx["efo_vals"])
-        base = ctx["base"]
         bin_size = float(self.bin_size.value())
 
-        # histogram
+        # Ensure caches exist
+        if not hasattr(self, "_raw_arr_by_base") or self._raw_arr_by_base is None:
+            self._raw_arr_by_base = {}
+        if not hasattr(self, "_arr_by_base") or self._arr_by_base is None:
+            self._arr_by_base = {}
+
+        # ---- cache as "raw" (trace-filtered) for this base ----
+        self._raw_arr_by_base[base] = arr
+        self._arr_by_base[base] = arr
+
+        # ---- histogram ----
         self.ax.clear()
-        bins = np.arange(efo_vals.min(), efo_vals.max() + bin_size, bin_size)
-        self.ax.hist(
-            efo_vals,
-            bins=bins,
-            edgecolor=HIST_THEME["hist_edge"],
-            color=HIST_THEME["hist_face"],
-        )
+        if len(efo_vals) > 0:
+            bins = np.arange(efo_vals.min(), efo_vals.max() + bin_size, bin_size)
+            self.ax.hist(
+                efo_vals,
+                bins=bins,
+                edgecolor=HIST_THEME["hist_edge"],
+                color=HIST_THEME["hist_face"],
+            )
+
         self.ax.set_xlabel("EFO")
         self.ax.set_ylabel("Count")
         self.ax.set_title(base)
@@ -2308,8 +2820,9 @@ class MainWindow(QtWidgets.QMainWindow):
         apply_hist_theme(self.fig, self.ax)
         self.canvas.draw()
 
-        self._span_xmin = float(efo_vals.min())
-        self._span_xmax = float(efo_vals.max())
+        # ---- initial span ----
+        self._span_xmin = float(efo_vals.min()) if len(efo_vals) else None
+        self._span_xmax = float(efo_vals.max()) if len(efo_vals) else None
 
         def onselect(xmin, xmax):
             self._span_xmin, self._span_xmax = float(xmin), float(xmax)
@@ -2318,98 +2831,233 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._span is not None:
             self._span.disconnect_events()
 
-        self._span = SpanSelector(
-            self.ax, onselect, direction="horizontal", useblit=True,
-            props=dict(
-                facecolor=HIST_THEME["span_face"],
-                alpha=HIST_THEME["span_alpha"],
-                edgecolor=HIST_THEME["span_edge"],
-                linewidth=HIST_THEME["span_lw"],
-            ),
-            interactive=True, drag_from_anywhere=True
-        )
-        self._span.extents = (self._span_xmin, self._span_xmax)
-        onselect(self._span_xmin, self._span_xmax)
+        if self._span_xmin is not None and self._span_xmax is not None:
+            self._span = SpanSelector(
+                self.ax, onselect, direction="horizontal", useblit=True,
+                props=dict(
+                    facecolor=HIST_THEME["span_face"],
+                    alpha=HIST_THEME["span_alpha"],
+                    edgecolor=HIST_THEME["span_edge"],
+                    linewidth=HIST_THEME["span_lw"],
+                ),
+                interactive=True, drag_from_anywhere=True
+            )
+            self._span.extents = (self._span_xmin, self._span_xmax)
+            onselect(self._span_xmin, self._span_xmax)
+        else:
+            self._span = None
+            self.range_lbl.setText("Selected range: —")
 
         self.apply_btn.setEnabled(True)
-        self.continue_btn.setEnabled(False)
 
-        # initial scatter - reset view for new file
-        self.redraw_scatter(reset_view=True)
+        # ---- cache ctx for later "Save all" ----
+        self._ctx_by_base[base] = ctx
 
-        base = ctx["base"]
-        self._arr_by_base[base] = ctx["arr"]  # trace-filtered (initial)
-        self._multicolor_update_base(base, reset_view=True)
-        self._refresh_multicolor_contents(reset_view=False)
+        # ---- default range = full range (auto-applied) ----
+        if len(efo_vals) > 0:
+            full_range = (float(efo_vals.min()), float(efo_vals.max()))
+            self._efo_range_by_base[base] = full_range
+
+            # this updates memory + plots + output table
+            self._apply_efo_range_to_memory(
+                base,
+                full_range[0],
+                full_range[1],
+                update_view=True,
+                reset_view=True
+            )
+
+        # ---- enable navigation + save ----
+        self.back_btn.setEnabled(True)
+        self.next_btn.setEnabled(True)
+        self.save_all_btn.setEnabled(True)
+
+        # ---- update plotting arrays depending on MBM align toggle ----
+        mbm_enabled = bool(getattr(self, "_mbm_enabled", False))
+        if mbm_enabled and getattr(self, "_mbm_source_base", None):
+            # will update _arr_by_base for all datasets + redraw plots
+            self._apply_mbm_alignment()
+        else:
+            # just show raw (trace-filtered)
+            self._arr_by_base[base] = arr
+
+            # initial scatter - reset view for new file
+            self.redraw_scatter(reset_view=True)
+
+            # update multicolor for this base and any open multicolor view
+            self._multicolor_update_base(base, reset_view=True)
+            self._refresh_multicolor_contents(reset_view=False)
+
+        
 
     def redraw_scatter(self, reset_view=False):
         if self._current_ctx is None:
             return
-        if self._plot_arr is None:
-            self._plot_arr = self._current_ctx["arr"]
-            self._plot_is_filtered = False
-        base = self._current_ctx["base"] if self._current_ctx else None
-        cs = self._color_settings_by_base.get(base, {"mode": DEFAULT_MODE, "solid": DEFAULT_SOLID, "lut": DEFAULT_LUT, "alpha": DEFAULT_ALPHA, "size": DEFAULT_SIZE_2D})
-        fig = make_plotly_fig(self._plot_arr, self.avg_tid.isChecked(), self.is3d.isChecked(), color_settings=cs)
+
+        base = self._current_ctx.get("base")
+        if not base:
+            return
+
+        # Always plot whatever is currently active for this base (raw or aligned)
+        arr_to_plot = self._arr_by_base.get(base)
+        if arr_to_plot is None:
+            # fallback to ctx
+            arr_to_plot = self._current_ctx.get("arr")
+            if arr_to_plot is None:
+                return
+
+        # keep state consistent
+        self._plot_arr = arr_to_plot
+
+        cs = self._color_settings_by_base.get(
+            base,
+            {
+                "mode": DEFAULT_MODE,
+                "solid": DEFAULT_SOLID,
+                "lut": DEFAULT_LUT,
+                "alpha": DEFAULT_ALPHA,
+                "size": DEFAULT_SIZE_2D,
+            },
+        )
+
+        fig = make_plotly_fig(arr_to_plot, self.avg_tid.isChecked(), self.is3d.isChecked(), color_settings=cs)
         self.update_plotly_fig(fig, reset_view=reset_view)
 
     def apply_preview(self):
         if self._current_ctx is None:
             return
-        arr = self._current_ctx["arr"]
-        xmin, xmax = self._span_xmin, self._span_xmax
-        mask = (arr["efo"] >= xmin) & (arr["efo"] <= xmax)
-        arr_efo = arr[mask]
+        base = self._current_ctx.get("base")
+        if not base or self._span_xmin is None or self._span_xmax is None:
+            return
+        self._apply_efo_range_to_memory(base, self._span_xmin, self._span_xmax, update_view=True, reset_view=False)
 
-        base = self._current_ctx["base"] if self._current_ctx else None
-        cs = self._color_settings_by_base.get(base, {"mode": DEFAULT_MODE, "solid": DEFAULT_SOLID, "lut": DEFAULT_LUT, "alpha": DEFAULT_ALPHA, "size": DEFAULT_SIZE_2D})
+        # if alignment is enabled, recompute it on the *filtered* datasets
+        if self._mbm_enabled:
+            self._apply_mbm_alignment()
 
-        self._arr_by_base[base] = arr_efo  # now filtered
-        self._multicolor_update_base(base, reset_view=False)
-        self._refresh_multicolor_contents(reset_view=False)
-        # store as current plot data
-        self._plot_arr = arr_efo
-        self._plot_is_filtered = True
-
-        # update scatter
-        fig = make_plotly_fig(self._plot_arr, self.avg_tid.isChecked(), self.is3d.isChecked(), color_settings=cs)
-        self.update_plotly_fig(fig)
-
-        # preview localization precision
-        lp = preview_localization_precision(arr_efo)
-        lp = tuple(float(f"{v:.2f}") for v in lp) if lp is not None else None
-
-        # ratio loc per trace
-        if len(arr_efo) == 0:
-            ratio_loc_per_trace = 0.0
+    def on_mbm_align_toggled(self, state):
+        enabled = (state == Qt.Checked)
+        if enabled:
+            if not getattr(self, "_mbm_source_base", None):
+                self.statusBar().showMessage("MBM align: no source selected")
+                return
+            if not self._mbm_dir_by_base:
+                self.statusBar().showMessage("MBM align: MBM folders not set (open Parameters and press OK)")
+                return
+            self._apply_mbm_alignment()
         else:
-            unique_tids, inv_idx, locs_per_tid = np.unique(
-                arr_efo["tid"], return_inverse=True, return_counts=True
-            )
-            ratio_loc_per_trace = np.sum(locs_per_tid) / len(unique_tids)
-        items = [
-            ("File", self._current_ctx["base"]),
-            ("Total imaging time (min)", f"{self._current_ctx['total_tim']/60:.2f}"),
-            #("Total raw localizations", str(self._current_ctx["total_loc"])),
-            ("Last iteration localizations", str(self._current_ctx["last_iteration_loc"])),
-            ("After trace filtering", str(self._current_ctx["after_trace"])),
-            ("After EFO filtering", str(int(np.count_nonzero(mask)))),
-            ("Localization precision (x, y, z)", str(lp) if lp is not None else "—"),
-            ("Ratio loc per trace", f"{ratio_loc_per_trace:.4f}"),
-            ("% remaining", f"{(int(np.count_nonzero(mask)) / self._current_ctx['last_iteration_loc'] * 100):.2f}%"),
-            ("Note", "Preview only. Click Continue to save + advance."),
-        ]
-        self.set_output(items)
-        self.continue_btn.setEnabled(True)
+            self._remove_mbm_alignment()
 
-    def continue_file(self):
-        if self._current_worker is None:
+    def save_all(self):
+        save_folder = self.out_edit.text().strip()
+        if not save_folder:
+            QtWidgets.QMessageBox.critical(self, "Error", "Please set an output folder.")
             return
-        if self._span_xmin is None or self._span_xmax is None:
+        os.makedirs(save_folder, exist_ok=True)
+
+        for base, arr_filt in self._filtered_by_base.items():
+            if arr_filt is None:
+                continue
+
+            arr_to_save = self._aligned_arr_by_base.get(base, arr_filt) if self._mbm_enabled else arr_filt
+
+            df = np_to_df(arr_to_save)
+            save_path = os.path.join(save_folder, f"{base}.csv")
+            save_to_csv(df, save_path)
+
+            # stats (reuse your existing logic)
+            dims = [c.replace("loc_", "") for c in df.columns if c.startswith("loc_")]
+            avg_df = pd.DataFrame()
+            if len(df) > 0 and dims:
+                for dim in dims:
+                    avg_df[f"loc_{dim}_mean"] = df.groupby("tid")[f"loc_{dim}"].mean()
+                    avg_df[f"loc_{dim}_std"] = df.groupby("tid")[f"loc_{dim}"].std()
+                avg_df["n"] = df.groupby("tid")[f"loc_{dims[0]}"].count()
+                avg_df["tim_tot"] = df.groupby("tid")["tim"].sum()
+
+            avg_save_path = os.path.join(save_folder, f"{base}_stats.csv")
+            avg_df.to_csv(avg_save_path, index=True)
+
+        self.statusBar().showMessage(f"Saved {len(self._filtered_by_base)} datasets.")
+
+    def _apply_mbm_alignment(self):
+        self.statusBar().showMessage(
+            f"MBM aligning to source={self._mbm_source_base}, have dirs={len(self._mbm_dir_by_base)}, "
+            f"have filtered={len(self._filtered_by_base)}"
+        )
+        self._mbm_enabled = True
+
+        src = self._mbm_source_base
+        if not src:
             return
-        self.apply_btn.setEnabled(False)
-        self.continue_btn.setEnabled(False)
-        self._current_worker.set_range_and_continue(self._span_xmin, self._span_xmax)
+
+        # align the EFO-filtered arrays (what will be saved)
+        src_arr = self._filtered_by_base.get(src)
+        if src_arr is None:
+            src_arr = self._arr_by_base.get(src)
+        if src_arr is None:
+            return
+
+        mbm_src = self._mbm_dir_by_base.get(src)
+        if not mbm_src or not os.path.isdir(mbm_src):
+            self.statusBar().showMessage(f"MBM: source folder missing for {src}")
+            return
+
+        self._aligned_arr_by_base.clear()
+        self._T_by_base.clear()
+
+        # source stays unchanged
+        self._aligned_arr_by_base[src] = src_arr
+        self._T_by_base[src] = np.eye(4)
+
+        for base, arr in self._filtered_by_base.items():
+            if base == src:
+                continue
+            if arr is None or len(arr) == 0:
+                self._aligned_arr_by_base[base] = arr
+                continue
+
+            mbm_mov = self._mbm_dir_by_base.get(base)
+            if not mbm_mov or not os.path.isdir(mbm_mov):
+                # keep unaligned if no mbm folder
+                self._aligned_arr_by_base[base] = arr
+                continue
+
+            try:
+                T, common = compute_mbm_transform(
+                    mbm_src, mbm_mov, k=4, scale=float(self.scale.value())
+                )
+                self._T_by_base[base] = T
+                self._aligned_arr_by_base[base] = apply_transform_to_arr(arr, T)
+            except Exception as e:
+                self.statusBar().showMessage(f"MBM align failed for {base}: {e}")
+                self._aligned_arr_by_base[base] = arr
+
+        # drive plotting from aligned (aligned if present else original)
+        for base, arr in self._filtered_by_base.items():
+            self._arr_by_base[base] = self._aligned_arr_by_base.get(base, arr)
+
+        self.redraw_scatter(reset_view=False)
+        self._refresh_multicolor_contents(reset_view=False)
+
+    def go_next(self):
+        if not self._all_files:
+            return
+        self.file_combo.setCurrentIndex((self.file_combo.currentIndex() + 1) % len(self._all_files))
+
+    def go_back(self):
+        if not self._all_files:
+            return
+        self.file_combo.setCurrentIndex((self.file_combo.currentIndex() - 1) % len(self._all_files))
+
+    def _remove_mbm_alignment(self):
+        for base, arr in self._raw_arr_by_base.items():
+            self._arr_by_base[base] = arr
+        self._mbm_enabled = False
+        self._aligned_arr_by_base.clear()
+        self._T_by_base.clear()
+        self.redraw_scatter(reset_view=False)
+        self._refresh_multicolor_contents(reset_view=False)
 
     # ---------------- output / done ----------------
     def set_output(self, items):
@@ -2422,31 +3070,47 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_done_one(self, result):
         if getattr(self, "_closing", False):
             return
-        if result is not None:
-            self.set_output(result["items"])
+        if not result:
+            return
 
-        # advance to next file
-        self._current_index += 1
-        
-        # Loop back to first file when reaching the end
-        if self._current_index >= len(self._all_files):
-            self._current_index = 0
-            self.statusBar().showMessage("Reached end of list. Looping back to first file.")
+        ctx = result.get("ctx")
+        if not ctx:
+            return
 
-        # Update combo box and label
-        self.file_combo.blockSignals(True)
-        self.file_combo.setCurrentIndex(self._current_index)
-        self.file_combo.blockSignals(False)
-        
-        self.start_worker_for_current()
+        base = ctx.get("base")
+        if not base:
+            return
+
+        # store ctx; on_need_efo already updates UI
+        self._ctx_by_base[base] = ctx
+
+def handle_download_requested(download):
+    suggested = download.suggestedFileName() or "plot.png"
+    path, _ = QtWidgets.QFileDialog.getSaveFileName(
+        None,
+        "Save Plot",
+        suggested,
+        "PNG Image (*.png);;All Files (*)"
+    )
+    if not path:
+        download.cancel()
+        return
+
+    if not os.path.splitext(path)[1]:
+        path += ".png"
+
+    download.setDownloadDirectory(os.path.dirname(path))
+    download.setDownloadFileName(os.path.basename(path))
+    download.accept()
+
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
-
-    apply_gui_theme(app)   # <<< add this line
+    apply_gui_theme(app)
 
     from PySide6.QtWebEngineCore import QWebEngineProfile
-    QWebEngineProfile.defaultProfile()
+    profile = QWebEngineProfile.defaultProfile()
+    profile.downloadRequested.connect(handle_download_requested)
 
     w = MainWindow()
     w.show()
