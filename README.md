@@ -1,24 +1,19 @@
-# 
-Collaboration with ALM, discussion about support for 3D light-sheet and MINFLUX data
+# Pyflux
 
-Meeting on 2025-10-17 with the Advanced Light Microscopy facility at SciLifeLab, discussed that there is a need for future image analysis support for data that ALM generates 
+App for analyzing MINFLUX data.
 
-[Download code](../../archive/refs/heads/main.zip)
+## TODO 
 
-## Installation
-
-- Clone this repository
-- Install environment with conda env create -f environment.yml
-
-## TODO for 1.1.0
-
-- pip install "zarr<3"
-- pip install scipy for the icp
-- pip install -U kaleido, chrome needs to be installed to export to svg/pdf -> not ideal
+- when building with pyinstaller, scipy is not detected even though it is installed in .venv, see (workaround)[https://stackoverflow.com/questions/49559770/how-do-you-resolve-hidden-imports-not-found-warnings-in-pyinstaller-for-scipy?rq=1]
+- Problem with kaleido/chrome, also only an issue with built app, 
 - check out resolution of exported imgs
  
 ## Bugs pyflux
 
+- Save as SVG/PDF does NOT work in built app on arm64, error message:
+```
+'The browser seemed to close immediately after starting.', 'You can set the `logging.Logger` level lower to see more output.', 'You may try installing a known working copy of Chrome by running ', '`$ choreo_get_chrome`.It may be your browser auto-updated and will now work upon restart. The browser we tried to start is located at /Applications/Google Chrome.app/Contents/MacOS/Google Chrome.'
+```
 - js: Canvas2D: Multiple readback operations using getImageData are faster with the willReadFrequently attribute set to true. See: https://html.spec.whatwg.org/multipage/canvas.html#concept-canvas-will-read-frequently
 - js: Uncaught TypeError: Cannot read properties of undefined (reading 'setViewport') sometimes shows up when zooming
 - 2026-02-12 11:28:57.603 python[36522:16515968] The class 'NSOpenPanel' overrides the method identifier.  This method is implemented by class 'NSWindow'
