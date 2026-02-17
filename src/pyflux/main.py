@@ -24,7 +24,9 @@ from PySide6.QtGui import QColor
 import hashlib
 from scipy.spatial import cKDTree
 import zarr
+from matplotlib.colors import LinearSegmentedColormap
 from functools import partial
+from PySide6 import QtGui
 
 # -------------------- helpers --------------------
 def save_to_csv(df, save_path):
@@ -126,7 +128,7 @@ def make_labeled_separator(text: str):
     w = QtWidgets.QWidget()
     h = QtWidgets.QHBoxLayout(w)
     h.setContentsMargins(0, 6, 0, 6)
-    h.setSpacing(8)
+    h.setSpacing(4)
 
     line1 = QtWidgets.QFrame()
     line1.setFrameShape(QtWidgets.QFrame.HLine)
@@ -379,7 +381,6 @@ def make_plotly_fig(arr, avg_tid: bool, is3d: bool, color_settings: dict = None,
         dy = float(np.nanmax(y) - np.nanmin(y)) if len(y) else 0.0
         if dx > 0 and dy > 0:
             fig.update_yaxes(scaleanchor="x", scaleratio=1)
-        add_scalebar_2d(fig, scalebar_nm)
 
     apply_plot_theme(fig, is3d=is3d)
     return fig
@@ -466,7 +467,6 @@ def make_plotly_fig_merged(arr_by_base: dict, avg_tid: bool, is3d: bool, color_s
             ),
         )
     else:
-        add_scalebar_2d(fig, scalebar_nm)
         fig.update_layout(
             dragmode="pan",
             legend=dict(
@@ -570,6 +570,7 @@ def make_plotly_heatmap_from_arr(
     scale_mode : str
         "linear" or "log" (log uses log10(count+1)).
     """
+
     if arr is None or len(arr) == 0:
         fig = go.Figure()
         fig.update_layout(annotations=[dict(text="No data", x=0.5, y=0.5, showarrow=False)])
@@ -607,6 +608,8 @@ def make_plotly_heatmap_from_arr(
 
     if lut not in LUT_CHOICES:
         lut = DEFAULT_LUT_BIN
+    if lut.startswith("cu"):
+        lut = CUSTOM_LUTS.get(lut, DEFAULT_LUT_BIN)
 
     scale_mode = (scale_mode or "linear").strip().lower()
     if scale_mode not in ("linear", "log10(count+1)"):
@@ -698,7 +701,8 @@ def make_trace_for_arr(arr, avg_tid: bool, is3d: bool, color_settings: dict, nam
         lut = cs.get("lut", DEFAULT_LUT)
         if lut not in LUT_CHOICES:
             lut = DEFAULT_LUT
-
+        if lut.startswith("cu"):
+            lut = CUSTOM_LUTS.get(lut, DEFAULT_LUT)
         marker = dict(
             size=size,
             opacity=alpha,
@@ -724,6 +728,8 @@ def make_trace_for_arr(arr, avg_tid: bool, is3d: bool, color_settings: dict, nam
         lut = cs.get("lut", DEFAULT_LUT)
         if lut not in LUT_CHOICES:
             lut = DEFAULT_LUT
+        if lut.startswith("cu"):
+            lut = CUSTOM_LUTS.get(lut, DEFAULT_LUT)
 
         cL = np.asarray(vals, dtype=float).tolist()
         marker = dict(
@@ -749,11 +755,12 @@ def make_trace_for_arr(arr, avg_tid: bool, is3d: bool, color_settings: dict, nam
     else:
         # When coloring by depth, include z in hover even in 2D
         if mode == "depth":
-            customdata = z.reshape(-1, 1)
-            hovertemplate = "x=%{x:.3f}<br>y=%{y:.3f}<br>z=%{customdata[0]:.3f}<br>%{text}<extra></extra>"
+            customdata = z.astype(float).tolist()   # 1D list
+            hovertemplate = "x=%{x:.3f}<br>y=%{y:.3f}<br>z=%{customdata:.3f}<br>%{text}<extra></extra>"
         else:
             customdata = None
             hovertemplate = "x=%{x:.3f}<br>y=%{y:.3f}<br>%{text}<extra></extra>"
+
 
         return go.Scattergl(
             x=x.tolist(), y=y.tolist(),
@@ -1092,6 +1099,21 @@ def apply_gui_theme(app: QtWidgets.QApplication):
     """
     app.setStyleSheet(qss)
 
+def custom_LUT(colors=["#000000", "#ff0000"], bins=2**8):
+    """
+    colors: list of colors that define the color scale
+    bins: range
+    """
+
+    cm = LinearSegmentedColormap.from_list(
+        "Custom", colors, N=bins)
+    xs = np.linspace(0, 1, bins)
+    rgba = cm(xs)  # (n,4) floats in [0,1]
+    colorscale = []
+    for x, (r, g, b, a) in zip(xs, rgba):
+        colorscale.append([float(x), f"rgb({int(r*255)}, {int(g*255)}, {int(b*255)})"])
+    return colorscale
+
 # -------------------- Qt (GUI) theme --------------------
 
 GUI_THEME = {
@@ -1140,12 +1162,17 @@ SOLID_COLOR_MAP = {
 }
 SOLID_COLOR_CHOICES = list(SOLID_COLOR_MAP.keys())
 
+CUSTOM_LUTS = {
+    f"cu_{i}": custom_LUT(colors=["#000000", SOLID_COLOR_MAP[i]], bins=256)
+    for i in SOLID_COLOR_CHOICES
+}
+
 LUT_CHOICES = ["turbo", "viridis", "cividis", "inferno", "magma", "plasma", 
                "electric", "hot", "hsv", "jet", "rainbow", "twilight", "icefire", 
                "piyg", "brbg", "rdbu", "brwnyl", "reds", "rdpu", "ylgn", "ylorbr", 
-               "thermal","gray", "ice", "algae", "speed", "temps",
+               "thermal","gray", "ice", "algae", "speed", "temps", 
                ]  # Plotly colorscale names
-LUT_CHOICES = sorted(LUT_CHOICES)
+LUT_CHOICES = sorted(LUT_CHOICES + list(CUSTOM_LUTS.keys()))
 
 DEFAULT_SOLID = "darkgreen"
 DEFAULT_LUT = "twilight"
@@ -1810,8 +1837,12 @@ class BinningWindow(QtWidgets.QMainWindow):
         )
 
         # keep current zoom if requested
-        self.view.update_fig(fig, reset_view=not keep_view, is3d=False)
-
+        self.view.update_fig(
+            fig,
+            reset_view=not keep_view,
+            is3d=False,
+            scalebar_nm=getattr(self._mw, "_scalebar_nm", 100.0),
+        )
 
 class PlotSyncBridge(QtCore.QObject):
     viewChanged = Signal(str, object)  # (source_id, payload dict)
@@ -1914,15 +1945,16 @@ class MultiColorWindow(QtWidgets.QMainWindow):
                 c = 0
                 r += 1
 
-    def update_one(self, base, fig, reset_view=False, is3d=False):
+    def update_one(self, base, fig, reset_view=False, is3d=False, scalebar_nm=100.0):
         view = self._views.get(base)
         if view is None:
             return
-        view.update_fig(fig, reset_view=reset_view, is3d=is3d)
+        view.update_fig(fig, reset_view=reset_view, is3d=is3d, scalebar_nm=scalebar_nm)
 
-    def update_all(self, figs_by_base, reset_view=False, is3d=False):
+    def update_all(self, figs_by_base, reset_view=False, is3d=False, scalebar_nm=100.0):
         for base, fig in figs_by_base.items():
-            self.update_one(base, fig, reset_view=reset_view, is3d=is3d)
+            self.update_one(base, fig, reset_view=reset_view, is3d=is3d, scalebar_nm=scalebar_nm)
+
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -1934,8 +1966,8 @@ class MultiColorWindow(QtWidgets.QMainWindow):
             y = self.centralWidget().height() - btn.height() - m
             btn.move(x, y)
 
-    def update_merged(self, fig, reset_view=False, is3d=False):
-        self.merged_view.update_fig(fig, reset_view=reset_view, is3d=is3d)
+    def update_merged(self, fig, reset_view=False, is3d=False, scalebar_nm=100.0):
+        self.merged_view.update_fig(fig, reset_view=reset_view, is3d=is3d, scalebar_nm=scalebar_nm)
 
 class PlotlyView(QtWidgets.QWidget):
     """Widget hosting Plotly in a QWebEngineView + emits view changes."""
@@ -2035,7 +2067,7 @@ class PlotlyView(QtWidgets.QWidget):
     <div id="container"><div id="plot"></div></div>
 
     <script>
-    window._plotSync = {{ ready:false, bridge:null, sourceId:null, ignore:false, _scalebarUpdating:false }};
+    window._plotSync = {{ ready:false, bridge:null, sourceId:null, ignore:false, _scalebarUpdating:false, scalebarNm: 100.0 }};
 
     new QWebChannel(qt.webChannelTransport, function(channel) {{
     window._plotSync.bridge = channel.objects.plotSync;
@@ -2058,7 +2090,9 @@ class PlotlyView(QtWidgets.QWidget):
         const dy = yMax - yMin;
         if (!isFinite(dx) || !isFinite(dy) || dx === 0 || dy === 0) return;
 
-        const L = {L};
+        const L = (window._plotSync && typeof window._plotSync.scalebarNm === "number")
+          ? window._plotSync.scalebarNm
+          : {L};
         const m = {mfrac};
 
         const x0 = xMin + m * dx;
@@ -2089,7 +2123,7 @@ class PlotlyView(QtWidgets.QWidget):
         y: y0 + 0.03 * dy,
         xref: "x",
         yref: "y",
-        text: "{sb_label}",
+        text: Math.round(L).toString() + " nm",
         showarrow: false,
         font: {{ color: "{sb_color}", size: 12 }},
         name: sbLabelName
@@ -2346,7 +2380,7 @@ function installRelayoutHandler() {{
 
         QtWidgets.QMessageBox.information(self, "Export", f"Saved:\n{path}")
 
-    def update_fig(self, fig, reset_view=False, is3d=False):
+    def update_fig(self, fig, reset_view=False, is3d=False, scalebar_nm=None):
         self.ensure_page()
         if not self._plotly_ready:
             self._pending_fig = (fig, reset_view, is3d)
@@ -2354,7 +2388,7 @@ function installRelayoutHandler() {{
         self._last_fig = fig
         fig_json = pio.to_json(fig, validate=False)
         source_id = self._id
-
+        sb = 100.0 if scalebar_nm is None else float(scalebar_nm)
         js = f"""
     (async function() {{
     try {{
@@ -2390,7 +2424,7 @@ function installRelayoutHandler() {{
         // Prevent relayout events from being broadcast while we update
         window._plotSync.sourceId = "{source_id}";
         window._plotSync.ignore = true;
-
+        window._plotSync.scalebarNm = {sb};
         if (modeChanged || !gd.data) {{
         try {{ Plotly.purge(gd); }} catch(e) {{}}
         container.innerHTML = '<div id="plot" style="width:100%;height:100%;"></div>';
@@ -2596,7 +2630,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("MINFLUX Filter GUI (PyQt + Matplotlib + Plotly)")
-        self.resize(1200, 780)
+        self.resize(1500, 950)
         self._plotly_tmp = None
         # state
         self._all_files = []
@@ -2725,19 +2759,30 @@ class MainWindow(QtWidgets.QMainWindow):
 
         right_controls.addLayout(row)
 
-        # --- Multicolor buttons ---
-        mc = QtWidgets.QWidget()
-        mc_lay = QtWidgets.QVBoxLayout(mc)
-        mc_lay.setContentsMargins(0, 6, 0, 6)
-        mc_lay.setSpacing(12)
-
-        VIEWER_W = 150          # pick what looks good on your UI
-        BTN_H    = 34
-        GAP_H    = 10
+        # --- Binning button (standalone, above multicolor section) ---
+        VIEWER_W = 150
+        BTN_H = 34
 
         def tune_btn(b, w):
             b.setFixedHeight(BTN_H)
             b.setFixedWidth(w)
+
+        self.binning_btn = QtWidgets.QPushButton("Binning")
+        self.binning_btn.clicked.connect(self.open_binning_window)
+        tune_btn(self.binning_btn, VIEWER_W)
+        right_controls.addWidget(self.binning_btn, 0, Qt.AlignHCenter)
+
+        # --- Multicolor section (divider + controls) ---
+        mc = QtWidgets.QWidget()
+        mc_lay = QtWidgets.QVBoxLayout(mc)
+        mc_lay.setContentsMargins(0, 0, 0, 0)
+        mc_lay.setSpacing(0)   # tighter default spacing between items
+
+        # divider “Multicolor”
+        mc_lay.addWidget(make_labeled_separator("Multicolor"))
+
+        # reduce spacing between separator and viewer a bit more
+        mc_lay.addSpacing(0)
 
         # Viewer (full width)
         self.multi_btn = QtWidgets.QPushButton("Viewer")
@@ -2745,30 +2790,30 @@ class MainWindow(QtWidgets.QMainWindow):
         tune_btn(self.multi_btn, VIEWER_W)
         mc_lay.addWidget(self.multi_btn, 0, Qt.AlignHCenter)
 
-        mc_lay.addSpacing(GAP_H)
+        # increase spacing between viewer and align/reset row
+        mc_lay.addSpacing(16)
 
-        # Row: Align + Reset (half width each)
+        # Row: Align mbm + Reset (together same width as Viewer)
         roww = QtWidgets.QWidget()
         row = QtWidgets.QHBoxLayout(roww)
         row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(12)
+        row.setSpacing(6)  # reduced spacing between Align and Reset
 
-        half_w = (VIEWER_W - row.spacing()) // 2  # ensures the pair matches viewer width
+        half_w = (VIEWER_W - row.spacing()) // 2
 
-        self.mbm_align_btn = QtWidgets.QPushButton("Align mbm")
+        self.mbm_align_btn = QtWidgets.QPushButton("Align")
         self.mbm_align_btn.clicked.connect(self.on_mbm_align_clicked)
-        tune_btn(self.mbm_align_btn, (VIEWER_W - row.spacing()) // 1.5)
+        tune_btn(self.mbm_align_btn, half_w)
 
         self.mbm_reset_btn = QtWidgets.QPushButton("Reset")
         self.mbm_reset_btn.clicked.connect(self.on_mbm_reset_clicked)
-        tune_btn(self.mbm_reset_btn, (VIEWER_W - row.spacing()) // 2.5)
+        tune_btn(self.mbm_reset_btn, half_w)
 
         row.addWidget(self.mbm_align_btn)
         row.addWidget(self.mbm_reset_btn)
-
         mc_lay.addWidget(roww, 0, Qt.AlignHCenter)
 
-        # Center the checkbox as a whole (indicator + text)
+        # Merged checkbox (centered)
         chk_wrap = QtWidgets.QWidget()
         chk_lay = QtWidgets.QHBoxLayout(chk_wrap)
         chk_lay.setContentsMargins(0, 0, 0, 0)
@@ -2782,14 +2827,8 @@ class MainWindow(QtWidgets.QMainWindow):
         chk_lay.addStretch(1)
         mc_lay.addWidget(chk_wrap)
 
-        # --- Binning button (under Merged checkbox) ---
-        self.binning_btn = QtWidgets.QPushButton("Binning")
-        self.binning_btn.clicked.connect(self.open_binning_window)
-        tune_btn(self.binning_btn, VIEWER_W)
-        mc_lay.addWidget(self.binning_btn, 0, Qt.AlignHCenter)
-
         right_controls.addWidget(mc)
-
+        
         # output table
         outbox = QtWidgets.QGroupBox("Output")
         right.addWidget(outbox)
@@ -3126,6 +3165,8 @@ class MainWindow(QtWidgets.QMainWindow):
             
             self.redraw_scatter(reset_view=False)
             self._refresh_multicolor_contents(reset_view=False)
+            if self._binning_win is not None and self._binning_win.isVisible():
+                self._binning_win.refresh_plot(keep_view=True)
 
             # if a histogram is currently shown, refreshing it to new bin size can be helpful:
             if self._current_ctx is not None:
@@ -3171,7 +3212,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         is3d = self.is3d.isChecked()
         avg = self.avg_tid.isChecked()
-
+        sb = float(getattr(self, "_scalebar_nm", 100.0))
         if self._multicolor_win.mode() == "merged":
             # Build merged from whatever is in _arr_by_base (trace-filtered or EFO-filtered)
             # preserve insertion order from _all_files:
@@ -3189,7 +3230,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 color_settings_by_base=self._color_settings_by_base,
                 scalebar_nm=getattr(self, "_scalebar_nm", 100.0)
             )
-            self._multicolor_win.update_merged(fig, reset_view=reset_view, is3d=is3d)
+            self._multicolor_win.update_merged(fig, reset_view=reset_view, is3d=is3d, scalebar_nm=sb)
         else:
             figs = {}
             for f in self._all_files:
@@ -3200,7 +3241,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     continue
                 figs[base] = make_plotly_fig(arr, avg, is3d, color_settings=cs, scalebar_nm=getattr(self, "_scalebar_nm", 100.0))
 
-            self._multicolor_win.update_all(figs, reset_view=reset_view, is3d=is3d)
+            self._multicolor_win.update_all(figs, reset_view=reset_view, is3d=is3d, scalebar_nm=sb)
 
     def _get_arr_for_base(self, base: str):
         arr = self._arr_by_base.get(base)
@@ -3240,7 +3281,12 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         cs = self._color_settings_by_base.get(base, {"mode": DEFAULT_MODE, "solid": DEFAULT_SOLID, "lut": DEFAULT_LUT, "alpha": DEFAULT_ALPHA, "size": DEFAULT_SIZE_2D})
         fig = make_plotly_fig(arr, self.avg_tid.isChecked(), self.is3d.isChecked(), color_settings=cs)
-        self._multicolor_win.update_one(base, fig, reset_view=reset_view, is3d=self.is3d.isChecked())
+        self._multicolor_win.update_one(
+            base, fig,
+            reset_view=reset_view,
+            is3d=self.is3d.isChecked(),
+            scalebar_nm=getattr(self, "_scalebar_nm", 100.0),
+        )
 
     def _multicolor_rebuild_if_open(self):
         if self._multicolor_win is None or not self._multicolor_win.isVisible():
@@ -3249,8 +3295,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._multicolor_win.rebuild(bases)
 
     def update_plotly_fig(self, fig, reset_view=False):
-        self.plot_view.update_fig(fig, reset_view=reset_view, is3d=self.is3d.isChecked())
-
+        self.plot_view.update_fig(
+            fig,
+            reset_view=reset_view,
+            is3d=self.is3d.isChecked(),
+            scalebar_nm=getattr(self, "_scalebar_nm", 100.0),
+        )
     # ---------------- UI actions ----------------
     def browse_folder(self):
         old = self.data_edit.text().strip()
@@ -3365,6 +3415,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Last iteration localizations", str(last_it)),
             ("After trace filtering", str(ctx.get("after_trace", "—"))),
             ("After EFO filtering", str(n_after)),
+            ("Total traces", str(ut.size if arr_efo is not None else "—")),
             ("Localization precision (x, y, z)", str(lp) if lp is not None else "—"),
             ("Ratio loc per trace", f"{ratio_loc_per_trace:.4f}"),
             ("% remaining", f"{(n_after / last_it * 100):.2f}%"),
@@ -3529,9 +3580,16 @@ class MainWindow(QtWidgets.QMainWindow):
         apply_hist_theme(self.fig, self.ax)
         self.canvas.draw()
 
-        # ---- initial span ----
-        self._span_xmin = float(efo_vals.min()) if len(efo_vals) else None
-        self._span_xmax = float(efo_vals.max()) if len(efo_vals) else None
+        if len(efo_vals) > 0:
+            if base in self._efo_range_by_base:
+                self._span_xmin, self._span_xmax = self._efo_range_by_base[base]
+            else:
+                self._span_xmin = float(efo_vals.min())
+                self._span_xmax = float(efo_vals.max())
+        else:
+            self._span_xmin = None
+            self._span_xmax = None
+
 
         def onselect(xmin, xmax):
             self._span_xmin, self._span_xmax = float(xmin), float(xmax)
@@ -3562,16 +3620,19 @@ class MainWindow(QtWidgets.QMainWindow):
         # ---- cache ctx for later "Save all" ----
         self._ctx_by_base[base] = ctx
 
-        # ---- default range = full range (auto-applied) ----
+        # ---- apply existing range if present; otherwise default to full range (once) ----
         if len(efo_vals) > 0:
-            full_range = (float(efo_vals.min()), float(efo_vals.max()))
-            self._efo_range_by_base[base] = full_range
+            if base in self._efo_range_by_base:
+                xmin, xmax = self._efo_range_by_base[base]
+            else:
+                xmin, xmax = float(efo_vals.min()), float(efo_vals.max())
+                self._efo_range_by_base[base] = (xmin, xmax)
 
-            # this updates memory + plots + output table
+            # apply (this updates _filtered_by_base + plots)
             self._apply_efo_range_to_memory(
                 base,
-                full_range[0],
-                full_range[1],
+                xmin,
+                xmax,
                 update_view=True,
                 reset_view=True
             )
@@ -3676,21 +3737,69 @@ class MainWindow(QtWidgets.QMainWindow):
             if arr_filt is None:
                 continue
 
+            # what you actually save (aligned if enabled)
             arr_to_save = self._aligned_arr_by_base.get(base, arr_filt) if self._mbm_enabled else arr_filt
+            if arr_to_save is None:
+                continue
 
+            # --- save main localization CSV (UNCHANGED; no extra columns) ---
             df = np_to_df(arr_to_save)
             save_path = os.path.join(save_folder, f"{base}.csv")
             save_to_csv(df, save_path)
 
-            # stats (reuse your existing logic)
+            # --- build per-tid stats DataFrame (as before) ---
             dims = [c.replace("loc_", "") for c in df.columns if c.startswith("loc_")]
             avg_df = pd.DataFrame()
+
             if len(df) > 0 and dims:
                 for dim in dims:
                     avg_df[f"loc_{dim}_mean"] = df.groupby("tid")[f"loc_{dim}"].mean()
                     avg_df[f"loc_{dim}_std"] = df.groupby("tid")[f"loc_{dim}"].std()
                 avg_df["n"] = df.groupby("tid")[f"loc_{dims[0]}"].count()
                 avg_df["tim_tot"] = df.groupby("tid")["tim"].sum()
+
+            # --- summary metrics: write into base_stats.csv ONLY (row 0 only) ---
+            n_after = int(len(arr_to_save))
+
+            ctx = self._ctx_by_base.get(base) or self._current_ctx
+            last_it = 0
+            if ctx and ctx.get("base") == base:
+                try:
+                    last_it = int(ctx.get("last_iteration_loc", 0))
+                except Exception:
+                    last_it = 0
+            if last_it <= 0:
+                last_it = max(n_after, 1)
+
+            # localization precision (per dimension)
+            lp = preview_localization_precision(arr_to_save)  # (x,y,z) or (x,y) or None
+
+            # ratio loc per trace
+            if n_after > 0:
+                ut = np.unique(arr_to_save["tid"])
+                ratio_loc_per_trace = float(n_after / len(ut)) if len(ut) else 0.0
+            else:
+                ratio_loc_per_trace = 0.0
+
+            percent_remaining = float(n_after / last_it * 100.0) if last_it else float("nan")
+
+            # Ensure at least one row exists so we can fill row 0
+            if avg_df is None or len(avg_df) == 0:
+                avg_df = pd.DataFrame(index=[0])
+
+            # Add columns and fill only first row
+            dim_names = ["x", "y", "z"]
+            if lp is not None:
+                for i, v in enumerate(lp):
+                    col = f"localization_precision_{dim_names[i] if i < len(dim_names) else i}"
+                    avg_df[col] = np.nan
+                    avg_df.iloc[0, avg_df.columns.get_loc(col)] = float(v) if np.isfinite(v) else np.nan
+
+            avg_df["ratio_loc_per_trace"] = np.nan
+            avg_df.iloc[0, avg_df.columns.get_loc("ratio_loc_per_trace")] = float(ratio_loc_per_trace)
+
+            avg_df["percent_remaining"] = np.nan
+            avg_df.iloc[0, avg_df.columns.get_loc("percent_remaining")] = float(percent_remaining)
 
             avg_save_path = os.path.join(save_folder, f"{base}_stats.csv")
             avg_df.to_csv(avg_save_path, index=True)
@@ -3778,6 +3887,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.redraw_scatter(reset_view=False)
         self._refresh_multicolor_contents(reset_view=False)
 
+        # NEW: refresh binning window too
+        if self._binning_win is not None and self._binning_win.isVisible():
+            self._binning_win.refresh_plot(keep_view=True)
+
     # ---------------- output / done ----------------
     def set_output(self, items):
         self.out_table.setRowCount(0)
@@ -3833,6 +3946,22 @@ def main():
 
     w = MainWindow()
     w.show()
+
+    QtWidgets.QApplication.processEvents()  # ensure window is realized
+
+    # pick the screen where the window currently is
+    screen = w.screen()
+    if screen is None:
+        screen = QtWidgets.QApplication.screenAt(QtGui.QCursor.pos())
+    if screen is None:
+        screen = QtWidgets.QApplication.primaryScreen()
+
+    if screen is not None:
+        g = screen.availableGeometry()
+        if g.width() < 1500 or g.height() < 950:
+            w.showMaximized()
+        else:
+            w.resize(1500, 950)
     sys.exit(app.exec())
 
 if __name__ == "__main__":
