@@ -503,7 +503,7 @@ def make_plotly_fig_merged(arr_by_base: dict, avg_tid: bool, is3d: bool, color_s
     apply_plot_theme(fig, is3d=is3d)
     return fig
 
-def pointcloud_to_image(x_nm, y_nm, pixel_size_nm=5.0, padding_nm=0.0):
+def pointcloud_to_image(x_nm, y_nm, pixel_size_nm=4.0, padding_nm=0.0):
     """
     Bin a 2D point cloud (x_nm, y_nm) into an image where each pixel is
     pixel_size_nm wide/tall. Pixel intensity = number of points in that pixel.
@@ -554,6 +554,9 @@ def make_plotly_heatmap_from_arr(
     title: str = None,
     *,
     scale_mode: str = "linear",   # "linear" (default) or "log"
+    pmax: float = 100.00,
+    arcsinh_a: float = 1.0,
+    show_colorbar: bool = True,
 ):
     """
     Build a single Plotly heatmap for the array's loc_x/loc_y (assumes nm units already).
@@ -617,12 +620,10 @@ def make_plotly_heatmap_from_arr(
 
     if scale_mode == "log10(count+1)":
         Z = np.log10(H + 1.0)
-        cb_title = "log"#10(count+1)"
-        zmin = 0
     else:
         Z = H.astype(float, copy=False)
-        cb_title = "count"
-        zmin = 0
+
+    Z = _normalize_image(Z, pmin=0.0, pmax=pmax, arcsinh_a=arcsinh_a)
 
     fig = go.Figure(
         data=go.Heatmap(
@@ -630,8 +631,10 @@ def make_plotly_heatmap_from_arr(
             x=x_centers.tolist(),
             y=y_centers.tolist(),
             colorscale=lut,
-            colorbar=dict(title=cb_title),
-            zmin=zmin,
+            colorbar=dict(title="norm"),
+            showscale=bool(show_colorbar),
+            zmin=0.0,
+            zmax=1.0,
         )
     )
 
@@ -646,6 +649,366 @@ def make_plotly_heatmap_from_arr(
     fig.update_xaxes(showline=False, ticks="", showticklabels=False)
     fig.update_yaxes(showline=False, ticks="", showticklabels=False)
 
+    return fig
+
+def _xy_from_arr(arr):
+    if arr is None or len(arr) == 0:
+        return np.array([]), np.array([])
+    loc = np.asarray(arr["loc"], dtype=float)
+    if loc.ndim != 2 or loc.shape[1] < 2:
+        return np.array([]), np.array([])
+    x = loc[:, 0]
+    y = loc[:, 1]
+    m = np.isfinite(x) & np.isfinite(y)
+    return x[m], y[m]
+
+def _normalize_hist_for_overlay(H, scale_mode: str, pmax: float = 100.00, arcsinh_a: float = 1.0):
+    scale_mode = (scale_mode or "linear").strip().lower()
+    if scale_mode == "log10(count+1)":
+        Z = np.log10(H + 1.0)
+    else:
+        Z = H.astype(float, copy=False)
+    return _normalize_image(Z, pmin=0.0, pmax=pmax, arcsinh_a=arcsinh_a)
+
+def _normalize_image(img: np.ndarray, pmin: float = 0.0, pmax: float = 100.00, arcsinh_a: float = 1.0):
+    if img is None or np.size(img) == 0:
+        return np.zeros((1, 1), dtype=float)
+    pmax = float(max(pmin + 1e-6, min(100.0, pmax)))
+    hi = float(np.percentile(img, pmax))
+    if not np.isfinite(hi) or hi <= 0:
+        return np.zeros_like(img, dtype=float)
+    out = np.clip(img / (hi + 1e-12), 0.0, None)
+
+    a = float(max(0.0, arcsinh_a))
+    if a > 0:
+        den = np.arcsinh(a)
+        if np.isfinite(den) and den > 0:
+            out = np.arcsinh(a * out) / den
+    else:
+        out = np.clip(out, 0.0, 1.0)
+    return np.clip(out, 0.0, 1.0)
+
+def _resolve_overlay_colorscale(lut: str):
+    if lut not in LUT_CHOICES:
+        lut = DEFAULT_LUT_BIN
+    if lut.startswith("cu"):
+        return CUSTOM_LUTS.get(lut, DEFAULT_LUT_BIN)
+    return lut
+
+def _plotly_color_to_mpl(color):
+    if not isinstance(color, str):
+        return color
+
+    s = color.strip()
+    low = s.lower()
+
+    if low.startswith("rgb(") and low.endswith(")"):
+        body = s[s.find("(") + 1:-1]
+        parts = [p.strip() for p in body.split(",")]
+        if len(parts) >= 3:
+            try:
+                r = float(parts[0]) / 255.0
+                g = float(parts[1]) / 255.0
+                b = float(parts[2]) / 255.0
+                r = max(0.0, min(1.0, r))
+                g = max(0.0, min(1.0, g))
+                b = max(0.0, min(1.0, b))
+                return (r, g, b)
+            except Exception:
+                return s
+
+    if low.startswith("rgba(") and low.endswith(")"):
+        body = s[s.find("(") + 1:-1]
+        parts = [p.strip() for p in body.split(",")]
+        if len(parts) >= 4:
+            try:
+                r = float(parts[0]) / 255.0
+                g = float(parts[1]) / 255.0
+                b = float(parts[2]) / 255.0
+                a = float(parts[3])
+                r = max(0.0, min(1.0, r))
+                g = max(0.0, min(1.0, g))
+                b = max(0.0, min(1.0, b))
+                a = max(0.0, min(1.0, a))
+                return (r, g, b, a)
+            except Exception:
+                return s
+
+    return s
+
+def _resolve_mpl_cmap(lut: str):
+    if lut not in LUT_CHOICES:
+        lut = DEFAULT_LUT_BIN
+    if lut.startswith("cu"):
+        colors = CUSTOM_LUTS.get(lut)
+        if colors:
+            mpl_colors = []
+            for c in colors:
+                if isinstance(c, (list, tuple)) and len(c) == 2:
+                    mpl_colors.append((float(c[0]), _plotly_color_to_mpl(c[1])))
+                else:
+                    mpl_colors.append(_plotly_color_to_mpl(c))
+            return LinearSegmentedColormap.from_list(f"overlay_{lut}", mpl_colors)
+        return matplotlib.colormaps.get_cmap(DEFAULT_LUT_BIN)
+    try:
+        return matplotlib.colormaps.get_cmap(lut)
+    except Exception:
+        return matplotlib.colormaps.get_cmap(DEFAULT_LUT_BIN)
+
+def _make_rgba_intensity_colorscale(lut: str, steps: int = 256):
+    cmap = _resolve_mpl_cmap(lut)
+    out = []
+    steps = max(2, int(steps))
+    for i in range(steps):
+        t = i / (steps - 1)
+        r, g, b, _ = cmap(t)
+        rr = int(round(255 * r))
+        gg = int(round(255 * g))
+        bb = int(round(255 * b))
+        out.append([t, f"rgba({rr},{gg},{bb},1.0)"])
+    return out
+
+def _lut_peak_rgb(lut: str):
+    cmap = _resolve_mpl_cmap(lut)
+    r, g, b, _ = cmap(1.0)
+    return np.array([float(r), float(g), float(b)], dtype=float)
+
+def _compute_bounds_xy(x: np.ndarray, y: np.ndarray, sigma_nm: float, n_sigma: float = 3.0):
+    if len(x) == 0:
+        return (0.0, 1.0, 0.0, 1.0)
+    pad = float(n_sigma) * float(sigma_nm)
+    xmin = float(np.min(x) - pad)
+    xmax = float(np.max(x) + pad)
+    ymin = float(np.min(y) - pad)
+    ymax = float(np.max(y) + pad)
+    if xmax <= xmin:
+        xmax = xmin + max(float(sigma_nm), 1.0)
+    if ymax <= ymin:
+        ymax = ymin + max(float(sigma_nm), 1.0)
+    return xmin, xmax, ymin, ymax
+
+def render_gaussians_xy(x, y, sigma_nm: float, pixel_size_nm: float, n_sigma: float = 3.0, bounds=None):
+    x = np.asarray(x, dtype=float).ravel()
+    y = np.asarray(y, dtype=float).ravel()
+
+    if len(x) == 0:
+        return np.zeros((1, 1), dtype=float), (0.0, 1.0, 0.0, 1.0)
+
+    sigma_nm = max(float(sigma_nm), 1e-9)
+    pixel_size_nm = max(float(pixel_size_nm), 0.1)
+
+    if bounds is None:
+        xmin, xmax, ymin, ymax = _compute_bounds_xy(x, y, sigma_nm=sigma_nm, n_sigma=n_sigma)
+    else:
+        xmin, xmax, ymin, ymax = bounds
+
+    nx = max(int(np.ceil((xmax - xmin) / pixel_size_nm)), 1)
+    ny = max(int(np.ceil((ymax - ymin) / pixel_size_nm)), 1)
+
+    xs = xmin + (np.arange(nx) + 0.5) * pixel_size_nm
+    ys = ymin + (np.arange(ny) + 0.5) * pixel_size_nm
+
+    img = np.zeros((ny, nx), dtype=float)
+    r = float(n_sigma) * sigma_nm
+    denom = 2.0 * sigma_nm * sigma_nm
+
+    for xi, yi in zip(x, y):
+        ix = np.where((xs >= xi - r) & (xs <= xi + r))[0]
+        iy = np.where((ys >= yi - r) & (ys <= yi + r))[0]
+        if ix.size == 0 or iy.size == 0:
+            continue
+        X, Y = np.meshgrid(xs[ix], ys[iy])
+        img[np.ix_(iy, ix)] += np.exp(-((X - xi) ** 2 + (Y - yi) ** 2) / denom)
+
+    return img, (float(xmin), float(xmax), float(ymin), float(ymax))
+
+def make_plotly_gaussian_from_arr(
+    arr,
+    pixel_size_nm: float,
+    lut: str,
+    title: str = None,
+    *,
+    pmax: float = 100.00,
+    arcsinh_a: float = 1.0,
+    show_colorbar: bool = True,
+):
+    x, y = _xy_from_arr(arr)
+    if len(x) == 0:
+        fig = go.Figure()
+        fig.update_layout(annotations=[dict(text="No valid points", x=0.5, y=0.5, showarrow=False)])
+        apply_plot_theme(fig, is3d=False)
+        return fig
+
+    sigma_nm = max(float(pixel_size_nm), 0.1)
+    img, extent = render_gaussians_xy(
+        x,
+        y,
+        sigma_nm=sigma_nm,
+        pixel_size_nm=float(pixel_size_nm),
+        n_sigma=3.0,
+        bounds=None,
+    )
+    z = _normalize_image(img, pmin=0.0, pmax=pmax, arcsinh_a=arcsinh_a)
+
+    xmin, xmax, ymin, ymax = extent
+    ny, nx = z.shape
+    x_centers = xmin + (np.arange(nx) + 0.5) * float(pixel_size_nm)
+    y_centers = ymin + (np.arange(ny) + 0.5) * float(pixel_size_nm)
+
+    cs = _resolve_overlay_colorscale(lut)
+
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=z.tolist(),
+            x=x_centers.tolist(),
+            y=y_centers.tolist(),
+            colorscale=cs,
+            zmin=0.0,
+            zmax=1.0,
+            colorbar=dict(title="gaussian"),
+            showscale=bool(show_colorbar),
+        )
+    )
+
+    fig.update_layout(
+        title=title,
+        xaxis_title="x (nm)",
+        yaxis_title="y (nm)",
+        dragmode="pan",
+    )
+    fig.update_yaxes(scaleanchor="x", scaleratio=1)
+    apply_plot_theme(fig, is3d=False)
+    fig.update_xaxes(showline=False, ticks="", showticklabels=False)
+    fig.update_yaxes(showline=False, ticks="", showticklabels=False)
+    return fig
+
+def make_plotly_overlay_heatmap_from_two_arrs(
+    arr_a,
+    arr_b,
+    pixel_size_nm: float,
+    lut_a: str,
+    lut_b: str,
+    *,
+    title: str = None,
+    scale_mode: str = "linear",
+    render_mode: str = "heatmap",
+    pmax: float = 100.00,
+    arcsinh_a: float = 1.0,
+):
+    x_a, y_a = _xy_from_arr(arr_a)
+    x_b, y_b = _xy_from_arr(arr_b)
+
+    if len(x_a) == 0 and len(x_b) == 0:
+        fig = go.Figure()
+        fig.update_layout(annotations=[dict(text="No valid points", x=0.5, y=0.5, showarrow=False)])
+        apply_plot_theme(fig, is3d=False)
+        return fig
+
+    render_mode = (render_mode or "heatmap").strip().lower()
+    pixel_size_nm = max(float(pixel_size_nm), 0.1)
+
+    x_all = np.concatenate([x_a, x_b]) if (len(x_a) and len(x_b)) else (x_a if len(x_a) else x_b)
+    y_all = np.concatenate([y_a, y_b]) if (len(y_a) and len(y_b)) else (y_a if len(y_a) else y_b)
+
+    xmin, xmax = float(np.min(x_all)), float(np.max(x_all))
+    ymin, ymax = float(np.min(y_all)), float(np.max(y_all))
+
+    if render_mode == "gaussian":
+        pad = 3.0 * pixel_size_nm
+        xmin -= pad
+        xmax += pad
+        ymin -= pad
+        ymax += pad
+
+    if xmax == xmin:
+        xmax = xmin + pixel_size_nm
+    if ymax == ymin:
+        ymax = ymin + pixel_size_nm
+
+    nx = max(int(np.ceil((xmax - xmin) / pixel_size_nm)), 1)
+    ny = max(int(np.ceil((ymax - ymin) / pixel_size_nm)), 1)
+
+    x_edges = xmin + np.arange(nx + 1) * pixel_size_nm
+    y_edges = ymin + np.arange(ny + 1) * pixel_size_nm
+
+    if render_mode == "gaussian":
+        sigma_nm = pixel_size_nm
+        bounds = (float(x_edges[0]), float(x_edges[-1]), float(y_edges[0]), float(y_edges[-1]))
+        img_a, _ = render_gaussians_xy(
+            x_a,
+            y_a,
+            sigma_nm=sigma_nm,
+            pixel_size_nm=pixel_size_nm,
+            n_sigma=3.0,
+            bounds=bounds,
+        )
+        img_b, _ = render_gaussians_xy(
+            x_b,
+            y_b,
+            sigma_nm=sigma_nm,
+            pixel_size_nm=pixel_size_nm,
+            n_sigma=3.0,
+            bounds=bounds,
+        )
+        norm_a = _normalize_image(img_a, pmin=0.0, pmax=pmax, arcsinh_a=arcsinh_a)
+        norm_b = _normalize_image(img_b, pmin=0.0, pmax=pmax, arcsinh_a=arcsinh_a)
+        z_a = np.asarray(norm_a, dtype=float)
+        z_b = np.asarray(norm_b, dtype=float)
+    else:
+        H_a = np.zeros((ny, nx), dtype=float)
+        H_b = np.zeros((ny, nx), dtype=float)
+
+        if len(x_a):
+            H_a, _, _ = np.histogram2d(y_a, x_a, bins=(y_edges, x_edges))
+        if len(x_b):
+            H_b, _, _ = np.histogram2d(y_b, x_b, bins=(y_edges, x_edges))
+
+        norm_a = _normalize_hist_for_overlay(H_a, scale_mode, pmax=pmax, arcsinh_a=arcsinh_a)
+        norm_b = _normalize_hist_for_overlay(H_b, scale_mode, pmax=pmax, arcsinh_a=arcsinh_a)
+
+        z_a = np.asarray(norm_a, dtype=float)
+        z_b = np.asarray(norm_b, dtype=float)
+
+    col_a = _lut_peak_rgb(lut_a)
+    col_b = _lut_peak_rgb(lut_b)
+    rgb = np.clip(
+        z_a[..., None] * col_a[None, None, :] + z_b[..., None] * col_b[None, None, :],
+        0.0,
+        1.0,
+    )
+    rgb_u8 = np.asarray(np.round(rgb * 255.0), dtype=np.uint8)
+
+    fig = go.Figure()
+    fig.add_trace(go.Image(
+        z=rgb_u8.tolist(),
+        x0=float(x_edges[0]),
+        y0=float(y_edges[0]),
+        dx=float(pixel_size_nm),
+        dy=float(pixel_size_nm),
+    ))
+
+    fig.update_layout(
+        title=title,
+        xaxis_title="x (nm)",
+        yaxis_title="y (nm)",
+        dragmode="pan",
+    )
+    fig.update_xaxes(
+        showline=False,
+        ticks="",
+        showticklabels=False,
+        range=[float(x_edges[0]), float(x_edges[-1])],
+    )
+    fig.update_yaxes(
+        showline=False,
+        ticks="",
+        showticklabels=False,
+        range=[float(y_edges[0]), float(y_edges[-1])],
+        scaleanchor="x",
+        scaleratio=1,
+    )
+    apply_plot_theme(fig, is3d=False)
+    fig.update_layout(plot_bgcolor="#000000")
     return fig
 
 def make_trace_for_arr(arr, avg_tid: bool, is3d: bool, color_settings: dict, name: str = None, show_colorbar: bool = True):
@@ -1111,7 +1474,10 @@ def custom_LUT(colors=["#000000", "#ff0000"], bins=2**8):
     rgba = cm(xs)  # (n,4) floats in [0,1]
     colorscale = []
     for x, (r, g, b, a) in zip(xs, rgba):
-        colorscale.append([float(x), f"rgb({int(r*255)}, {int(g*255)}, {int(b*255)})"])
+        rr = int(round(r * 255))
+        gg = int(round(g * 255))
+        bb = int(round(b * 255))
+        colorscale.append([float(x), f"#{rr:02x}{gg:02x}{bb:02x}"])
     return colorscale
 
 # -------------------- Qt (GUI) theme --------------------
@@ -1617,10 +1983,9 @@ class ParametersDialog(QtWidgets.QDialog):
 class BinningWindow(QtWidgets.QMainWindow):
     """
     One window, one plot.
-    Table: File | XX (single selection) | LUT | Pixel size (nm)
-    Shows heatmap for the selected file, using the SAVED array:
-      - if MBM enabled -> aligned saved array if available
-      - else -> saved array
+    Table: File | XX (multi-selection, max 2) | LUT
+    - 1 selected file: heatmap or gaussian (based on mode)
+    - 2 selected files: single merged overlay image from both binned maps
     """
     def __init__(self, main_window: "MainWindow", parent=None):
         super().__init__(parent)
@@ -1629,20 +1994,22 @@ class BinningWindow(QtWidgets.QMainWindow):
 
         self._mw = main_window
         self._widgets_by_base = {}
-        self._selected_base = None
+        self._selected_bases = []
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
         root = QtWidgets.QVBoxLayout(central)
-        root.setContentsMargins(8, 8, 8, 8)
-        root.setSpacing(8)
+        root.setContentsMargins(6, 2, 2, 2)
+        root.setSpacing(10)
 
-        # top bar: table + plot
         top = QtWidgets.QHBoxLayout()
-        root.addLayout(top, 2)
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(6)
+        root.addLayout(top, 1)
 
-        # --- left: table ---
         left = QtWidgets.QVBoxLayout()
+        left.setContentsMargins(4, 0, 0, 0)
+        left.setSpacing(6)
         top.addLayout(left, 1)
 
         self.table = QtWidgets.QTableWidget(0, 3, self)
@@ -1656,62 +2023,91 @@ class BinningWindow(QtWidgets.QMainWindow):
         hdr.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
         hdr.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeToContents)
 
-        self.table.setMinimumWidth(420)
-        self.table.setMaximumWidth(520)
+        self.table.setMinimumWidth(460)
+        self.table.setMaximumWidth(580)
+        self.table.setMaximumHeight(260)
         left.addWidget(self.table, 1)
 
-        # --- controls under table (global) ---
-        ctrl = QtWidgets.QHBoxLayout()
+        ctrl = QtWidgets.QGridLayout()
+        ctrl.setContentsMargins(2, 0, 0, 0)
+        ctrl.setHorizontalSpacing(8)
+        ctrl.setVerticalSpacing(6)
         left.addLayout(ctrl)
 
-        ctrl.addWidget(QtWidgets.QLabel("Scale:"))
-        self.scale_combo = QtWidgets.QComboBox()
-        self.scale_combo.addItems(["linear", "log10(count+1)"])
-        self.scale_combo.setCurrentText("linear")  # DEFAULT = linear
-        self.scale_combo.currentTextChanged.connect(lambda _: self.refresh_plot(keep_view=True))
-        ctrl.addWidget(self.scale_combo)
+        ctrl.addWidget(QtWidgets.QLabel("Mode:"), 0, 0)
+        self.mode_combo = QtWidgets.QComboBox()
+        self.mode_combo.addItems(["heatmap", "gaussian"])
+        self.mode_combo.setCurrentText("heatmap")
+        ctrl.addWidget(self.mode_combo, 0, 1)
 
-        ctrl.addSpacing(12)
-
-        ctrl.addWidget(QtWidgets.QLabel("Pixel size (nm):"))
+        ctrl.addWidget(QtWidgets.QLabel("Pixel size (nm):"), 0, 2)
         self.px_spin = QtWidgets.QDoubleSpinBox()
         self.px_spin.setDecimals(1)
         self.px_spin.setRange(0.1, 1e6)
         self.px_spin.setSingleStep(1.0)
-        self.px_spin.setValue(5.0)
-        self.px_spin.valueChanged.connect(lambda _: self.refresh_plot(keep_view=True))
-        ctrl.addWidget(self.px_spin)
+        self.px_spin.setValue(4.0)
+        ctrl.addWidget(self.px_spin, 0, 3)
 
-        ctrl.addStretch(1)
+        ctrl.addWidget(QtWidgets.QLabel("Scale:"), 1, 0)
+        self.scale_combo = QtWidgets.QComboBox()
+        self.scale_combo.addItems(["linear", "log10(count+1)"])
+        self.scale_combo.setCurrentText("linear")
+        ctrl.addWidget(self.scale_combo, 1, 1)
 
-        # --- right: plot ---
+        ctrl.addWidget(QtWidgets.QLabel("pmax:"), 2, 0)
+        self.pmax_spin = QtWidgets.QDoubleSpinBox()
+        self.pmax_spin.setDecimals(3)
+        self.pmax_spin.setRange(90.0, 100.0)
+        self.pmax_spin.setSingleStep(0.01)
+        self.pmax_spin.setValue(100.00)
+        ctrl.addWidget(self.pmax_spin, 2, 1)
+
+        ctrl.addWidget(QtWidgets.QLabel("arcsinh a:"), 2, 2)
+        self.arcsinh_a_spin = QtWidgets.QDoubleSpinBox()
+        self.arcsinh_a_spin.setDecimals(2)
+        self.arcsinh_a_spin.setRange(0.0, 50.0)
+        self.arcsinh_a_spin.setSingleStep(0.25)
+        self.arcsinh_a_spin.setValue(1.0)
+        ctrl.addWidget(self.arcsinh_a_spin, 2, 3)
+
+        self.apply_settings_btn = QtWidgets.QPushButton("Apply")
+        self.apply_settings_btn.clicked.connect(lambda: self.refresh_plot(keep_view=True))
+        ctrl.addWidget(self.apply_settings_btn, 3, 0, 1, 1)
+
+        self.reset_tone_btn = QtWidgets.QPushButton("Reset Tone")
+        self.reset_tone_btn.clicked.connect(self._reset_tone_controls)
+        ctrl.addWidget(self.reset_tone_btn, 3, 1, 1, 1)
+
+        self.save_tif_btn = QtWidgets.QPushButton("Save as tif")
+        self.save_tif_btn.clicked.connect(self._save_selected_as_tif)
+        ctrl.addWidget(self.save_tif_btn, 3, 2, 1, 2)
+
+        ctrl.setRowMinimumHeight(4, 14)
+
+        self.tone_hint_lbl = QtWidgets.QLabel("pmax sets clipping of bright pixels; arcsinh a controls highlight compression.")
+        self.tone_hint_lbl.setStyleSheet("color: #B0B3B8;")
+        ctrl.addWidget(self.tone_hint_lbl, 5, 0, 1, 4)
+
+        ctrl.setColumnStretch(4, 1)
+
         self.view = PlotlyView()
         top.addWidget(self.view, 3)
 
-        # bottom buttons
-        btnrow = QtWidgets.QHBoxLayout()
-        root.addLayout(btnrow)
-        btnrow.addStretch(1)
-
-        self.refresh_btn = QtWidgets.QPushButton("Refresh")
-        self.refresh_btn.clicked.connect(self.refresh_plot)
-        btnrow.addWidget(self.refresh_btn)
-
-        self.close_btn = QtWidgets.QPushButton("Close")
-        self.close_btn.clicked.connect(self.close)
-        btnrow.addWidget(self.close_btn)
+        left.addStretch(1)
 
     def rebuild(self, base_names):
+        prev_selected = [b for b in self._selected_bases if b in set(base_names)]
+
         self.table.setRowCount(0)
         self._widgets_by_base.clear()
+        self._selected_bases = []
 
         for r, base in enumerate(base_names):
             self.table.insertRow(r)
 
-            item = QtWidgets.QTableWidgetItem(base)
+            item = QtWidgets.QTableWidgetItem(f" {base}")
             self.table.setItem(r, 0, item)
 
-            # XX checkbox (single selection)
             xx = QtWidgets.QCheckBox()
             xx.toggled.connect(lambda checked, b=base: self._on_xx_toggled(b, checked))
             xx_cell = QtWidgets.QWidget()
@@ -1721,7 +2117,6 @@ class BinningWindow(QtWidgets.QMainWindow):
             xx_lay.addWidget(xx)
             self.table.setCellWidget(r, 1, xx_cell)
 
-            # LUT combo
             lut = QtWidgets.QComboBox()
             lut.addItems(LUT_CHOICES)
             lut.setCurrentText(DEFAULT_LUT_BIN)
@@ -1732,111 +2127,294 @@ class BinningWindow(QtWidgets.QMainWindow):
 
         self.table.resizeRowsToContents()
 
-        # optionally auto-select first file if any
-        if base_names and self._selected_base is None:
-            first = base_names[0]
-            self._select_base(first, do_refresh=True)
-
-    def _on_settings_changed(self, base: str):
-        if base == self._selected_base:
-            self.refresh_plot(keep_view=True)
-
-    def _select_base(self, base: str, do_refresh: bool):
-        # enforce single selection
-        for b, w in self._widgets_by_base.items():
+        for base in prev_selected[:2]:
+            w = self._widgets_by_base.get(base)
+            if not w:
+                continue
             chk = w["xx"]
             chk.blockSignals(True)
-            chk.setChecked(b == base)
+            chk.setChecked(True)
             chk.blockSignals(False)
+            self._selected_bases.append(base)
 
-        self._selected_base = base
-        if do_refresh:
-            self.refresh_plot(keep_view=False)  # autorange for new file
+        if not self._selected_bases and base_names:
+            first = base_names[0]
+            w = self._widgets_by_base.get(first)
+            if w:
+                chk = w["xx"]
+                chk.blockSignals(True)
+                chk.setChecked(True)
+                chk.blockSignals(False)
+                self._selected_bases = [first]
+
+        self.refresh_plot(keep_view=False)
+
+    def _on_settings_changed(self, base: str):
+        if base in self._selected_bases:
+            self.refresh_plot(keep_view=True)
 
     def _on_xx_toggled(self, base: str, checked: bool):
         if checked:
-            self._select_base(base, do_refresh=True)
-        else:
-            if self._selected_base == base:
-                self._selected_base = None
-                fig = go.Figure()
-                fig.update_layout(annotations=[dict(text="No file selected", x=0.5, y=0.5, showarrow=False)])
-                apply_plot_theme(fig, is3d=False)
-                self.view.update_fig(fig, reset_view=True, is3d=False)
-
-    def _on_zmax_checked(self, state: int):
-            on = (state == Qt.Checked)
-            self.zmax_spin.setEnabled(on)
-
-            if on:
-                # try to set a reasonable default based on current selection
-                base, lut, px = self._get_selected_settings()
-                if base:
-                    arr = self._mw._filtered_by_base.get(base)
-                    if getattr(self._mw, "_mbm_enabled", False):
-                        arr = self._mw._aligned_arr_by_base.get(base, arr)
-                    if arr is not None and len(arr):
-                        loc = np.asarray(arr["loc"], dtype=float)
-                        x = loc[:, 0]; y = loc[:, 1]
-                        m = np.isfinite(x) & np.isfinite(y)
-                        x = x[m]; y = y[m]
-                        if len(x):
-                            H, _ = pointcloud_to_image(x, y, pixel_size_nm=float(px), padding_nm=0.0)
-                            if self.scale_combo.currentText() == "log":
-                                Z = np.log10(H + 1.0)
-                            else:
-                                Z = H.astype(float, copy=False)
-                            if self.minmax_chk.isChecked():
-                                # normalized => zmax should be 1
-                                self.zmax_spin.setValue(1.0)
-                            else:
-                                vmax = float(np.nanmax(Z)) if np.size(Z) else 1.0
-                                self.zmax_spin.setValue(vmax)
-
-            self.refresh_plot()
-
-    def _get_selected_settings(self):
-        base = self._selected_base
-        if not base:
-            return None, None
-        w = self._widgets_by_base.get(base)
-        if not w:
-            return base, DEFAULT_LUT_BIN
-        return base, w["lut"].currentText()
-
-    def refresh_plot(self, keep_view: bool = True):
-        base, lut = self._get_selected_settings()
-        if not base:
+            if base not in self._selected_bases:
+                if len(self._selected_bases) >= 2:
+                    w = self._widgets_by_base.get(base)
+                    if w and "xx" in w:
+                        w["xx"].blockSignals(True)
+                        w["xx"].setChecked(False)
+                        w["xx"].blockSignals(False)
+                    QtWidgets.QToolTip.showText(QtGui.QCursor.pos(), "Select at most 2 files for overlay")
+                    return
+                self._selected_bases.append(base)
+            self.refresh_plot(keep_view=True)
             return
 
-        # saved array (EFO-filtered), aligned if enabled
-        arr = self._mw._filtered_by_base.get(base)
-        if arr is None:
+        if base in self._selected_bases:
+            self._selected_bases.remove(base)
+
+        if not self._selected_bases:
             fig = go.Figure()
-            fig.update_layout(annotations=[dict(
-                text=f"No saved (EFO-filtered) data for: {base}<br>Apply EFO first.",
-                x=0.5, y=0.5, showarrow=False
-            )])
+            fig.update_layout(annotations=[dict(text="No file selected", x=0.5, y=0.5, showarrow=False)])
             apply_plot_theme(fig, is3d=False)
             self.view.update_fig(fig, reset_view=True, is3d=False)
             return
 
+        self.refresh_plot(keep_view=True)
+
+    def _get_selected_settings(self):
+        out = []
+        for base in self._selected_bases:
+            w = self._widgets_by_base.get(base)
+            if not w:
+                continue
+            out.append((
+                base,
+                w["lut"].currentText() if "lut" in w else DEFAULT_LUT_BIN,
+            ))
+        return out
+
+    def _get_saved_arr_for_base(self, base: str):
+        arr = self._mw._filtered_by_base.get(base)
+        if arr is None:
+            return None
         if getattr(self._mw, "_mbm_enabled", False):
             arr = self._mw._aligned_arr_by_base.get(base, arr)
+        return arr
 
-        # global settings
-        pixel_size_nm = float(self.px_spin.value()) if hasattr(self, "px_spin") else 5.0
+    def _reset_tone_controls(self):
+        if hasattr(self, "pmax_spin"):
+            self.pmax_spin.blockSignals(True)
+            self.pmax_spin.setValue(100.00)
+            self.pmax_spin.blockSignals(False)
+        if hasattr(self, "arcsinh_a_spin"):
+            self.arcsinh_a_spin.blockSignals(True)
+            self.arcsinh_a_spin.setValue(1.0)
+            self.arcsinh_a_spin.blockSignals(False)
+
+    def _compute_selected_channel_images(
+        self,
+        selected,
+        pixel_size_nm: float,
+        scale_mode: str,
+        render_mode: str,
+        pmax: float,
+        arcsinh_a: float,
+    ):
+        channel_xy = []
+        channel_names = []
+
+        for base, _lut in selected:
+            arr = self._get_saved_arr_for_base(base)
+            if arr is None:
+                raise ValueError(f"No saved (EFO-filtered) data for: {base}")
+            x, y = _xy_from_arr(arr)
+            channel_xy.append((x, y))
+            channel_names.append(base)
+
+        non_empty = [(x, y) for (x, y) in channel_xy if len(x) > 0]
+        if not non_empty:
+            raise ValueError("No valid points in selected channel(s).")
+
+        pixel_size_nm = max(float(pixel_size_nm), 0.1)
+        render_mode = (render_mode or "heatmap").strip().lower()
+
+        x_all = np.concatenate([x for x, _ in non_empty])
+        y_all = np.concatenate([y for _, y in non_empty])
+
+        xmin, xmax = float(np.min(x_all)), float(np.max(x_all))
+        ymin, ymax = float(np.min(y_all)), float(np.max(y_all))
+
+        if render_mode == "gaussian":
+            pad = 3.0 * pixel_size_nm
+            xmin -= pad
+            xmax += pad
+            ymin -= pad
+            ymax += pad
+
+        if xmax == xmin:
+            xmax = xmin + pixel_size_nm
+        if ymax == ymin:
+            ymax = ymin + pixel_size_nm
+
+        nx = max(int(np.ceil((xmax - xmin) / pixel_size_nm)), 1)
+        ny = max(int(np.ceil((ymax - ymin) / pixel_size_nm)), 1)
+
+        x_edges = xmin + np.arange(nx + 1) * pixel_size_nm
+        y_edges = ymin + np.arange(ny + 1) * pixel_size_nm
+
+        images = []
+        for (x, y) in channel_xy:
+            if len(x) == 0:
+                img_norm = np.zeros((ny, nx), dtype=float)
+            elif render_mode == "gaussian":
+                sigma_nm = pixel_size_nm
+                bounds = (float(x_edges[0]), float(x_edges[-1]), float(y_edges[0]), float(y_edges[-1]))
+                img, _ = render_gaussians_xy(
+                    x,
+                    y,
+                    sigma_nm=sigma_nm,
+                    pixel_size_nm=pixel_size_nm,
+                    n_sigma=3.0,
+                    bounds=bounds,
+                )
+                img_norm = _normalize_image(img, pmin=0.0, pmax=pmax, arcsinh_a=arcsinh_a)
+            else:
+                H = np.zeros((ny, nx), dtype=float)
+                H, _, _ = np.histogram2d(y, x, bins=(y_edges, x_edges))
+                img_norm = _normalize_hist_for_overlay(H, scale_mode, pmax=pmax, arcsinh_a=arcsinh_a)
+
+            images.append(np.asarray(img_norm, dtype=np.float32))
+
+        return images, channel_names
+
+    def _save_selected_as_tif(self):
+        selected = self._get_selected_settings()
+        if not selected:
+            QtWidgets.QMessageBox.warning(self, "Save as tif", "No channel selected.")
+            return
+
+        pixel_size_nm = float(self.px_spin.value()) if hasattr(self, "px_spin") else 4.0
         scale_mode = self.scale_combo.currentText().strip().lower() if hasattr(self, "scale_combo") else "linear"
+        render_mode = self.mode_combo.currentText().strip().lower() if hasattr(self, "mode_combo") else "heatmap"
+        pmax = float(self.pmax_spin.value()) if hasattr(self, "pmax_spin") else 100.00
+        arcsinh_a = float(self.arcsinh_a_spin.value()) if hasattr(self, "arcsinh_a_spin") else 1.0
 
-        fig = make_plotly_heatmap_from_arr(
-            arr,
-            pixel_size_nm=pixel_size_nm,
-            lut=lut,
-            title=None,
-            scale_mode=scale_mode,
+        try:
+            images, channel_names = self._compute_selected_channel_images(
+                selected,
+                pixel_size_nm=pixel_size_nm,
+                scale_mode=scale_mode,
+                render_mode=render_mode,
+                pmax=pmax,
+                arcsinh_a=arcsinh_a,
+            )
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Save as tif", str(exc))
+            return
+
+        # TIFF viewers use row-0 at top; flip y so saved stack matches on-screen orientation
+        stack_cxy = np.stack([np.flipud(im) for im in images], axis=0).astype(np.float32)
+
+        default_name = "_".join(channel_names) + ".tif"
+        out_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save selected channels as tif",
+            default_name,
+            "TIFF (*.tif *.tiff)",
+        )
+        if not out_path:
+            return
+
+        root, ext = os.path.splitext(out_path)
+        if ext.lower() not in (".tif", ".tiff"):
+            out_path = root + ".tif"
+
+        try:
+            import tifffile
+            tifffile.imwrite(out_path, stack_cxy)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Save as tif", f"Failed to save tif:\n{exc}")
+            return
+
+        QtWidgets.QMessageBox.information(
+            self,
+            "Save as tif",
+            f"Saved {out_path}\nshape={tuple(stack_cxy.shape)}",
         )
 
-        # keep current zoom if requested
+    def refresh_plot(self, keep_view: bool = True):
+        selected = self._get_selected_settings()
+        if not selected:
+            return
+
+        pixel_size_nm = float(self.px_spin.value()) if hasattr(self, "px_spin") else 4.0
+        scale_mode = self.scale_combo.currentText().strip().lower() if hasattr(self, "scale_combo") else "linear"
+        render_mode = self.mode_combo.currentText().strip().lower() if hasattr(self, "mode_combo") else "heatmap"
+        pmax = float(self.pmax_spin.value()) if hasattr(self, "pmax_spin") else 100.00
+        arcsinh_a = float(self.arcsinh_a_spin.value()) if hasattr(self, "arcsinh_a_spin") else 1.0
+
+        if len(selected) == 1:
+            base, lut = selected[0]
+            arr = self._get_saved_arr_for_base(base)
+            if arr is None:
+                fig = go.Figure()
+                fig.update_layout(annotations=[dict(
+                    text=f"No saved (EFO-filtered) data for: {base}<br>Apply EFO first.",
+                    x=0.5, y=0.5, showarrow=False
+                )])
+                apply_plot_theme(fig, is3d=False)
+                self.view.update_fig(fig, reset_view=True, is3d=False)
+                return
+
+            if render_mode == "gaussian":
+                fig = make_plotly_gaussian_from_arr(
+                    arr,
+                    pixel_size_nm=pixel_size_nm,
+                    lut=lut,
+                    title=None,
+                    pmax=pmax,
+                    arcsinh_a=arcsinh_a,
+                    show_colorbar=False,
+                )
+            else:
+                fig = make_plotly_heatmap_from_arr(
+                    arr,
+                    pixel_size_nm=pixel_size_nm,
+                    lut=lut,
+                    title=None,
+                    scale_mode=scale_mode,
+                    pmax=pmax,
+                    arcsinh_a=arcsinh_a,
+                    show_colorbar=False,
+                )
+        else:
+            (base_a, lut_a), (base_b, lut_b) = selected[:2]
+            arr_a = self._get_saved_arr_for_base(base_a)
+            arr_b = self._get_saved_arr_for_base(base_b)
+
+            missing = [b for b, a in ((base_a, arr_a), (base_b, arr_b)) if a is None]
+            if missing:
+                fig = go.Figure()
+                fig.update_layout(annotations=[dict(
+                    text="No saved (EFO-filtered) data for:<br>" + "<br>".join(missing) + "<br>Apply EFO first.",
+                    x=0.5, y=0.5, showarrow=False
+                )])
+                apply_plot_theme(fig, is3d=False)
+                self.view.update_fig(fig, reset_view=True, is3d=False)
+                return
+
+            fig = make_plotly_overlay_heatmap_from_two_arrs(
+                arr_a,
+                arr_b,
+                pixel_size_nm=pixel_size_nm,
+                lut_a=lut_a,
+                lut_b=lut_b,
+                title=None,
+                scale_mode=scale_mode,
+                render_mode=render_mode,
+                pmax=pmax,
+                arcsinh_a=arcsinh_a,
+            )
+
         self.view.update_fig(
             fig,
             reset_view=not keep_view,
