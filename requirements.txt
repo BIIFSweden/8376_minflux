@@ -69,11 +69,12 @@ psutil==7.0.0
 ptyprocess==0.7.0
 pure_eval==0.2.3
 Pygments==2.19.2
-pyobjc-framework-Cocoa==12.1
-pyobjc-framework-Quartz==12.1
-pyobjc-framework-Security==12.1
-pyobjc-framework-UniformTypeIdentifiers==12.1
-pyobjc-framework-WebKit==12.1
+pyobjc-core==12.1; platform_system == "Darwin"
+pyobjc-framework-Cocoa==12.1; platform_system == "Darwin"
+pyobjc-framework-Quartz==12.1; platform_system == "Darwin"
+pyobjc-framework-Security==12.1; platform_system == "Darwin"
+pyobjc-framework-UniformTypeIdentifiers==12.1; platform_system == "Darwin"
+pyobjc-framework-WebKit==12.1; platform_system == "Darwin"
 pyparsing==3.2.5
 PySide6==6.9.2
 pytest==9.0.2
