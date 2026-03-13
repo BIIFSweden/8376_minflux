@@ -3456,6 +3456,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.apply_btn.clicked.connect(self.apply_preview)
         ctrl.addWidget(self.apply_btn)
 
+        self.reset_btn = QtWidgets.QPushButton("Reset EFO")
+        self.reset_btn.setEnabled(False)
+        self.reset_btn.clicked.connect(self.reset_efo)
+        ctrl.addWidget(self.reset_btn)
+
         self.back_btn = QtWidgets.QPushButton("Back")
         self.back_btn.setEnabled(False)
         self.back_btn.clicked.connect(self.go_back)
@@ -3571,6 +3576,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # reset UI controls
         self.apply_btn.setEnabled(False)
+        self.reset_btn.setEnabled(False)
         self.back_btn.setEnabled(False)
         self.next_btn.setEnabled(False)
         self.save_all_btn.setEnabled(False)
@@ -4194,6 +4200,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.range_lbl.setText("Selected range: —")
 
         self.apply_btn.setEnabled(True)
+        self.reset_btn.setEnabled(self._span_xmin is not None and self._span_xmax is not None)
 
         # ---- cache ctx for later "Save all" ----
         self._ctx_by_base[base] = ctx
@@ -4286,6 +4293,40 @@ class MainWindow(QtWidgets.QMainWindow):
         self._apply_efo_range_to_memory(base, self._span_xmin, self._span_xmax, update_view=True, reset_view=False)
 
         # if alignment is enabled, recompute it on the *filtered* datasets
+        if self._mbm_enabled:
+            self._apply_mbm_alignment()
+        if self._binning_win is not None and self._binning_win.isVisible():
+            self._binning_win.refresh_plot()
+
+    def reset_efo(self):
+        if self._current_ctx is None:
+            return
+
+        base = self._current_ctx.get("base")
+        if not base:
+            return
+
+        arr = self._raw_arr_by_base.get(base)
+        if arr is None or len(arr) == 0:
+            return
+
+        efo_vals = np.asarray(arr["efo"])
+        if efo_vals.size == 0:
+            return
+
+        xmin = float(np.min(efo_vals))
+        xmax = float(np.max(efo_vals))
+        self._span_xmin, self._span_xmax = xmin, xmax
+
+        if self._span is not None:
+            self._span.extents = (xmin, xmax)
+
+        self.range_lbl.setText(f"Selected range: {xmin:.2f} ... {xmax:.2f}")
+        self.canvas.draw_idle()
+
+        # Reuse the same update path as Apply EFO so all plots and outputs refresh.
+        self._apply_efo_range_to_memory(base, xmin, xmax, update_view=True, reset_view=False)
+
         if self._mbm_enabled:
             self._apply_mbm_alignment()
         if self._binning_win is not None and self._binning_win.isVisible():
