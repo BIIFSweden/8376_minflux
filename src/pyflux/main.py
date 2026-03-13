@@ -1440,6 +1440,30 @@ def apply_gui_theme(app: QtWidgets.QApplication):
         background-color: {t["panel_bg"]};
     }}
 
+    /* Tabs */
+    QTabWidget::pane {{
+        border: 1px solid {t["border"]};
+        background-color: {t["panel_bg"]};
+        border-radius: 6px;
+        top: -1px;
+    }}
+    QTabBar::tab {{
+        background-color: {t["button_bg"]};
+        color: {t["button_text"]};
+        border: 1px solid {t["button_border"]};
+        border-bottom: none;
+        border-top-left-radius: 6px;
+        border-top-right-radius: 6px;
+        padding: 5px 12px;
+        margin-right: 2px;
+    }}
+    QTabBar::tab:selected {{
+        background-color: #1f2123;
+    }}
+    QTabBar::tab:hover:!selected {{
+        background-color: {t["button_bg_hover"]};
+    }}
+
     /* Tables */
     QTableWidget {{
         background-color: {t["panel_bg"]};
@@ -2358,7 +2382,7 @@ class BinningWindow(QtWidgets.QMainWindow):
             if arr is None:
                 fig = go.Figure()
                 fig.update_layout(annotations=[dict(
-                    text=f"No saved (EFO-filtered) data for: {base}<br>Apply EFO first.",
+                    text=f"No saved (EFO-filtered) data for: {base}<br>Apply filter first.",
                     x=0.5, y=0.5, showarrow=False
                 )])
                 apply_plot_theme(fig, is3d=False)
@@ -2395,7 +2419,7 @@ class BinningWindow(QtWidgets.QMainWindow):
             if missing:
                 fig = go.Figure()
                 fig.update_layout(annotations=[dict(
-                    text="No saved (EFO-filtered) data for:<br>" + "<br>".join(missing) + "<br>Apply EFO first.",
+                    text="No saved (EFO-filtered) data for:<br>" + "<br>".join(missing) + "<br>Apply filter first.",
                     x=0.5, y=0.5, showarrow=False
                 )])
                 apply_plot_theme(fig, is3d=False)
@@ -3186,15 +3210,23 @@ class FileWorker(QtCore.QThread):
 
         max_itr = np.max(MFX_Data_vld_fnl_filt["itr"])
         efo_vals = MFX_Data_vld_fnl_filt["efo"][MFX_Data_vld_fnl_filt["itr"] == max_itr]
+        if "cfr" not in MFX_Data_vld_fnl_filt.dtype.names:
+            self.status.emit(f"Skipping {base}: no CFR field.")
+            return None
+        cfr_vals = MFX_Data_vld_fnl_filt["cfr"][MFX_Data_vld_fnl_filt["itr"] == max_itr]
         self._check_cancel()
         if len(efo_vals) == 0:
             self.status.emit(f"Skipping {base}: no EFO values.")
+            return None
+        if len(cfr_vals) == 0:
+            self.status.emit(f"Skipping {base}: no CFR values.")
             return None
 
         ctx = dict(
             base=base,
             arr=MFX_Data_vld_fnl_filt,
             efo_vals=efo_vals,
+            cfr_vals=cfr_vals,
             total_tim=total_tim,
             total_loc=total_loc,
             last_iteration_loc=last_iteration_loc,
@@ -3223,7 +3255,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._ctx_by_base = {}          # base -> ctx (from worker)
         self._efo_range_by_base = {}    # base -> (xmin, xmax) selected
-        self._filtered_by_base = {}     # base -> array after EFO filter (what will be saved)
+        self._cfr_range_by_base = {}    # base -> (xmin, xmax) selected
+        self._filtered_by_base = {}     # base -> array after EFO+CFR filtering (what will be saved)
 
         # widgets
         central = QtWidgets.QWidget()
@@ -3431,34 +3464,57 @@ class MainWindow(QtWidgets.QMainWindow):
         root.addLayout(bottom, 5)
 
         # histogram panel
-        hist_box = QtWidgets.QGroupBox("EFO selection")
+        hist_box = QtWidgets.QGroupBox("Filter selection")
         bottom.addWidget(hist_box, 1)
         hv = QtWidgets.QVBoxLayout(hist_box)
 
-        self.fig = Figure(figsize=(5, 4.5), dpi=100)
-        self.ax = self.fig.add_subplot(111)
-        self.canvas = FigureCanvas(self.fig)
-        apply_hist_theme(self.fig, self.ax)
-        self.canvas.draw()
-        hv.addWidget(self.canvas)
-        self.nav_toolbar = NavigationToolbar2QT(self.canvas, self)
-        self.nav_toolbar.setIconSize(QtCore.QSize(16, 16))   # try 12, 14, 16
-        self.nav_toolbar.setFixedHeight(28)                  # try 24–30
-        hv.addWidget(self.nav_toolbar)
+        self.filter_tabs = QtWidgets.QTabWidget()
+        hv.addWidget(self.filter_tabs)
+
+        self.efo_tab = QtWidgets.QWidget()
+        self.filter_tabs.addTab(self.efo_tab, "EFO")
+        efo_v = QtWidgets.QVBoxLayout(self.efo_tab)
+        self.fig_efo = Figure(figsize=(5, 4.5), dpi=100)
+        self.ax_efo = self.fig_efo.add_subplot(111)
+        self.canvas_efo = FigureCanvas(self.fig_efo)
+        apply_hist_theme(self.fig_efo, self.ax_efo)
+        self.canvas_efo.draw()
+        efo_v.addWidget(self.canvas_efo)
+        self.nav_toolbar_efo = NavigationToolbar2QT(self.canvas_efo, self)
+        self.nav_toolbar_efo.setIconSize(QtCore.QSize(16, 16))
+        self.nav_toolbar_efo.setFixedHeight(28)
+        efo_v.addWidget(self.nav_toolbar_efo)
+        self.efo_range_lbl = QtWidgets.QLabel("Selected EFO range: —")
+        efo_v.addWidget(self.efo_range_lbl)
+
+        self.cfr_tab = QtWidgets.QWidget()
+        self.filter_tabs.addTab(self.cfr_tab, "CFR")
+        cfr_v = QtWidgets.QVBoxLayout(self.cfr_tab)
+        self.fig_cfr = Figure(figsize=(5, 4.5), dpi=100)
+        self.ax_cfr = self.fig_cfr.add_subplot(111)
+        self.canvas_cfr = FigureCanvas(self.fig_cfr)
+        apply_hist_theme(self.fig_cfr, self.ax_cfr)
+        self.canvas_cfr.draw()
+        cfr_v.addWidget(self.canvas_cfr)
+        self.nav_toolbar_cfr = NavigationToolbar2QT(self.canvas_cfr, self)
+        self.nav_toolbar_cfr.setIconSize(QtCore.QSize(16, 16))
+        self.nav_toolbar_cfr.setFixedHeight(28)
+        cfr_v.addWidget(self.nav_toolbar_cfr)
+        self.cfr_range_lbl = QtWidgets.QLabel("Selected CFR range: —")
+        cfr_v.addWidget(self.cfr_range_lbl)
 
         ctrl = QtWidgets.QHBoxLayout()
         hv.addLayout(ctrl)
-        self.range_lbl = QtWidgets.QLabel("Selected range: —")
-        ctrl.addWidget(self.range_lbl, 1)
+        ctrl.addWidget(QtWidgets.QLabel("Use tabs to select EFO and CFR ranges."), 1)
 
-        self.apply_btn = QtWidgets.QPushButton("Apply EFO")
+        self.apply_btn = QtWidgets.QPushButton("Apply filter")
         self.apply_btn.setEnabled(False)
         self.apply_btn.clicked.connect(self.apply_preview)
         ctrl.addWidget(self.apply_btn)
 
-        self.reset_btn = QtWidgets.QPushButton("Reset EFO")
+        self.reset_btn = QtWidgets.QPushButton("Reset filter")
         self.reset_btn.setEnabled(False)
-        self.reset_btn.clicked.connect(self.reset_efo)
+        self.reset_btn.clicked.connect(self.reset_filter)
         ctrl.addWidget(self.reset_btn)
 
         self.back_btn = QtWidgets.QPushButton("Back")
@@ -3476,9 +3532,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.save_all_btn.clicked.connect(self.save_all)
         ctrl.addWidget(self.save_all_btn)
 
-        self._span = None
-        self._span_xmin = None
-        self._span_xmax = None
+        self._span_efo = None
+        self._span_efo_xmin = None
+        self._span_efo_xmax = None
+        self._span_cfr = None
+        self._span_cfr_xmin = None
+        self._span_cfr_xmax = None
 
         self._mbm_dir_by_base = {}          # base -> mbm folder
         self._mbm_source_base = None        # selected source base
@@ -3564,6 +3623,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._ctx_by_base.clear()
         self._efo_range_by_base.clear()
+        self._cfr_range_by_base.clear()
         self._filtered_by_base.clear()
 
         self._raw_arr_by_base.clear()
@@ -3581,14 +3641,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.next_btn.setEnabled(False)
         self.save_all_btn.setEnabled(False)
 
-        self.range_lbl.setText("Selected range: —")
+        self.efo_range_lbl.setText("Selected EFO range: —")
+        self.cfr_range_lbl.setText("Selected CFR range: —")
         self.set_output([])
 
         # clear histogram
         try:
-            self.ax.clear()
-            apply_hist_theme(self.fig, self.ax)
-            self.canvas.draw()
+            self.ax_efo.clear()
+            apply_hist_theme(self.fig_efo, self.ax_efo)
+            self.canvas_efo.draw()
+            self.ax_cfr.clear()
+            apply_hist_theme(self.fig_cfr, self.ax_cfr)
+            self.canvas_cfr.draw()
         except Exception:
             pass
 
@@ -3986,6 +4050,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # ratio loc per trace
         if arr_efo is None or len(arr_efo) == 0:
+            ut = np.array([])
             ratio_loc_per_trace = 0.0
         else:
             ut = np.unique(arr_efo["tid"])
@@ -3998,7 +4063,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Total imaging time (min)", f"{ctx['total_tim']/60:.2f}"),
             ("Last iteration localizations", str(last_it)),
             ("After trace filtering", str(ctx.get("after_trace", "—"))),
-            ("After EFO filtering", str(n_after)),
+            ("After EFO and CFR filtering", str(n_after)),
             ("Total traces", str(ut.size if arr_efo is not None else "—")),
             ("Localization precision (x, y, z)", str(lp) if lp is not None else "—"),
             ("Ratio loc per trace", f"{ratio_loc_per_trace:.4f}"),
@@ -4021,37 +4086,40 @@ class MainWindow(QtWidgets.QMainWindow):
         if base in self._ctx_by_base:
             ctx = self._ctx_by_base[base]
             self.on_need_efo(ctx)
-
-            if base in self._efo_range_by_base:
-                xmin, xmax = self._efo_range_by_base[base]
-                self._apply_efo_range_to_memory(base, xmin, xmax, update_view=True, reset_view=True)
             return
 
         # else: load it
         if self.run_btn.isEnabled() is False:
             self.start_worker_for_current()
 
-    def _apply_efo_range_to_memory(self, base, xmin, xmax, *, update_view=True, reset_view=False):
+    def _apply_filter_ranges_to_memory(self, base, efo_xmin, efo_xmax, cfr_xmin, cfr_xmax, *, update_view=True, reset_view=False):
         arr = self._raw_arr_by_base.get(base)
         if arr is None:
             return
 
-        mask = (arr["efo"] >= xmin) & (arr["efo"] <= xmax)
-        arr_efo = arr[mask]
+        mask_efo = (arr["efo"] >= efo_xmin) & (arr["efo"] <= efo_xmax)
+        mask_cfr = (arr["cfr"] >= cfr_xmin) & (arr["cfr"] <= cfr_xmax)
+        mask = mask_efo & mask_cfr
+        arr_filt = arr[mask]
 
-        self._efo_range_by_base[base] = (float(xmin), float(xmax))
-        self._filtered_by_base[base] = arr_efo
+        if len(arr_filt) == 0:
+            QtWidgets.QMessageBox.warning(self, "Filter", "No localizations left, adjust filter")
+            return
+
+        self._efo_range_by_base[base] = (float(efo_xmin), float(efo_xmax))
+        self._cfr_range_by_base[base] = (float(cfr_xmin), float(cfr_xmax))
+        self._filtered_by_base[base] = arr_filt
 
         # default plotted data is the filtered data (or aligned filtered if enabled)
         if self._mbm_enabled and base in self._aligned_arr_by_base:
             self._arr_by_base[base] = self._aligned_arr_by_base[base]
         else:
-            self._arr_by_base[base] = arr_efo
+            self._arr_by_base[base] = arr_filt
 
         if update_view:
             self.redraw_scatter(reset_view=reset_view)
             self._refresh_multicolor_contents(reset_view=False)
-            self._update_output_for_base(base, arr_efo, int(np.count_nonzero(mask)))
+            self._update_output_for_base(base, arr_filt, int(np.count_nonzero(mask)))
 
     def run_start(self):
         data_path = self.data_edit.text().strip()
@@ -4109,11 +4177,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._current_worker = w
         w.start()
 
-    # ---------------- EFO selection ----------------
+    # ---------------- EFO + CFR selection ----------------
     def on_need_efo(self, ctx):
         """
         Called by FileWorker when a file is loaded and trace-filtered and the GUI should
-        display the EFO histogram + initial scatter preview.
+        display EFO/CFR histograms + initial scatter preview.
 
         This version also:
         - caches the current dataset into _raw_arr_by_base (for MBM align enable/disable)
@@ -4134,6 +4202,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         efo_vals = np.asarray(ctx["efo_vals"])
+        cfr_vals = np.asarray(ctx["cfr_vals"])
         bin_size = float(self.bin_size.value())
 
         # Ensure caches exist
@@ -4146,45 +4215,44 @@ class MainWindow(QtWidgets.QMainWindow):
         self._raw_arr_by_base[base] = arr
         self._arr_by_base[base] = arr
 
-        # ---- histogram ----
-        self.ax.clear()
+        # ---- EFO histogram ----
+        self.ax_efo.clear()
         if len(efo_vals) > 0:
             bins = np.arange(efo_vals.min(), efo_vals.max() + bin_size, bin_size)
-            self.ax.hist(
+            self.ax_efo.hist(
                 efo_vals,
                 bins=bins,
                 edgecolor=HIST_THEME["hist_edge"],
                 color=HIST_THEME["hist_face"],
             )
 
-        self.ax.set_xlabel("EFO")
-        self.ax.set_ylabel("Count")
-        self.ax.set_title(base)
+        #self.ax_efo.set_xlabel("EFO")
+        self.ax_efo.set_ylabel("Count")
+        self.ax_efo.set_title(base)
 
-        apply_hist_theme(self.fig, self.ax)
-        self.canvas.draw()
+        apply_hist_theme(self.fig_efo, self.ax_efo)
+        self.canvas_efo.draw()
 
         if len(efo_vals) > 0:
             if base in self._efo_range_by_base:
-                self._span_xmin, self._span_xmax = self._efo_range_by_base[base]
+                self._span_efo_xmin, self._span_efo_xmax = self._efo_range_by_base[base]
             else:
-                self._span_xmin = float(efo_vals.min())
-                self._span_xmax = float(efo_vals.max())
+                self._span_efo_xmin = float(efo_vals.min())
+                self._span_efo_xmax = float(efo_vals.max())
         else:
-            self._span_xmin = None
-            self._span_xmax = None
+            self._span_efo_xmin = None
+            self._span_efo_xmax = None
 
+        def onselect_efo(xmin, xmax):
+            self._span_efo_xmin, self._span_efo_xmax = float(xmin), float(xmax)
+            self.efo_range_lbl.setText(f"Selected EFO range: {self._span_efo_xmin:.2f} ... {self._span_efo_xmax:.2f}")
 
-        def onselect(xmin, xmax):
-            self._span_xmin, self._span_xmax = float(xmin), float(xmax)
-            self.range_lbl.setText(f"Selected range: {self._span_xmin:.2f} ... {self._span_xmax:.2f}")
+        if self._span_efo is not None:
+            self._span_efo.disconnect_events()
 
-        if self._span is not None:
-            self._span.disconnect_events()
-
-        if self._span_xmin is not None and self._span_xmax is not None:
-            self._span = SpanSelector(
-                self.ax, onselect, direction="horizontal", useblit=True,
+        if self._span_efo_xmin is not None and self._span_efo_xmax is not None:
+            self._span_efo = SpanSelector(
+                self.ax_efo, onselect_efo, direction="horizontal", useblit=True,
                 props=dict(
                     facecolor=HIST_THEME["span_face"],
                     alpha=HIST_THEME["span_alpha"],
@@ -4193,33 +4261,95 @@ class MainWindow(QtWidgets.QMainWindow):
                 ),
                 interactive=True, drag_from_anywhere=True
             )
-            self._span.extents = (self._span_xmin, self._span_xmax)
-            onselect(self._span_xmin, self._span_xmax)
+            self._span_efo.extents = (self._span_efo_xmin, self._span_efo_xmax)
+            onselect_efo(self._span_efo_xmin, self._span_efo_xmax)
         else:
-            self._span = None
-            self.range_lbl.setText("Selected range: —")
+            self._span_efo = None
+            self.efo_range_lbl.setText("Selected EFO range: —")
+
+        # ---- CFR histogram ----
+        self.ax_cfr.clear()
+        if len(cfr_vals) > 0:
+            bins = np.arange(cfr_vals.min(), cfr_vals.max() + bin_size, bin_size)
+            self.ax_cfr.hist(
+                cfr_vals,
+                bins=bins,
+                edgecolor=HIST_THEME["hist_edge"],
+                color=HIST_THEME["hist_face"],
+            )
+
+        #self.ax_cfr.set_xlabel("CFR")
+        self.ax_cfr.set_ylabel("Count")
+        self.ax_cfr.set_title(base)
+
+        apply_hist_theme(self.fig_cfr, self.ax_cfr)
+        self.canvas_cfr.draw()
+
+        if len(cfr_vals) > 0:
+            if base in self._cfr_range_by_base:
+                self._span_cfr_xmin, self._span_cfr_xmax = self._cfr_range_by_base[base]
+            else:
+                self._span_cfr_xmin = float(cfr_vals.min())
+                self._span_cfr_xmax = float(cfr_vals.max())
+        else:
+            self._span_cfr_xmin = None
+            self._span_cfr_xmax = None
+
+        def onselect_cfr(xmin, xmax):
+            self._span_cfr_xmin, self._span_cfr_xmax = float(xmin), float(xmax)
+            self.cfr_range_lbl.setText(f"Selected CFR range: {self._span_cfr_xmin:.2f} ... {self._span_cfr_xmax:.2f}")
+
+        if self._span_cfr is not None:
+            self._span_cfr.disconnect_events()
+
+        if self._span_cfr_xmin is not None and self._span_cfr_xmax is not None:
+            self._span_cfr = SpanSelector(
+                self.ax_cfr, onselect_cfr, direction="horizontal", useblit=True,
+                props=dict(
+                    facecolor=HIST_THEME["span_face"],
+                    alpha=HIST_THEME["span_alpha"],
+                    edgecolor=HIST_THEME["span_edge"],
+                    linewidth=HIST_THEME["span_lw"],
+                ),
+                interactive=True, drag_from_anywhere=True
+            )
+            self._span_cfr.extents = (self._span_cfr_xmin, self._span_cfr_xmax)
+            onselect_cfr(self._span_cfr_xmin, self._span_cfr_xmax)
+        else:
+            self._span_cfr = None
+            self.cfr_range_lbl.setText("Selected CFR range: —")
 
         self.apply_btn.setEnabled(True)
-        self.reset_btn.setEnabled(self._span_xmin is not None and self._span_xmax is not None)
+        self.reset_btn.setEnabled(
+            self._span_efo_xmin is not None and self._span_efo_xmax is not None
+            and self._span_cfr_xmin is not None and self._span_cfr_xmax is not None
+        )
 
         # ---- cache ctx for later "Save all" ----
         self._ctx_by_base[base] = ctx
 
-        # ---- apply existing range if present; otherwise default to full range (once) ----
-        if len(efo_vals) > 0:
+        # ---- apply existing ranges if present; otherwise default each to full range ----
+        if len(efo_vals) > 0 and len(cfr_vals) > 0:
             if base in self._efo_range_by_base:
-                xmin, xmax = self._efo_range_by_base[base]
+                efo_xmin, efo_xmax = self._efo_range_by_base[base]
             else:
-                xmin, xmax = float(efo_vals.min()), float(efo_vals.max())
-                self._efo_range_by_base[base] = (xmin, xmax)
+                efo_xmin, efo_xmax = float(efo_vals.min()), float(efo_vals.max())
+                self._efo_range_by_base[base] = (efo_xmin, efo_xmax)
 
-            # apply (this updates _filtered_by_base + plots)
-            self._apply_efo_range_to_memory(
+            if base in self._cfr_range_by_base:
+                cfr_xmin, cfr_xmax = self._cfr_range_by_base[base]
+            else:
+                cfr_xmin, cfr_xmax = float(cfr_vals.min()), float(cfr_vals.max())
+                self._cfr_range_by_base[base] = (cfr_xmin, cfr_xmax)
+
+            self._apply_filter_ranges_to_memory(
                 base,
-                xmin,
-                xmax,
+                efo_xmin,
+                efo_xmax,
+                cfr_xmin,
+                cfr_xmax,
                 update_view=True,
-                reset_view=True
+                reset_view=True,
             )
 
         # ---- enable navigation + save ----
@@ -4233,15 +4363,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # will update _arr_by_base for all datasets + redraw plots
             self._apply_mbm_alignment()
         else:
-            # just show raw (trace-filtered)
-            self._arr_by_base[base] = arr
-
-            # initial scatter - reset view for new file
-            self.redraw_scatter(reset_view=True)
-
-            # update multicolor for this base and any open multicolor view
-            self._multicolor_update_base(base, reset_view=True)
-            self._refresh_multicolor_contents(reset_view=False)
+            self._arr_by_base[base] = self._filtered_by_base.get(base, arr)
 
         
 
@@ -4288,9 +4410,21 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._current_ctx is None:
             return
         base = self._current_ctx.get("base")
-        if not base or self._span_xmin is None or self._span_xmax is None:
+        if (
+            not base
+            or self._span_efo_xmin is None or self._span_efo_xmax is None
+            or self._span_cfr_xmin is None or self._span_cfr_xmax is None
+        ):
             return
-        self._apply_efo_range_to_memory(base, self._span_xmin, self._span_xmax, update_view=True, reset_view=False)
+        self._apply_filter_ranges_to_memory(
+            base,
+            self._span_efo_xmin,
+            self._span_efo_xmax,
+            self._span_cfr_xmin,
+            self._span_cfr_xmax,
+            update_view=True,
+            reset_view=False,
+        )
 
         # if alignment is enabled, recompute it on the *filtered* datasets
         if self._mbm_enabled:
@@ -4298,7 +4432,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._binning_win is not None and self._binning_win.isVisible():
             self._binning_win.refresh_plot()
 
-    def reset_efo(self):
+    def reset_filter(self):
         if self._current_ctx is None:
             return
 
@@ -4311,21 +4445,37 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         efo_vals = np.asarray(arr["efo"])
-        if efo_vals.size == 0:
+        cfr_vals = np.asarray(arr["cfr"])
+        if efo_vals.size == 0 or cfr_vals.size == 0:
             return
 
-        xmin = float(np.min(efo_vals))
-        xmax = float(np.max(efo_vals))
-        self._span_xmin, self._span_xmax = xmin, xmax
+        efo_xmin = float(np.min(efo_vals))
+        efo_xmax = float(np.max(efo_vals))
+        cfr_xmin = float(np.min(cfr_vals))
+        cfr_xmax = float(np.max(cfr_vals))
+        self._span_efo_xmin, self._span_efo_xmax = efo_xmin, efo_xmax
+        self._span_cfr_xmin, self._span_cfr_xmax = cfr_xmin, cfr_xmax
 
-        if self._span is not None:
-            self._span.extents = (xmin, xmax)
+        if self._span_efo is not None:
+            self._span_efo.extents = (efo_xmin, efo_xmax)
+        if self._span_cfr is not None:
+            self._span_cfr.extents = (cfr_xmin, cfr_xmax)
 
-        self.range_lbl.setText(f"Selected range: {xmin:.2f} ... {xmax:.2f}")
-        self.canvas.draw_idle()
+        self.efo_range_lbl.setText(f"Selected EFO range: {efo_xmin:.2f} ... {efo_xmax:.2f}")
+        self.cfr_range_lbl.setText(f"Selected CFR range: {cfr_xmin:.2f} ... {cfr_xmax:.2f}")
+        self.canvas_efo.draw_idle()
+        self.canvas_cfr.draw_idle()
 
-        # Reuse the same update path as Apply EFO so all plots and outputs refresh.
-        self._apply_efo_range_to_memory(base, xmin, xmax, update_view=True, reset_view=False)
+        # Reuse the same update path as Apply filter so all plots and outputs refresh.
+        self._apply_filter_ranges_to_memory(
+            base,
+            efo_xmin,
+            efo_xmax,
+            cfr_xmin,
+            cfr_xmax,
+            update_view=True,
+            reset_view=False,
+        )
 
         if self._mbm_enabled:
             self._apply_mbm_alignment()
