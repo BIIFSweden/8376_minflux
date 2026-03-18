@@ -102,7 +102,7 @@ def bead_initial_positions(points, k=4, min_count=10):
         out[int(gri)] = np.array([x[0], y[0], z[0]], dtype=float)
     return out
 
-def match_and_filter_beads(beads_ref, beads_mov):
+def match_and_filter_beads(beads_ref, beads_mov, return_diagnostics: bool = False):
     common = sorted(set(beads_ref.keys()) & set(beads_mov.keys()))
     if len(common) < 3:
         raise ValueError(f"Need >=3 common beads, got {len(common)}")
@@ -122,6 +122,15 @@ def match_and_filter_beads(beads_ref, beads_mov):
 
     ref_kept = np.vstack([beads_ref[g] for g in common_kept])
     mov_kept = np.vstack([beads_mov[g] for g in common_kept])
+    if return_diagnostics:
+        diagnostics = {
+            "common_ids": [int(g) for g in common],
+            "keep_mask": np.asarray(keep, dtype=bool),
+            "ref_common": np.asarray(ref, dtype=float),
+            "mov_common": np.asarray(mov, dtype=float),
+            "common_kept": [int(g) for g in common_kept],
+        }
+        return ref_kept, mov_kept, common_kept, diagnostics
     return ref_kept, mov_kept, common_kept
 
 def make_labeled_separator(text: str):
@@ -146,20 +155,32 @@ def make_labeled_separator(text: str):
     h.addWidget(line2, 1)
     return w
 
-def compute_mbm_transform(mbm_ref_dir, mbm_mov_dir, k=4, scale=1.0):
+def compute_mbm_transform(mbm_ref_dir, mbm_mov_dir, k=4, scale=1.0, return_diagnostics: bool = False):
     pts_ref = load_mbm_points(mbm_ref_dir)
     pts_mov = load_mbm_points(mbm_mov_dir)
 
     beads_ref = bead_initial_positions(pts_ref, k=k)
     beads_mov = bead_initial_positions(pts_mov, k=k)
 
-    ref_pts, mov_pts, common = match_and_filter_beads(beads_ref, beads_mov)
+    diagnostics = None
+    if return_diagnostics:
+        ref_pts, mov_pts, common, diagnostics = match_and_filter_beads(
+            beads_ref, beads_mov, return_diagnostics=True
+        )
+    else:
+        ref_pts, mov_pts, common = match_and_filter_beads(beads_ref, beads_mov)
 
     # IMPORTANT: match units to MINFLUX loc units
     ref_pts = ref_pts * scale
     mov_pts = mov_pts * scale
 
+    if diagnostics is not None:
+        diagnostics["ref_common_scaled"] = np.asarray(diagnostics["ref_common"], dtype=float) * float(scale)
+        diagnostics["mov_common_scaled"] = np.asarray(diagnostics["mov_common"], dtype=float) * float(scale)
+
     _, T_total = icp(mov_pts, ref_pts, max_iterations=50, tolerance=0.5e-9 * scale)
+    if return_diagnostics:
+        return T_total, common, diagnostics
     return T_total, common
 
 def apply_transform_to_arr(arr, T):
@@ -554,8 +575,7 @@ def make_plotly_heatmap_from_arr(
     title: str = None,
     *,
     scale_mode: str = "linear",   # "linear" (default) or "log"
-    pmax: float = 100.00,
-    arcsinh_a: float = 1.0,
+    max_value: float = 10.0,
     show_colorbar: bool = True,
 ):
     """
@@ -623,7 +643,8 @@ def make_plotly_heatmap_from_arr(
     else:
         Z = H.astype(float, copy=False)
 
-    Z = _normalize_image(Z, pmin=0.0, pmax=pmax, arcsinh_a=arcsinh_a)
+    max_value = max(float(max_value), 1e-9)
+    Z = _clip_to_scale_max(Z, max_value=max_value)
 
     fig = go.Figure(
         data=go.Heatmap(
@@ -631,10 +652,10 @@ def make_plotly_heatmap_from_arr(
             x=x_centers.tolist(),
             y=y_centers.tolist(),
             colorscale=lut,
-            colorbar=dict(title="norm"),
+            colorbar=dict(title="value"),
             showscale=bool(show_colorbar),
             zmin=0.0,
-            zmax=1.0,
+            zmax=max_value,
         )
     )
 
@@ -662,31 +683,21 @@ def _xy_from_arr(arr):
     m = np.isfinite(x) & np.isfinite(y)
     return x[m], y[m]
 
-def _normalize_hist_for_overlay(H, scale_mode: str, pmax: float = 100.00, arcsinh_a: float = 1.0):
+def _clip_hist_for_overlay(H, scale_mode: str, max_value: float = 10.0):
     scale_mode = (scale_mode or "linear").strip().lower()
     if scale_mode == "log10(count+1)":
         Z = np.log10(H + 1.0)
     else:
         Z = H.astype(float, copy=False)
-    return _normalize_image(Z, pmin=0.0, pmax=pmax, arcsinh_a=arcsinh_a)
+    return _clip_to_scale_max(Z, max_value=max_value)
 
-def _normalize_image(img: np.ndarray, pmin: float = 0.0, pmax: float = 100.00, arcsinh_a: float = 1.0):
+def _clip_to_scale_max(img: np.ndarray, max_value: float = 10.0):
     if img is None or np.size(img) == 0:
         return np.zeros((1, 1), dtype=float)
-    pmax = float(max(pmin + 1e-6, min(100.0, pmax)))
-    hi = float(np.percentile(img, pmax))
-    if not np.isfinite(hi) or hi <= 0:
+    max_value = float(max(max_value, 1e-9))
+    if not np.isfinite(max_value) or max_value <= 0:
         return np.zeros_like(img, dtype=float)
-    out = np.clip(img / (hi + 1e-12), 0.0, None)
-
-    a = float(max(0.0, arcsinh_a))
-    if a > 0:
-        den = np.arcsinh(a)
-        if np.isfinite(den) and den > 0:
-            out = np.arcsinh(a * out) / den
-    else:
-        out = np.clip(out, 0.0, 1.0)
-    return np.clip(out, 0.0, 1.0)
+    return np.clip(np.asarray(img, dtype=float), 0.0, max_value)
 
 def _resolve_overlay_colorscale(lut: str):
     if lut not in LUT_CHOICES:
@@ -768,10 +779,11 @@ def _make_rgba_intensity_colorscale(lut: str, steps: int = 256):
         out.append([t, f"rgba({rr},{gg},{bb},1.0)"])
     return out
 
-def _lut_peak_rgb(lut: str):
+def _lut_rgb_image(lut: str, z01: np.ndarray):
     cmap = _resolve_mpl_cmap(lut)
-    r, g, b, _ = cmap(1.0)
-    return np.array([float(r), float(g), float(b)], dtype=float)
+    z = np.clip(np.asarray(z01, dtype=float), 0.0, 1.0)
+    rgba = cmap(z)
+    return np.asarray(rgba[..., :3], dtype=float)
 
 def _compute_bounds_xy(x: np.ndarray, y: np.ndarray, sigma_nm: float, n_sigma: float = 3.0):
     if len(x) == 0:
@@ -828,8 +840,7 @@ def make_plotly_gaussian_from_arr(
     lut: str,
     title: str = None,
     *,
-    pmax: float = 100.00,
-    arcsinh_a: float = 1.0,
+    max_value: float = 10.0,
     show_colorbar: bool = True,
 ):
     x, y = _xy_from_arr(arr)
@@ -848,7 +859,8 @@ def make_plotly_gaussian_from_arr(
         n_sigma=3.0,
         bounds=None,
     )
-    z = _normalize_image(img, pmin=0.0, pmax=pmax, arcsinh_a=arcsinh_a)
+    max_value = max(float(max_value), 1e-9)
+    z = _clip_to_scale_max(img, max_value=max_value)
 
     xmin, xmax, ymin, ymax = extent
     ny, nx = z.shape
@@ -864,8 +876,8 @@ def make_plotly_gaussian_from_arr(
             y=y_centers.tolist(),
             colorscale=cs,
             zmin=0.0,
-            zmax=1.0,
-            colorbar=dict(title="gaussian"),
+            zmax=max_value,
+            colorbar=dict(title="value"),
             showscale=bool(show_colorbar),
         )
     )
@@ -892,8 +904,8 @@ def make_plotly_overlay_heatmap_from_two_arrs(
     title: str = None,
     scale_mode: str = "linear",
     render_mode: str = "heatmap",
-    pmax: float = 100.00,
-    arcsinh_a: float = 1.0,
+    max_value_a: float = 10.0,
+    max_value_b: float = 10.0,
 ):
     x_a, y_a = _xy_from_arr(arr_a)
     x_b, y_b = _xy_from_arr(arr_b)
@@ -906,6 +918,8 @@ def make_plotly_overlay_heatmap_from_two_arrs(
 
     render_mode = (render_mode or "heatmap").strip().lower()
     pixel_size_nm = max(float(pixel_size_nm), 0.1)
+    max_value_a = max(float(max_value_a), 1e-9)
+    max_value_b = max(float(max_value_b), 1e-9)
 
     x_all = np.concatenate([x_a, x_b]) if (len(x_a) and len(x_b)) else (x_a if len(x_a) else x_b)
     y_all = np.concatenate([y_a, y_b]) if (len(y_a) and len(y_b)) else (y_a if len(y_a) else y_b)
@@ -950,10 +964,10 @@ def make_plotly_overlay_heatmap_from_two_arrs(
             n_sigma=3.0,
             bounds=bounds,
         )
-        norm_a = _normalize_image(img_a, pmin=0.0, pmax=pmax, arcsinh_a=arcsinh_a)
-        norm_b = _normalize_image(img_b, pmin=0.0, pmax=pmax, arcsinh_a=arcsinh_a)
-        z_a = np.asarray(norm_a, dtype=float)
-        z_b = np.asarray(norm_b, dtype=float)
+        clip_a = _clip_to_scale_max(img_a, max_value=max_value_a)
+        clip_b = _clip_to_scale_max(img_b, max_value=max_value_b)
+        z_a = np.asarray(clip_a / (max_value_a + 1e-12), dtype=float)
+        z_b = np.asarray(clip_b / (max_value_b + 1e-12), dtype=float)
     else:
         H_a = np.zeros((ny, nx), dtype=float)
         H_b = np.zeros((ny, nx), dtype=float)
@@ -963,19 +977,17 @@ def make_plotly_overlay_heatmap_from_two_arrs(
         if len(x_b):
             H_b, _, _ = np.histogram2d(y_b, x_b, bins=(y_edges, x_edges))
 
-        norm_a = _normalize_hist_for_overlay(H_a, scale_mode, pmax=pmax, arcsinh_a=arcsinh_a)
-        norm_b = _normalize_hist_for_overlay(H_b, scale_mode, pmax=pmax, arcsinh_a=arcsinh_a)
+        clip_a = _clip_hist_for_overlay(H_a, scale_mode, max_value=max_value_a)
+        clip_b = _clip_hist_for_overlay(H_b, scale_mode, max_value=max_value_b)
 
-        z_a = np.asarray(norm_a, dtype=float)
-        z_b = np.asarray(norm_b, dtype=float)
+        z_a = np.asarray(clip_a / (max_value_a + 1e-12), dtype=float)
+        z_b = np.asarray(clip_b / (max_value_b + 1e-12), dtype=float)
 
-    col_a = _lut_peak_rgb(lut_a)
-    col_b = _lut_peak_rgb(lut_b)
-    rgb = np.clip(
-        z_a[..., None] * col_a[None, None, :] + z_b[..., None] * col_b[None, None, :],
-        0.0,
-        1.0,
-    )
+    rgb_a = _lut_rgb_image(lut_a, z_a)
+    rgb_b = _lut_rgb_image(lut_b, z_b)
+    # Screen blend keeps per-channel LUT character and avoids neutral grey mixing.
+    rgb = 1.0 - (1.0 - rgb_a) * (1.0 - rgb_b)
+    rgb = np.clip(rgb, 0.0, 1.0)
     rgb_u8 = np.asarray(np.round(rgb * 255.0), dtype=np.uint8)
 
     fig = go.Figure()
@@ -2019,6 +2031,13 @@ class BinningWindow(QtWidgets.QMainWindow):
         self._mw = main_window
         self._widgets_by_base = {}
         self._selected_bases = []
+        self._base_order = []
+        self._max_value_applied_by_base = {}
+        self._max_value_pending_by_base = {}
+        self._max_value_spin_by_base = {}
+        self._confocal_reset_pending = False
+        self._confocal_max_applied = 750.0
+        self._confocal_max_pending = 750.0
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -2057,6 +2076,7 @@ class BinningWindow(QtWidgets.QMainWindow):
         ctrl.setHorizontalSpacing(8)
         ctrl.setVerticalSpacing(6)
         left.addLayout(ctrl)
+        self.ctrl = ctrl
 
         ctrl.addWidget(QtWidgets.QLabel("Mode:"), 0, 0)
         self.mode_combo = QtWidgets.QComboBox()
@@ -2078,49 +2098,93 @@ class BinningWindow(QtWidgets.QMainWindow):
         self.scale_combo.setCurrentText("linear")
         ctrl.addWidget(self.scale_combo, 1, 1)
 
-        ctrl.addWidget(QtWidgets.QLabel("pmax:"), 2, 0)
-        self.pmax_spin = QtWidgets.QDoubleSpinBox()
-        self.pmax_spin.setDecimals(3)
-        self.pmax_spin.setRange(90.0, 100.0)
-        self.pmax_spin.setSingleStep(0.01)
-        self.pmax_spin.setValue(100.00)
-        ctrl.addWidget(self.pmax_spin, 2, 1)
+        # small spacer to lower the confocal section a bit
+        ctrl.setRowMinimumHeight(2, 8)
 
-        ctrl.addWidget(QtWidgets.QLabel("arcsinh a:"), 2, 2)
-        self.arcsinh_a_spin = QtWidgets.QDoubleSpinBox()
-        self.arcsinh_a_spin.setDecimals(2)
-        self.arcsinh_a_spin.setRange(0.0, 50.0)
-        self.arcsinh_a_spin.setSingleStep(0.25)
-        self.arcsinh_a_spin.setValue(1.0)
-        ctrl.addWidget(self.arcsinh_a_spin, 2, 3)
+        self.confocal_sep = make_labeled_separator("Confocal")
+        ctrl.addWidget(self.confocal_sep, 3, 0, 1, 6)
+
+        self.confocal_btn = QtWidgets.QPushButton("Path")
+        self.confocal_btn.clicked.connect(self._browse_confocal_path)
+        ctrl.addWidget(self.confocal_btn, 4, 0)
+
+        self.confocal_path_edit = QtWidgets.QLineEdit()
+        self.confocal_path_edit.setPlaceholderText("Select .tif or .tiff file")
+        ctrl.addWidget(self.confocal_path_edit, 4, 1, 1, 2)
+
+        self.confocal_show_chk = QtWidgets.QCheckBox("show")
+        self.confocal_show_chk.toggled.connect(self._on_confocal_show_toggled)
+        ctrl.addWidget(self.confocal_show_chk, 4, 3)
+
+        ctrl.addWidget(QtWidgets.QLabel("Scale:"), 4, 4)
+        self.confocal_scale_spin = QtWidgets.QDoubleSpinBox()
+        self.confocal_scale_spin.setDecimals(1)
+        self.confocal_scale_spin.setRange(0.1, 10.0)
+        self.confocal_scale_spin.setSingleStep(0.1)
+        self.confocal_scale_spin.setValue(1.0)
+        self.confocal_scale_spin.valueChanged.connect(lambda _: self.refresh_plot(keep_view=True))
+        ctrl.addWidget(self.confocal_scale_spin, 4, 5)
+
+        ctrl.addWidget(QtWidgets.QLabel("LUT:"), 5, 0)
+        self.confocal_lut_combo = QtWidgets.QComboBox()
+        self.confocal_lut_combo.addItems(LUT_CHOICES)
+        self.confocal_lut_combo.setCurrentText(DEFAULT_LUT_BIN if DEFAULT_LUT_BIN in LUT_CHOICES else LUT_CHOICES[0])
+        self.confocal_lut_combo.currentTextChanged.connect(lambda _: self.refresh_plot(keep_view=True))
+        ctrl.addWidget(self.confocal_lut_combo, 5, 1)
+
+        ctrl.addWidget(QtWidgets.QLabel("Max value:"), 5, 2)
+        self.confocal_max_spin = QtWidgets.QDoubleSpinBox()
+        self.confocal_max_spin.setDecimals(0)
+        self.confocal_max_spin.setRange(0, 750)
+        self.confocal_max_spin.setSingleStep(1.0)
+        self.confocal_max_spin.setValue(750)
+        self.confocal_max_spin.valueChanged.connect(self._on_confocal_max_value_changed)
+        ctrl.addWidget(self.confocal_max_spin, 5, 3)
+
+        self.intensity_sep = make_labeled_separator("Intensity adjustment")
+        ctrl.addWidget(self.intensity_sep, 6, 0, 1, 6)
+
+        self._max_value_label_widgets = []
+        self._max_value_spin_widgets = []
+        self._max_value_placeholder = None
 
         self.apply_settings_btn = QtWidgets.QPushButton("Apply")
-        self.apply_settings_btn.clicked.connect(lambda: self.refresh_plot(keep_view=True))
-        ctrl.addWidget(self.apply_settings_btn, 3, 0, 1, 1)
-
-        self.reset_tone_btn = QtWidgets.QPushButton("Reset Tone")
-        self.reset_tone_btn.clicked.connect(self._reset_tone_controls)
-        ctrl.addWidget(self.reset_tone_btn, 3, 1, 1, 1)
+        self.apply_settings_btn.clicked.connect(self._on_apply_settings)
 
         self.save_tif_btn = QtWidgets.QPushButton("Save as tif")
         self.save_tif_btn.clicked.connect(self._save_selected_as_tif)
-        ctrl.addWidget(self.save_tif_btn, 3, 2, 1, 2)
 
-        ctrl.setRowMinimumHeight(4, 14)
+        self.actions_widget = QtWidgets.QWidget()
+        self.actions_layout = QtWidgets.QHBoxLayout(self.actions_widget)
+        self.actions_layout.setContentsMargins(0, 0, 0, 0)
+        self.actions_layout.setSpacing(8)
+        self.actions_layout.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.actions_layout.addWidget(self.apply_settings_btn)
+        self.actions_layout.addWidget(self.save_tif_btn)
+        self._sync_action_button_sizes()
 
-        self.tone_hint_lbl = QtWidgets.QLabel("pmax sets clipping of bright pixels; arcsinh a controls highlight compression.")
+        self.tone_hint_lbl = QtWidgets.QLabel("Values above each channel's Max value are clipped.")
         self.tone_hint_lbl.setStyleSheet("color: #B0B3B8;")
-        ctrl.addWidget(self.tone_hint_lbl, 5, 0, 1, 4)
 
-        ctrl.setColumnStretch(4, 1)
+        ctrl.setColumnStretch(6, 1)
 
         self.view = PlotlyView()
         top.addWidget(self.view, 3)
 
         left.addStretch(1)
 
+        self._rebuild_max_value_controls()
+
+    def _sync_action_button_sizes(self):
+        w = max(self.apply_settings_btn.sizeHint().width(), self.save_tif_btn.sizeHint().width())
+        self.apply_settings_btn.setFixedWidth(w)
+        self.save_tif_btn.setFixedWidth(w)
+
     def rebuild(self, base_names):
         prev_selected = [b for b in self._selected_bases if b in set(base_names)]
+        self._base_order = list(base_names)
+        self._max_value_applied_by_base = {b: v for b, v in self._max_value_applied_by_base.items() if b in set(base_names)}
+        self._max_value_pending_by_base = {b: v for b, v in self._max_value_pending_by_base.items() if b in set(base_names)}
 
         self.table.setRowCount(0)
         self._widgets_by_base.clear()
@@ -2171,6 +2235,8 @@ class BinningWindow(QtWidgets.QMainWindow):
                 chk.blockSignals(False)
                 self._selected_bases = [first]
 
+        self._rebuild_max_value_controls()
+
         self.refresh_plot(keep_view=False)
 
     def _on_settings_changed(self, base: str):
@@ -2189,11 +2255,14 @@ class BinningWindow(QtWidgets.QMainWindow):
                     QtWidgets.QToolTip.showText(QtGui.QCursor.pos(), "Select at most 2 files for overlay")
                     return
                 self._selected_bases.append(base)
+            self._rebuild_max_value_controls()
             self.refresh_plot(keep_view=True)
             return
 
         if base in self._selected_bases:
             self._selected_bases.remove(base)
+
+        self._rebuild_max_value_controls()
 
         if not self._selected_bases:
             fig = go.Figure()
@@ -2203,6 +2272,417 @@ class BinningWindow(QtWidgets.QMainWindow):
             return
 
         self.refresh_plot(keep_view=True)
+
+    def _get_max_value_for_base(self, base: str) -> float:
+        value = float(self._max_value_applied_by_base.get(base, 10.0))
+        if not np.isfinite(value) or value <= 0:
+            value = 10.0
+        self._max_value_applied_by_base[base] = value
+        return value
+
+    def _get_pending_max_value_for_base(self, base: str) -> float:
+        if base in self._max_value_pending_by_base:
+            value = float(self._max_value_pending_by_base.get(base, 10.0))
+        else:
+            value = self._get_max_value_for_base(base)
+        if not np.isfinite(value) or value <= 0:
+            value = 10.0
+        self._max_value_pending_by_base[base] = value
+        return value
+
+    def _on_apply_settings(self):
+        for base in self._base_order:
+            self._max_value_applied_by_base[base] = self._get_pending_max_value_for_base(base)
+        self._confocal_max_applied = float(self._confocal_max_pending)
+        self.refresh_plot(keep_view=True)
+
+    def _on_confocal_max_value_changed(self, value: float):
+        if not np.isfinite(value) or value < 0:
+            return
+        self._confocal_max_pending = float(value)
+
+    def _is_tiff_path(self, path: str) -> bool:
+        ext = os.path.splitext(str(path).strip())[1].lower()
+        return ext in (".tif", ".tiff")
+
+    def _browse_confocal_path(self):
+        start = self.confocal_path_edit.text().strip()
+        if not start:
+            start = self._mw.data_edit.text().strip() if hasattr(self._mw, "data_edit") else ""
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select confocal image",
+            start,
+            "TIFF (*.tif *.tiff);;All files (*.*)",
+        )
+        if not path:
+            return
+        if not self._is_tiff_path(path):
+            QtWidgets.QMessageBox.critical(self, "Confocal image", "Selected file is not .tif/.tiff")
+            return
+
+        # New confocal file -> reset scale to default.
+        if hasattr(self, "confocal_scale_spin"):
+            self.confocal_scale_spin.blockSignals(True)
+            self.confocal_scale_spin.setValue(1)
+            self.confocal_scale_spin.blockSignals(False)
+
+        self.confocal_path_edit.setText(path)
+        if self.confocal_show_chk.isChecked():
+            self._confocal_reset_pending = True
+            self.refresh_plot(keep_view=True)
+
+    def _on_confocal_show_toggled(self, checked: bool):
+        if checked:
+            path = self.confocal_path_edit.text().strip()
+            if not path:
+                QtWidgets.QMessageBox.warning(self, "Confocal image", "Select a .tif/.tiff file first.")
+                self.confocal_show_chk.blockSignals(True)
+                self.confocal_show_chk.setChecked(False)
+                self.confocal_show_chk.blockSignals(False)
+                return
+            if not self._is_tiff_path(path):
+                QtWidgets.QMessageBox.critical(self, "Confocal image", "Selected file is not .tif/.tiff")
+                self.confocal_show_chk.blockSignals(True)
+                self.confocal_show_chk.setChecked(False)
+                self.confocal_show_chk.blockSignals(False)
+                return
+            self._confocal_reset_pending = True
+        self.refresh_plot(keep_view=True)
+
+    def _load_confocal_image(self, path: str):
+        try:
+            import tifffile
+            img = np.asarray(tifffile.imread(path))
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Confocal image", f"Failed to load file:\n{exc}")
+            return None
+
+        if img.ndim < 2:
+            QtWidgets.QMessageBox.critical(self, "Confocal image", "Confocal image must be at least 2D.")
+            return None
+
+        # Reduce to 2D robustly:
+        # choose the two largest axes as spatial (y, x), then max-project all others.
+        if img.ndim >= 3:
+            shape = tuple(int(s) for s in img.shape)
+            largest = np.argsort(shape)[-2:]
+            spatial_axes = tuple(sorted(int(a) for a in largest))
+
+            # Keep spatial axes in (y, x) order, then project over remaining axes.
+            move_from = tuple(a for a in range(img.ndim) if a not in spatial_axes) + spatial_axes
+            img = np.transpose(img, axes=move_from)
+
+            if img.shape[-1] in (3, 4) and img.ndim == 3:
+                # RGB/RGBA after reordering.
+                img = np.mean(img[..., :3], axis=-1)
+            else:
+                lead_axes = tuple(range(img.ndim - 2))
+                if lead_axes:
+                    img = np.max(img, axis=lead_axes)
+
+        # Keep native 8-bit values unchanged.
+        if img.dtype == np.uint8:
+            return img
+
+        # For non-8-bit images, remap intensities to 8-bit.
+        imgf = np.asarray(img, dtype=float)
+        finite = np.isfinite(imgf)
+        if not np.any(finite):
+            QtWidgets.QMessageBox.critical(self, "Confocal image", "Confocal image has no finite values.")
+            return None
+        imgf = np.where(finite, imgf, 0.0)
+
+        vals = imgf[finite]
+        lo = float(np.min(vals))
+        hi = float(np.max(vals))
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            return np.zeros_like(imgf, dtype=np.uint8)
+
+        img8 = np.clip((imgf - lo) / (hi - lo), 0.0, 1.0)
+        return np.asarray(np.round(255.0 * img8), dtype=np.uint8)
+
+    def _compose_with_confocal(self, left_fig: go.Figure) -> go.Figure:
+        if not self.confocal_show_chk.isChecked():
+            return left_fig
+        if left_fig is None or len(getattr(left_fig, "data", [])) == 0:
+            return left_fig
+
+        conf_path = self.confocal_path_edit.text().strip()
+        if not conf_path or not self._is_tiff_path(conf_path):
+            return left_fig
+
+        conf = self._load_confocal_image(conf_path)
+        if conf is None:
+            return left_fig
+
+        try:
+            xmin = xmax = ymin = ymax = None
+
+            xr = None
+            yr = None
+            try:
+                xr = list(getattr(getattr(left_fig.layout, "xaxis", None), "range", []) or [])
+                yr = list(getattr(getattr(left_fig.layout, "yaxis", None), "range", []) or [])
+            except Exception:
+                xr = None
+                yr = None
+
+            if xr and len(xr) == 2 and yr and len(yr) == 2:
+                xmin = float(min(xr[0], xr[1]))
+                xmax = float(max(xr[0], xr[1]))
+                ymin = float(min(yr[0], yr[1]))
+                ymax = float(max(yr[0], yr[1]))
+            else:
+                xs = []
+                ys = []
+                for tr in left_fig.data:
+                    tx = getattr(tr, "x", None)
+                    ty = getattr(tr, "y", None)
+                    if tx is not None:
+                        try:
+                            ax = np.asarray(tx, dtype=float).ravel()
+                            ax = ax[np.isfinite(ax)]
+                            if ax.size:
+                                xs.append(ax)
+                        except Exception:
+                            pass
+                    if ty is not None:
+                        try:
+                            ay = np.asarray(ty, dtype=float).ravel()
+                            ay = ay[np.isfinite(ay)]
+                            if ay.size:
+                                ys.append(ay)
+                        except Exception:
+                            pass
+
+                if not xs or not ys:
+                    return left_fig
+
+                x_all = np.concatenate(xs)
+                y_all = np.concatenate(ys)
+                xmin = float(np.min(x_all))
+                xmax = float(np.max(x_all))
+                ymin = float(np.min(y_all))
+                ymax = float(np.max(y_all))
+
+            width0 = max(float(xmax - xmin), 1e-9)
+            height0 = max(float(ymax - ymin), 1e-9)
+
+            scale_factor = float(self.confocal_scale_spin.value()) if hasattr(self, "confocal_scale_spin") else 1.0
+            scale_factor = max(0.1, scale_factor)
+            if abs(scale_factor - 1.0) > 1e-9:
+                src_ny, src_nx = conf.shape
+                dst_ny = max(1, int(np.round(src_ny * scale_factor)))
+                dst_nx = max(1, int(np.round(src_nx * scale_factor)))
+                # Nearest-neighbor resize keeps intensity values unchanged.
+                y_idx = np.minimum((np.arange(dst_ny) / scale_factor).astype(np.int64), src_ny - 1)
+                x_idx = np.minimum((np.arange(dst_nx) / scale_factor).astype(np.int64), src_nx - 1)
+                conf = conf[np.ix_(y_idx, x_idx)]
+
+            ny, nx = conf.shape
+
+            # Infer binned raster shape; if confocal is larger, virtually pad binned extents.
+            bin_ny, bin_nx = ny, nx
+            for tr in left_fig.data:
+                if getattr(tr, "type", "") != "heatmap":
+                    continue
+                zt = np.asarray(getattr(tr, "z", None))
+                if zt.ndim == 2 and zt.size > 0:
+                    bin_ny, bin_nx = int(zt.shape[0]), int(zt.shape[1])
+                    break
+
+            target_ny = max(int(bin_ny), int(ny))
+            target_nx = max(int(bin_nx), int(nx))
+
+            # Pad confocal to the center if binned is larger.
+            pad_y = max(0, target_ny - int(ny))
+            pad_x = max(0, target_nx - int(nx))
+            if pad_y or pad_x:
+                pad_top = pad_y // 2
+                pad_bottom = pad_y - pad_top
+                pad_left = pad_x // 2
+                pad_right = pad_x - pad_left
+                conf = np.pad(
+                    conf,
+                    ((pad_top, pad_bottom), (pad_left, pad_right)),
+                    mode="constant",
+                    constant_values=0,
+                )
+                ny, nx = conf.shape
+
+            px_x = width0 / max(float(bin_nx), 1.0)
+            px_y = height0 / max(float(bin_ny), 1.0)
+            width = max(px_x * float(target_nx), 1e-9)
+            height = max(px_y * float(target_ny), 1e-9)
+            xmax_eff = float(xmin + width)
+            ymax_eff = float(ymin + height)
+            gap = 0.03 * width
+
+            max_side = 1024
+            if ny > max_side or nx > max_side:
+                sy = max(1, int(np.ceil(ny / max_side)))
+                sx = max(1, int(np.ceil(nx / max_side)))
+                # Preserve sparse bright structures by max-pooling instead of strided decimation.
+                pad_y = (-ny) % sy
+                pad_x = (-nx) % sx
+                if pad_y or pad_x:
+                    conf = np.pad(conf, ((0, pad_y), (0, pad_x)), mode="edge")
+                yy, xx = conf.shape
+                conf = conf.reshape(yy // sy, sy, xx // sx, sx).max(axis=(1, 3))
+                ny, nx = conf.shape
+
+            conf_xmax = float(xmax_eff + gap + width)
+            divider_x = float(xmax_eff + 0.5 * gap)
+
+            fig = go.Figure(left_fig)
+            for tr in fig.data:
+                if getattr(tr, "type", "") == "heatmap":
+                    tr.opacity = 1.0
+
+            x0_conf = float(xmax_eff + gap)
+            y0_conf = float(ymin)
+            dx_conf = float(width / max(nx, 1))
+            dy_conf = float(height / max(ny, 1))
+
+            conf_u8 = np.asarray(conf, dtype=np.uint8)
+            img_max = float(np.max(conf_u8)) if conf_u8.size > 0 else 0.0
+            conf_max = img_max
+            if hasattr(self, "confocal_max_spin"):
+                spin = self.confocal_max_spin
+                reset_for_new_image = bool(getattr(self, "_confocal_reset_pending", False))
+                upper = max(750.0, img_max * 16.0, 10000.0)
+                spin.blockSignals(True)
+                spin.setRange(0.0, upper)
+                if reset_for_new_image:
+                    spin.setValue(img_max)
+                    self._confocal_max_pending = float(img_max)
+                    self._confocal_max_applied = float(img_max)
+                spin.blockSignals(False)
+                conf_max = float(self._confocal_max_applied)
+
+            conf_max = max(float(conf_max), 1e-9)
+            conf_norm = np.clip(conf_u8.astype(np.float32) / conf_max, 0.0, 1.0)
+            conf_lut = self.confocal_lut_combo.currentText().strip() if hasattr(self, "confocal_lut_combo") else DEFAULT_LUT_BIN
+            conf_rgb01 = _lut_rgb_image(conf_lut, conf_norm)
+            conf_rgb_u8 = (255.0 * np.clip(conf_rgb01, 0.0, 1.0)).astype(np.uint8)
+
+            try:
+                from PIL import Image
+                pil_img = Image.fromarray(conf_rgb_u8, mode="RGB")
+                fig.add_layout_image(
+                    dict(
+                        source=pil_img,
+                        xref="x",
+                        yref="y",
+                        x=x0_conf,
+                        y=float(ymax_eff),
+                        sizex=float(width),
+                        sizey=float(height),
+                        sizing="stretch",
+                        opacity=1.0,
+                        layer="above",
+                    )
+                )
+            except Exception:
+                fig.add_trace(
+                    go.Heatmap(
+                        z=conf_u8,
+                        x0=x0_conf,
+                        dx=dx_conf,
+                        y0=y0_conf,
+                        dy=dy_conf,
+                        colorscale=_resolve_overlay_colorscale(conf_lut),
+                        zmin=0.0,
+                        zmax=255.0,
+                        showscale=False,
+                        hoverinfo="skip",
+                        opacity=1.0,
+                    )
+                )
+
+            fig.update_layout(dragmode="pan")
+            fig.update_xaxes(range=[xmin, conf_xmax], autorange=False)
+            fig.update_yaxes(range=[ymin, ymax_eff], autorange=False)
+            fig.add_shape(
+                type="line",
+                x0=divider_x,
+                x1=divider_x,
+                y0=ymin,
+                y1=ymax_eff,
+                xref="x",
+                yref="y",
+                line=dict(color="#9AA0A6", width=2),
+            )
+            fig.update_xaxes(showline=False, ticks="", showticklabels=False)
+            fig.update_yaxes(showline=False, ticks="", showticklabels=False)
+            return fig
+        except Exception:
+            return left_fig
+
+    def _on_max_value_changed(self, base: str, value: float):
+        if not np.isfinite(value) or value <= 0:
+            return
+        self._max_value_pending_by_base[base] = float(value)
+
+    def _rebuild_max_value_controls(self):
+        for widget in self._max_value_label_widgets:
+            self.ctrl.removeWidget(widget)
+            widget.deleteLater()
+        for widget in self._max_value_spin_widgets:
+            self.ctrl.removeWidget(widget)
+            widget.deleteLater()
+        self._max_value_label_widgets = []
+        self._max_value_spin_widgets = []
+
+        if self._max_value_placeholder is not None:
+            self.ctrl.removeWidget(self._max_value_placeholder)
+            self._max_value_placeholder.deleteLater()
+            self._max_value_placeholder = None
+
+        self._max_value_spin_by_base = {}
+
+        all_bases = list(self._base_order)
+        max_rows_used = 1
+        if not all_bases:
+            self._max_value_placeholder = QtWidgets.QLabel("No images loaded.")
+            self._max_value_placeholder.setStyleSheet("color: #B0B3B8;")
+            self.ctrl.addWidget(self._max_value_placeholder, 7, 0, 1, 4)
+        else:
+            max_rows_used = max(1, (len(all_bases) + 1) // 2)
+
+        for idx, base in enumerate(all_bases):
+            row = 7 + (idx // 2)
+            col_block = (idx % 2) * 2
+
+            label = QtWidgets.QLabel(f"Max value {idx + 1}:")
+            spin = QtWidgets.QDoubleSpinBox()
+            spin.setDecimals(3)
+            spin.setRange(0.001, 1e9)
+            spin.setSingleStep(1.0)
+            spin.setValue(self._get_pending_max_value_for_base(base))
+            spin.valueChanged.connect(lambda value, b=base: self._on_max_value_changed(b, value))
+
+            self.ctrl.addWidget(label, row, col_block)
+            self.ctrl.addWidget(spin, row, col_block + 1)
+            self._max_value_label_widgets.append(label)
+            self._max_value_spin_widgets.append(spin)
+            self._max_value_spin_by_base[base] = spin
+
+        actions_row = 7 + max_rows_used
+        self._sync_action_button_sizes()
+        self.ctrl.addWidget(self.actions_widget, actions_row, 0, 1, 4)
+
+        spacer_row = actions_row + 1
+        hint_row = actions_row + 2
+        self.ctrl.setRowMinimumHeight(spacer_row, 14)
+        self.ctrl.addWidget(self.tone_hint_lbl, hint_row, 0, 1, 4)
+
+    def _selected_max_values(self, selected):
+        out = []
+        for base, _lut in selected:
+            out.append(self._get_max_value_for_base(base))
+        return out
 
     def _get_selected_settings(self):
         out = []
@@ -2224,24 +2704,13 @@ class BinningWindow(QtWidgets.QMainWindow):
             arr = self._mw._aligned_arr_by_base.get(base, arr)
         return arr
 
-    def _reset_tone_controls(self):
-        if hasattr(self, "pmax_spin"):
-            self.pmax_spin.blockSignals(True)
-            self.pmax_spin.setValue(100.00)
-            self.pmax_spin.blockSignals(False)
-        if hasattr(self, "arcsinh_a_spin"):
-            self.arcsinh_a_spin.blockSignals(True)
-            self.arcsinh_a_spin.setValue(1.0)
-            self.arcsinh_a_spin.blockSignals(False)
-
     def _compute_selected_channel_images(
         self,
         selected,
         pixel_size_nm: float,
         scale_mode: str,
         render_mode: str,
-        pmax: float,
-        arcsinh_a: float,
+        max_values,
     ):
         channel_xy = []
         channel_names = []
@@ -2286,7 +2755,8 @@ class BinningWindow(QtWidgets.QMainWindow):
         y_edges = ymin + np.arange(ny + 1) * pixel_size_nm
 
         images = []
-        for (x, y) in channel_xy:
+        for idx, (x, y) in enumerate(channel_xy):
+            max_value = max(float(max_values[idx]) if idx < len(max_values) else 10.0, 1e-9)
             if len(x) == 0:
                 img_norm = np.zeros((ny, nx), dtype=float)
             elif render_mode == "gaussian":
@@ -2300,11 +2770,11 @@ class BinningWindow(QtWidgets.QMainWindow):
                     n_sigma=3.0,
                     bounds=bounds,
                 )
-                img_norm = _normalize_image(img, pmin=0.0, pmax=pmax, arcsinh_a=arcsinh_a)
+                img_norm = _clip_to_scale_max(img, max_value=max_value)
             else:
                 H = np.zeros((ny, nx), dtype=float)
                 H, _, _ = np.histogram2d(y, x, bins=(y_edges, x_edges))
-                img_norm = _normalize_hist_for_overlay(H, scale_mode, pmax=pmax, arcsinh_a=arcsinh_a)
+                img_norm = _clip_hist_for_overlay(H, scale_mode, max_value=max_value)
 
             images.append(np.asarray(img_norm, dtype=np.float32))
 
@@ -2319,8 +2789,7 @@ class BinningWindow(QtWidgets.QMainWindow):
         pixel_size_nm = float(self.px_spin.value()) if hasattr(self, "px_spin") else 4.0
         scale_mode = self.scale_combo.currentText().strip().lower() if hasattr(self, "scale_combo") else "linear"
         render_mode = self.mode_combo.currentText().strip().lower() if hasattr(self, "mode_combo") else "heatmap"
-        pmax = float(self.pmax_spin.value()) if hasattr(self, "pmax_spin") else 100.00
-        arcsinh_a = float(self.arcsinh_a_spin.value()) if hasattr(self, "arcsinh_a_spin") else 1.0
+        max_values = self._selected_max_values(selected)
 
         try:
             images, channel_names = self._compute_selected_channel_images(
@@ -2328,8 +2797,7 @@ class BinningWindow(QtWidgets.QMainWindow):
                 pixel_size_nm=pixel_size_nm,
                 scale_mode=scale_mode,
                 render_mode=render_mode,
-                pmax=pmax,
-                arcsinh_a=arcsinh_a,
+                max_values=max_values,
             )
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "Save as tif", str(exc))
@@ -2373,11 +2841,11 @@ class BinningWindow(QtWidgets.QMainWindow):
         pixel_size_nm = float(self.px_spin.value()) if hasattr(self, "px_spin") else 4.0
         scale_mode = self.scale_combo.currentText().strip().lower() if hasattr(self, "scale_combo") else "linear"
         render_mode = self.mode_combo.currentText().strip().lower() if hasattr(self, "mode_combo") else "heatmap"
-        pmax = float(self.pmax_spin.value()) if hasattr(self, "pmax_spin") else 100.00
-        arcsinh_a = float(self.arcsinh_a_spin.value()) if hasattr(self, "arcsinh_a_spin") else 1.0
+        max_values = self._selected_max_values(selected)
 
         if len(selected) == 1:
             base, lut = selected[0]
+            max_value = max_values[0] if max_values else 10.0
             arr = self._get_saved_arr_for_base(base)
             if arr is None:
                 fig = go.Figure()
@@ -2395,8 +2863,7 @@ class BinningWindow(QtWidgets.QMainWindow):
                     pixel_size_nm=pixel_size_nm,
                     lut=lut,
                     title=None,
-                    pmax=pmax,
-                    arcsinh_a=arcsinh_a,
+                    max_value=max_value,
                     show_colorbar=False,
                 )
             else:
@@ -2406,8 +2873,7 @@ class BinningWindow(QtWidgets.QMainWindow):
                     lut=lut,
                     title=None,
                     scale_mode=scale_mode,
-                    pmax=pmax,
-                    arcsinh_a=arcsinh_a,
+                    max_value=max_value,
                     show_colorbar=False,
                 )
         else:
@@ -2435,32 +2901,45 @@ class BinningWindow(QtWidgets.QMainWindow):
                 title=None,
                 scale_mode=scale_mode,
                 render_mode=render_mode,
-                pmax=pmax,
-                arcsinh_a=arcsinh_a,
+                max_value_a=max_values[0] if len(max_values) >= 1 else 10.0,
+                max_value_b=max_values[1] if len(max_values) >= 2 else 10.0,
             )
 
+        composed = self._compose_with_confocal(fig)
+        force_reset_for_confocal = bool(getattr(self, "_confocal_reset_pending", False))
+        self._confocal_reset_pending = False
+
         self.view.update_fig(
-            fig,
-            reset_view=not keep_view,
+            composed,
+            reset_view=(not keep_view) or force_reset_for_confocal,
             is3d=False,
             scalebar_nm=getattr(self._mw, "_scalebar_nm", 100.0),
         )
 
 class PlotSyncBridge(QtCore.QObject):
     viewChanged = Signal(str, object)  # (source_id, payload dict)
+    selectionChanged = Signal(str, object)  # (source_id, payload dict)
 
     @QtCore.Slot(str, "QVariant")
     def relayView(self, source_id, payload):
         # payload is a dict like {"mode":"2d","xRange":[...],"yRange":[...]} or {"mode":"3d","camera":{...}}
         self.viewChanged.emit(source_id, payload)
 
+    @QtCore.Slot(str, "QVariant")
+    def relaySelection(self, source_id, payload):
+        # payload is a dict like {"mode":"2d","xRange":[...],"yRange":[...]}
+        self.selectionChanged.emit(source_id, payload)
+
 
 class MultiColorWindow(QtWidgets.QMainWindow):
-    def __init__(self, on_view_changed, parent=None):
+    def __init__(self, on_view_changed, on_crop_requested=None, on_reset_crop_requested=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Multicolor")
         self.resize(1200, 700)
         self._on_view_changed = on_view_changed
+        self._on_crop_requested = on_crop_requested
+        self._on_reset_crop_requested = on_reset_crop_requested
+        self._last_selection_payload = None
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -2471,7 +2950,23 @@ class MultiColorWindow(QtWidgets.QMainWindow):
         self.stack = QtWidgets.QStackedWidget()
         outer.addWidget(self.stack, 1)
 
-        # --- export button overlaid bottom-right ---
+        # --- crop/export buttons overlaid bottom-right ---
+        self._crop_btn = QtWidgets.QPushButton("Crop", central)
+        self._crop_btn.clicked.connect(self._crop_current_selection)
+        self._crop_btn.setFixedHeight(24)
+        self._crop_btn.setMaximumWidth(90)
+        self._crop_btn.raise_()
+
+        self._reset_crop_btn = QtWidgets.QPushButton("Reset Crop", central)
+        self._reset_crop_btn.clicked.connect(self._reset_crop)
+        self._reset_crop_btn.setFixedHeight(24)
+        self._reset_crop_btn.setMaximumWidth(110)
+        self._reset_crop_btn.raise_()
+
+        self._sync_chk = QtWidgets.QCheckBox("Synch", central)
+        self._sync_chk.setChecked(True)
+        self._sync_chk.raise_()
+
         self._export_btn = QtWidgets.QPushButton("Export (SVG/PDF)", central)
         self._export_btn.clicked.connect(self._export_current)
         self._export_btn.setFixedHeight(24)
@@ -2492,6 +2987,7 @@ class MultiColorWindow(QtWidgets.QMainWindow):
 
         self.merged_view = PlotlyView()
         self.merged_view.viewChanged.connect(self._on_view_changed)
+        self.merged_view.selectionChanged.connect(self._on_plot_selection)
         mv.addWidget(self.merged_view, 1)
 
         self.stack.addWidget(self.merged_page)
@@ -2537,6 +3033,7 @@ class MultiColorWindow(QtWidgets.QMainWindow):
 
             view = PlotlyView()
             view.viewChanged.connect(self._on_view_changed)
+            view.selectionChanged.connect(self._on_plot_selection)
             vbox.addWidget(view, 1)
 
             self._views[base] = view
@@ -2560,13 +3057,76 @@ class MultiColorWindow(QtWidgets.QMainWindow):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if hasattr(self, "_export_btn") and self._export_btn is not None:
+        if (
+            hasattr(self, "_export_btn") and self._export_btn is not None
+            and hasattr(self, "_crop_btn") and self._crop_btn is not None
+            and hasattr(self, "_reset_crop_btn") and self._reset_crop_btn is not None
+            and hasattr(self, "_sync_chk") and self._sync_chk is not None
+        ):
             m = 12  # margin from edges
-            btn = self._export_btn
-            btn.adjustSize()
-            x = self.centralWidget().width() - btn.width() - m
-            y = self.centralWidget().height() - btn.height() - m
-            btn.move(x, y)
+            gap = 8
+            btn_exp = self._export_btn
+            btn_crop = self._crop_btn
+            btn_reset = self._reset_crop_btn
+            chk_sync = self._sync_chk
+            btn_exp.adjustSize()
+            btn_crop.adjustSize()
+            btn_reset.adjustSize()
+            chk_sync.adjustSize()
+            y = self.centralWidget().height() - btn_exp.height() - m
+            x_exp = self.centralWidget().width() - btn_exp.width() - m
+            x_sync = x_exp - chk_sync.width() - gap
+            x_reset = x_sync - btn_reset.width() - gap
+            x_crop = x_reset - btn_crop.width() - gap
+            btn_crop.move(x_crop, y)
+            btn_reset.move(x_reset, y)
+            chk_sync.move(x_sync, y + max(0, (btn_exp.height() - chk_sync.height()) // 2))
+            btn_exp.move(x_exp, y)
+
+    def _on_plot_selection(self, _source_id, payload):
+        if not isinstance(payload, dict):
+            return
+        if payload.get("mode") != "2d":
+            return
+        xr = payload.get("xRange")
+        yr = payload.get("yRange")
+        if not (isinstance(xr, (list, tuple)) and isinstance(yr, (list, tuple)) and len(xr) == 2 and len(yr) == 2):
+            return
+        self._last_selection_payload = payload
+
+    def _crop_current_selection(self):
+        if self._on_crop_requested is None:
+            return
+        p = self._last_selection_payload
+        if not isinstance(p, dict):
+            QtWidgets.QMessageBox.information(self, "Crop", "Use Box select on a multicolor plot first.")
+            return
+        xr = p.get("xRange")
+        yr = p.get("yRange")
+        if not (isinstance(xr, (list, tuple)) and isinstance(yr, (list, tuple)) and len(xr) == 2 and len(yr) == 2):
+            QtWidgets.QMessageBox.information(self, "Crop", "Box selection range is unavailable.")
+            return
+        try:
+            payload = {
+                "mode": "2d",
+                "xRange": [float(min(xr[0], xr[1])), float(max(xr[0], xr[1]))],
+                "yRange": [float(min(yr[0], yr[1])), float(max(yr[0], yr[1]))],
+            }
+        except Exception:
+            QtWidgets.QMessageBox.information(self, "Crop", "Invalid box selection values.")
+            return
+        self._on_crop_requested(payload)
+
+    def _reset_crop(self):
+        if self._on_reset_crop_requested is None:
+            return
+        self._on_reset_crop_requested()
+
+    def grid_sync_enabled(self) -> bool:
+        chk = getattr(self, "_sync_chk", None)
+        if chk is None:
+            return True
+        return bool(chk.isChecked())
 
     def update_merged(self, fig, reset_view=False, is3d=False, scalebar_nm=100.0):
         self.merged_view.update_fig(fig, reset_view=reset_view, is3d=is3d, scalebar_nm=scalebar_nm)
@@ -2574,6 +3134,7 @@ class MultiColorWindow(QtWidgets.QMainWindow):
 class PlotlyView(QtWidgets.QWidget):
     """Widget hosting Plotly in a QWebEngineView + emits view changes."""
     viewChanged = Signal(str, object)  # (source_id, payload)
+    selectionChanged = Signal(str, object)  # (source_id, payload)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2597,6 +3158,7 @@ class PlotlyView(QtWidgets.QWidget):
         # WebChannel bridge
         self._bridge = PlotSyncBridge()
         self._bridge.viewChanged.connect(self.viewChanged.emit)
+        self._bridge.selectionChanged.connect(self.selectionChanged.emit)
 
         self._channel = QWebChannel(self.web.page())
         self._channel.registerObject("plotSync", self._bridge)
@@ -2813,6 +3375,46 @@ class PlotlyView(QtWidgets.QWidget):
         }}
         }} catch(err) {{
         console.log("relayout hook error", err);
+        }}
+    }});
+    }}
+
+    function installSelectionHandler() {{
+    const gd = document.getElementById('plot');
+    if (!gd) return;
+
+    if (gd.removeAllListeners) gd.removeAllListeners('plotly_selected');
+
+    gd.on('plotly_selected', function(ev) {{
+        try {{
+        if (window._plotSync.ignore || !window._plotSync.ready || !window._plotSync.bridge) return;
+        if (!gd._fullLayout || gd._fullLayout.scene) return; // 2D only
+
+        let xr = null;
+        let yr = null;
+
+        if (ev && ev.range && ev.range.x && ev.range.y) {{
+            xr = ev.range.x;
+            yr = ev.range.y;
+        }} else if (ev && ev.points && ev.points.length) {{
+            const xs = ev.points.map(p => Number(p.x)).filter(v => Number.isFinite(v));
+            const ys = ev.points.map(p => Number(p.y)).filter(v => Number.isFinite(v));
+            if (xs.length && ys.length) {{
+                xr = [Math.min(...xs), Math.max(...xs)];
+                yr = [Math.min(...ys), Math.max(...ys)];
+            }}
+        }}
+
+        if (!xr || !yr || xr.length < 2 || yr.length < 2) return;
+
+        const payload = {{
+            mode: "2d",
+            xRange: [Number(xr[0]), Number(xr[1])],
+            yRange: [Number(yr[0]), Number(yr[1])]
+        }};
+        window._plotSync.bridge.relaySelection(window._plotSync.sourceId || "unknown", payload);
+        }} catch(err) {{
+        console.log("selection hook error", err);
         }}
     }});
     }}
@@ -3077,6 +3679,7 @@ function installRelayoutHandler() {{
 
         // Install relayout handler after plot exists
         installRelayoutHandler();
+        installSelectionHandler();
 
         // Re-enable broadcasting (next tick so Plotly internal relayouts won't echo)
         setTimeout(() => {{ window._plotSync.ignore = false; }}, 60);
@@ -3175,6 +3778,9 @@ class FileWorker(QtCore.QThread):
         self.status.emit(f"Loading: {base}")
 
         MFX_Data = np.load(file, allow_pickle=False)
+        MFX_Data = MFX_Data.copy()
+        # Flip vertically immediately after loading.
+        MFX_Data["loc"][:, 1] *= -1.0
         if self.isInterruptionRequested():
             return None
         self._check_cancel()
@@ -3190,7 +3796,6 @@ class FileWorker(QtCore.QThread):
             self.status.emit(f"Skipping {base}: no valid localizations.")
             return None
 
-        MFX_Data = MFX_Data.copy()
         MFX_Data["loc"][:, -1] *= p["z_corr"]
         MFX_Data["loc"] *= p["scale"]
 
@@ -3252,6 +3857,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._arr_by_base = {}        # base -> currently active array for plotting (trace-filtered or EFO-filtered)
         self._base_by_file = {}       # file_path -> base (optional convenience)
         self._multicolor_win = None
+        self._multicolor_crop_bounds = None  # (xmin, xmax, ymin, ymax) for multicolor-only crop
+        self._multicolor_cropped_by_base = {}  # base -> cropped array used only in multicolor viewer
 
         self._ctx_by_base = {}          # base -> ctx (from worker)
         self._efo_range_by_base = {}    # base -> (xmin, xmax) selected
@@ -3630,6 +4237,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._arr_by_base.clear()
         self._aligned_arr_by_base.clear()
         self._T_by_base.clear()
+        self._multicolor_crop_bounds = None
+        self._multicolor_cropped_by_base.clear()
 
         self._mbm_enabled = False
         self._mbm_source_base = None
@@ -3828,7 +4437,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def open_multicolor(self):
         if self._multicolor_win is None:
-            self._multicolor_win = MultiColorWindow(self.on_any_plot_view_changed, self)
+            self._multicolor_win = MultiColorWindow(
+                self.on_any_plot_view_changed,
+                self._on_multicolor_crop_requested,
+                self._on_multicolor_reset_crop_requested,
+                self,
+            )
 
         bases = [os.path.splitext(os.path.basename(f))[0] for f in self._all_files]
         self._multicolor_win.rebuild(bases)
@@ -3858,6 +4472,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._multicolor_win is None or not self._multicolor_win.isVisible():
             return
 
+        self._recompute_multicolor_crop_cache()
+
         is3d = self.is3d.isChecked()
         avg = self.avg_tid.isChecked()
         sb = float(getattr(self, "_scalebar_nm", 100.0))
@@ -3867,7 +4483,7 @@ class MainWindow(QtWidgets.QMainWindow):
             arr_by_base = {}
             for f in self._all_files:
                 base = os.path.splitext(os.path.basename(f))[0]
-                arr = self._get_arr_for_base(base)
+                arr = self._get_multicolor_arr_for_base(base)
                 if arr is not None:
                     arr_by_base[base] = arr
 
@@ -3884,7 +4500,7 @@ class MainWindow(QtWidgets.QMainWindow):
             for f in self._all_files:
                 base = os.path.splitext(os.path.basename(f))[0]
                 cs = self._color_settings_by_base.get(base, {"mode": DEFAULT_MODE, "solid": DEFAULT_SOLID, "lut": DEFAULT_LUT, "alpha": DEFAULT_ALPHA, "size": DEFAULT_SIZE_2D})
-                arr = self._get_arr_for_base(base)
+                arr = self._get_multicolor_arr_for_base(base)
                 if arr is None:
                     continue
                 figs[base] = make_plotly_fig(arr, avg, is3d, color_settings=cs, scalebar_nm=getattr(self, "_scalebar_nm", 100.0))
@@ -3900,10 +4516,85 @@ class MainWindow(QtWidgets.QMainWindow):
             return self._current_ctx.get("arr")
         return None
 
+    def _on_multicolor_crop_requested(self, payload: dict):
+        if not isinstance(payload, dict):
+            return
+        xr = payload.get("xRange")
+        yr = payload.get("yRange")
+        if not (isinstance(xr, (list, tuple)) and isinstance(yr, (list, tuple)) and len(xr) == 2 and len(yr) == 2):
+            QtWidgets.QMessageBox.information(self, "Crop", "Use Box select on a multicolor plot first.")
+            return
+        try:
+            xmin = float(min(xr[0], xr[1]))
+            xmax = float(max(xr[0], xr[1]))
+            ymin = float(min(yr[0], yr[1]))
+            ymax = float(max(yr[0], yr[1]))
+        except Exception:
+            QtWidgets.QMessageBox.information(self, "Crop", "Invalid crop selection.")
+            return
+
+        if not (np.isfinite(xmin) and np.isfinite(xmax) and np.isfinite(ymin) and np.isfinite(ymax)):
+            QtWidgets.QMessageBox.information(self, "Crop", "Crop range must be finite.")
+            return
+
+        self._multicolor_crop_bounds = (xmin, xmax, ymin, ymax)
+        self._recompute_multicolor_crop_cache()
+        self._refresh_multicolor_contents(reset_view=True)
+
+        n = int(sum(len(v) for v in self._multicolor_cropped_by_base.values() if v is not None))
+        self.statusBar().showMessage(f"Multicolor crop applied: x=[{xmin:.2f}, {xmax:.2f}], y=[{ymin:.2f}, {ymax:.2f}], kept {n} locs")
+
+    def _on_multicolor_reset_crop_requested(self):
+        if not getattr(self, "_multicolor_crop_bounds", None):
+            return
+        self._multicolor_crop_bounds = None
+        self._multicolor_cropped_by_base.clear()
+        self._refresh_multicolor_contents(reset_view=True)
+        self.statusBar().showMessage("Multicolor crop reset")
+
+    def _recompute_multicolor_crop_cache(self):
+        self._multicolor_cropped_by_base = {}
+        bounds = getattr(self, "_multicolor_crop_bounds", None)
+        if not bounds:
+            return
+
+        xmin, xmax, ymin, ymax = bounds
+        for f in self._all_files:
+            base = os.path.splitext(os.path.basename(f))[0]
+            arr = self._get_arr_for_base(base)
+            if arr is None:
+                continue
+            if len(arr) == 0:
+                self._multicolor_cropped_by_base[base] = arr
+                continue
+
+            try:
+                loc = np.asarray(arr["loc"], dtype=float)
+                if loc.ndim != 2 or loc.shape[1] < 2:
+                    self._multicolor_cropped_by_base[base] = arr
+                    continue
+                x = loc[:, 0]
+                y = loc[:, 1]
+                m = np.isfinite(x) & np.isfinite(y)
+                m &= (x >= xmin) & (x <= xmax) & (y >= ymin) & (y <= ymax)
+                self._multicolor_cropped_by_base[base] = arr[m]
+            except Exception:
+                self._multicolor_cropped_by_base[base] = arr
+
+    def _get_multicolor_arr_for_base(self, base: str):
+        if getattr(self, "_multicolor_crop_bounds", None):
+            return self._multicolor_cropped_by_base.get(base)
+        return self._get_arr_for_base(base)
+
     def on_any_plot_view_changed(self, source_id, payload):
         if isinstance(payload, dict) and payload.get("mode") == "3d" and "camera" in payload:
             payload = dict(payload)
             payload["camera"] = _camera_slim(payload["camera"])
+
+        sync_grid = True
+        if self._multicolor_win is not None and self._multicolor_win.isVisible():
+            if self._multicolor_win.mode() == "grid":
+                sync_grid = bool(self._multicolor_win.grid_sync_enabled())
 
         # main plot
         if hasattr(self, "plot_view") and self.plot_view._id != source_id:
@@ -3916,15 +4607,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._multicolor_win.merged_view.apply_view(payload)
 
             # grid views
-            for base, view in self._multicolor_win._views.items():
-                if view._id == source_id:
-                    continue
-                view.apply_view(payload)
+            if sync_grid:
+                for base, view in self._multicolor_win._views.items():
+                    if view._id == source_id:
+                        continue
+                    view.apply_view(payload)
 
     def _multicolor_update_base(self, base, reset_view=False):
         if self._multicolor_win is None or not self._multicolor_win.isVisible():
             return
-        arr = self._arr_by_base.get(base)
+        self._recompute_multicolor_crop_cache()
+        arr = self._get_multicolor_arr_for_base(base)
         if arr is None:
             return
         cs = self._color_settings_by_base.get(base, {"mode": DEFAULT_MODE, "solid": DEFAULT_SOLID, "lut": DEFAULT_LUT, "alpha": DEFAULT_ALPHA, "size": DEFAULT_SIZE_2D})
@@ -4619,11 +5312,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 continue
 
             try:
-                T, common = compute_mbm_transform(
-                    mbm_src, mbm_mov, k=4, scale=float(self.scale.value())
+                T, common, diagnostics = compute_mbm_transform(
+                    mbm_src,
+                    mbm_mov,
+                    k=4,
+                    scale=float(self.scale.value()),
+                    return_diagnostics=True,
                 )
                 self._T_by_base[base] = T
                 self._aligned_arr_by_base[base] = apply_transform_to_arr(arr, T)
+                self._save_mbm_alignment_bead_plots(src, base, diagnostics, T)
             except Exception as e:
                 self.statusBar().showMessage(f"MBM align failed for {base}: {e}")
                 self._aligned_arr_by_base[base] = arr
@@ -4636,6 +5334,82 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_multicolor_contents(reset_view=False)
         if self._binning_win is not None and self._binning_win.isVisible():
             self._binning_win.refresh_plot()
+
+    def _save_mbm_alignment_bead_plots(self, src_base: str, mov_base: str, diagnostics: dict, T=None):
+        if not isinstance(diagnostics, dict):
+            return
+
+        out_root = self.out_edit.text().strip() if hasattr(self, "out_edit") else ""
+        if not out_root:
+            return
+
+        ref = np.asarray(diagnostics.get("ref_common_scaled", diagnostics.get("ref_common", [])), dtype=float)
+        mov = np.asarray(diagnostics.get("mov_common_scaled", diagnostics.get("mov_common", [])), dtype=float)
+        keep = np.asarray(diagnostics.get("keep_mask", []), dtype=bool)
+
+        if ref.ndim != 2 or mov.ndim != 2 or ref.shape[1] < 3 or mov.shape[1] < 3:
+            return
+        if len(ref) == 0 or len(mov) == 0 or len(ref) != len(mov):
+            return
+        if keep.shape[0] != len(ref):
+            keep = np.ones(len(ref), dtype=bool)
+
+        os.makedirs(out_root, exist_ok=True)
+        diag_dir = os.path.join(out_root, "mbm_alignment_plots")
+        os.makedirs(diag_dir, exist_ok=True)
+
+        def _safe_name(s: str) -> str:
+            return "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in str(s))
+
+        src_name = _safe_name(src_base)
+        mov_name = _safe_name(mov_base)
+        stem = f"mbm_beads_{mov_name}_to_{src_name}"
+
+        c_in = "#ff8c00"
+        c_out = "#9e9e9e"
+
+        fig2d = Figure(figsize=(8.0, 6.0), dpi=150)
+        ax2d = fig2d.add_subplot(111)
+        ax2d.scatter(ref[~keep, 0], ref[~keep, 1], c=c_out, s=26, marker="o", alpha=0.75, label=f"{src_base} filtered out")
+        ax2d.scatter(ref[keep, 0], ref[keep, 1], c=c_in, s=30, marker="o", alpha=0.9, label=f"{src_base} included")
+        ax2d.scatter(mov[~keep, 0], mov[~keep, 1], c=c_out, s=26, marker="^", alpha=0.75, label=f"{mov_base} filtered out")
+        ax2d.scatter(mov[keep, 0], mov[keep, 1], c=c_in, s=30, marker="^", alpha=0.9, label=f"{mov_base} included")
+        ax2d.set_title(f"MBM beads (2D): {mov_base} -> {src_base}")
+        ax2d.set_xlabel("x")
+        ax2d.set_ylabel("y")
+        ax2d.grid(True, alpha=0.25)
+        ax2d.legend(loc="best", fontsize=8)
+        fig2d.tight_layout()
+
+        fig3d = Figure(figsize=(8.4, 6.4), dpi=150)
+        ax3d = fig3d.add_subplot(111, projection="3d")
+        ref_used = ref[keep]
+        mov_used = mov[keep]
+        if isinstance(T, np.ndarray) and T.shape == (4, 4) and len(mov_used) > 0:
+            mov_registered = apply_T(mov_used, T)
+        else:
+            mov_registered = mov_used
+
+        ax3d.scatter(ref_used[:, 0], ref_used[:, 1], ref_used[:, 2], c=c_in, s=34, marker="o", alpha=0.9, label="reference")
+        ax3d.scatter(mov_registered[:, 0], mov_registered[:, 1], mov_registered[:, 2], c="#1f77b4", s=34, marker="^", alpha=0.9, label="registered")
+        if len(ref_used) > 0:
+            dx = float(np.ptp(ref_used[:, 0]))
+            dy = float(np.ptp(ref_used[:, 1]))
+            dz = float(np.ptp(ref_used[:, 2]))
+            ax3d.set_box_aspect((max(dx, 1e-12), max(dy, 1e-12), max(dz, 1e-12)))
+        ax3d.set_title(f"MBM bead registration (3D): {mov_base} -> {src_base}")
+        ax3d.set_xlabel("x")
+        ax3d.set_ylabel("y")
+        ax3d.set_zlabel("z")
+        ax3d.legend(loc="best", fontsize=8)
+        fig3d.tight_layout()
+
+        out_2d = os.path.join(diag_dir, f"{stem}_2d.png")
+        out_3d = os.path.join(diag_dir, f"{stem}_3d.png")
+        fig2d.savefig(out_2d, dpi=200)
+        fig3d.savefig(out_3d, dpi=200)
+
+        self.statusBar().showMessage(f"MBM bead plots saved: {os.path.basename(out_2d)}, {os.path.basename(out_3d)}")
 
     def go_next(self):
         if not self._all_files:
