@@ -27,6 +27,7 @@ import zarr
 from matplotlib.colors import LinearSegmentedColormap
 from functools import partial
 from PySide6 import QtGui
+from collections import deque
 
 # -------------------- helpers --------------------
 def save_to_csv(df, save_path):
@@ -154,6 +155,101 @@ def make_labeled_separator(text: str):
     h.addWidget(lbl, 0)
     h.addWidget(line2, 1)
     return w
+
+
+def dbscan_numpy(points, eps=200.0, min_samples=3):
+    """
+    Simple DBSCAN using cKDTree neighborhood queries.
+    points: (N, D) array
+    Returns labels (N,), where -1 means noise.
+    """
+    pts = np.asarray(points, dtype=float)
+    if pts.ndim != 2 or len(pts) == 0:
+        return np.array([], dtype=int)
+
+    eps = float(max(eps, 1e-12))
+    min_samples = int(max(1, min_samples))
+
+    tree = cKDTree(pts)
+    neighbors = tree.query_ball_point(pts, r=eps)
+
+    labels = np.full(len(pts), -99, dtype=int)  # unvisited
+    cluster_id = 0
+
+    for i in range(len(pts)):
+        if labels[i] != -99:
+            continue
+
+        if len(neighbors[i]) < min_samples:
+            labels[i] = -1
+            continue
+
+        labels[i] = cluster_id
+        seeds = deque(j for j in neighbors[i] if j != i)
+        seed_set = set(seeds)
+
+        while seeds:
+            j = seeds.popleft()
+
+            if labels[j] == -1:
+                labels[j] = cluster_id
+
+            if labels[j] != -99:
+                continue
+
+            labels[j] = cluster_id
+
+            if len(neighbors[j]) >= min_samples:
+                for k in neighbors[j]:
+                    if k not in seed_set:
+                        seeds.append(k)
+                        seed_set.add(k)
+
+        cluster_id += 1
+
+    labels[labels == -99] = -1
+    return labels
+
+
+def avg_loc_by_tid(arr):
+    """
+    Returns track-level centroids and counts.
+    Output tuple:
+      track_ids: (T,)
+      centroids_xyz: (T, 3)
+      n_localizations: (T,)
+    """
+    if arr is None or len(arr) == 0:
+        return np.array([], dtype=int), np.zeros((0, 3), dtype=float), np.array([], dtype=int)
+
+    if "tid" not in arr.dtype.names or "loc" not in arr.dtype.names:
+        return np.array([], dtype=int), np.zeros((0, 3), dtype=float), np.array([], dtype=int)
+
+    tids = np.asarray(arr["tid"])
+    loc = np.asarray(arr["loc"], dtype=float)
+    if loc.ndim != 2 or loc.shape[1] < 2:
+        return np.array([], dtype=int), np.zeros((0, 3), dtype=float), np.array([], dtype=int)
+
+    use_dims = min(3, loc.shape[1])
+    valid = np.isfinite(tids)
+    valid &= np.isfinite(loc[:, 0]) & np.isfinite(loc[:, 1])
+    if use_dims >= 3:
+        valid &= np.isfinite(loc[:, 2])
+
+    tids = tids[valid]
+    loc = loc[valid]
+    if len(tids) == 0:
+        return np.array([], dtype=int), np.zeros((0, 3), dtype=float), np.array([], dtype=int)
+
+    tids = tids.astype(np.int64)
+    unique_tids, inv_idx, counts = np.unique(tids, return_inverse=True, return_counts=True)
+
+    centroids = np.zeros((len(unique_tids), 3), dtype=float)
+    for d in range(use_dims):
+        sums = np.bincount(inv_idx, weights=loc[:, d], minlength=len(unique_tids))
+        centroids[:, d] = sums / np.maximum(counts, 1)
+
+    return unique_tids.astype(int), centroids, counts.astype(int)
 
 def compute_mbm_transform(mbm_ref_dir, mbm_mov_dir, k=4, scale=1.0, return_diagnostics: bool = False):
     pts_ref = load_mbm_points(mbm_ref_dir)
@@ -2916,6 +3012,609 @@ class BinningWindow(QtWidgets.QMainWindow):
             scalebar_nm=getattr(self._mw, "_scalebar_nm", 100.0),
         )
 
+
+class DBSCANWindow(QtWidgets.QMainWindow):
+    """DBSCAN on avg track centroids for one selected file at a time."""
+
+    def __init__(self, main_window: "MainWindow", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("DBSCAN")
+        self.resize(1200, 760)
+
+        self._mw = main_window
+        self._base_buttons = {}
+        self._current_base = None
+        self._current_arr = None
+        self._tracks_df = None
+        self._labels = None
+
+        central = QtWidgets.QWidget()
+        self.setCentralWidget(central)
+        root = QtWidgets.QHBoxLayout(central)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(8)
+
+        left_wrap = QtWidgets.QWidget()
+        left = QtWidgets.QVBoxLayout(left_wrap)
+        left.setContentsMargins(0, 0, 0, 0)
+        left.setSpacing(8)
+        left_wrap.setMinimumWidth(330)
+        left_wrap.setMaximumWidth(420)
+        root.addWidget(left_wrap, 0)
+
+        files_group = QtWidgets.QGroupBox("Files")
+        files_v = QtWidgets.QVBoxLayout(files_group)
+        files_v.setContentsMargins(8, 8, 8, 8)
+        files_v.setSpacing(6)
+
+        self.files_scroll = QtWidgets.QScrollArea()
+        self.files_scroll.setWidgetResizable(True)
+        self.files_scroll.setMinimumWidth(300)
+        self.files_scroll.setMaximumWidth(360)
+
+        self.files_container = QtWidgets.QWidget()
+        self.files_layout = QtWidgets.QVBoxLayout(self.files_container)
+        self.files_layout.setContentsMargins(6, 8, 6, 8)
+        self.files_layout.setSpacing(12)
+        self.files_layout.addStretch(1)
+        self.files_scroll.setWidget(self.files_container)
+        files_v.addWidget(self.files_scroll, 1)
+        left.addWidget(files_group, 3)
+
+        # Add clear visual separation between file list and DBSCAN action controls.
+        left.addSpacing(14)
+
+        params_group = QtWidgets.QGroupBox("DBSCAN")
+        params_grid = QtWidgets.QGridLayout(params_group)
+        params_grid.setContentsMargins(8, 8, 8, 8)
+        params_grid.setHorizontalSpacing(8)
+        params_grid.setVerticalSpacing(8)
+
+        params_grid.addWidget(QtWidgets.QLabel("eps (nm):"), 0, 0)
+        self.eps_spin = QtWidgets.QDoubleSpinBox()
+        self.eps_spin.setDecimals(1)
+        self.eps_spin.setRange(0.1, 1e6)
+        self.eps_spin.setSingleStep(5.0)
+        self.eps_spin.setValue(200.0)
+        params_grid.addWidget(self.eps_spin, 0, 1)
+
+        params_grid.addWidget(QtWidgets.QLabel("min_samples:"), 1, 0)
+        self.min_samples_spin = QtWidgets.QSpinBox()
+        self.min_samples_spin.setRange(1, 10000)
+        self.min_samples_spin.setValue(3)
+        params_grid.addWidget(self.min_samples_spin, 1, 1)
+
+        params_grid.addWidget(QtWidgets.QLabel("Clustering mode:"), 2, 0)
+        self.dimension_combo = QtWidgets.QComboBox()
+        self.dimension_combo.addItems(["3D (x,y,z)", "2D (x,y)"])
+        self.dimension_combo.setCurrentIndex(0)
+        params_grid.addWidget(self.dimension_combo, 2, 1)
+
+        self.run_btn = QtWidgets.QPushButton("Run DBSCAN")
+        self.run_btn.clicked.connect(self.run_dbscan)
+        params_grid.addWidget(self.run_btn, 3, 0, 1, 2)
+
+        # Add extra breathing room between run action and log output.
+        params_grid.setRowMinimumHeight(4, 12)
+
+        self.log_text = QtWidgets.QPlainTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setMaximumHeight(150)
+        self.log_text.setPlaceholderText("Output will appear here...")
+        params_grid.addWidget(self.log_text, 5, 0, 1, 2)
+
+        self.clear_log_btn = QtWidgets.QPushButton("Clear log")
+        self.clear_log_btn.clicked.connect(self.log_text.clear)
+
+        self.save_btn = QtWidgets.QPushButton("Save DBSCAN")
+        self.save_btn.clicked.connect(self.save_dbscan)
+
+        # Match the button separation style used in other windows.
+        for b in (self.run_btn, self.clear_log_btn, self.save_btn):
+            b.setFixedHeight(40)
+
+        params_grid.setRowMinimumHeight(6, 14)
+
+        action_row = QtWidgets.QWidget()
+        action_h = QtWidgets.QHBoxLayout(action_row)
+        action_h.setContentsMargins(0, 6, 0, 8)
+        action_h.setSpacing(12)
+        action_h.addWidget(self.clear_log_btn)
+        action_h.addWidget(self.save_btn)
+        params_grid.addWidget(action_row, 7, 0, 1, 2)
+
+        left.addWidget(params_group, 2)
+
+        self.view = PlotlyView()
+        self.view.setMinimumWidth(520)
+        root.addWidget(self.view, 1)
+
+        # Keep a stable split: controls panel narrow, viewer wide.
+        root.setStretch(0, 1)
+        root.setStretch(1, 3)
+
+    def _append_log(self, text: str):
+        self.log_text.appendPlainText(str(text))
+
+    def rebuild(self, base_names):
+        self._base_buttons.clear()
+
+        while self.files_layout.count() > 0:
+            item = self.files_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+
+        self._btn_group = QtWidgets.QButtonGroup(self)
+        self._btn_group.setExclusive(True)
+
+        for base in base_names:
+            btn = QtWidgets.QPushButton(base)
+            btn.setCheckable(True)
+            btn.setStyleSheet(
+                """
+                QPushButton {
+                    text-align: center;
+                    padding: 6px 10px;
+                }
+                QPushButton:checked {
+                    background-color: #1F2123;
+                    border: 1px solid #8AB4F8;
+                    padding-top: 9px;
+                    padding-left: 12px;
+                }
+                """
+            )
+            btn.clicked.connect(lambda checked, b=base: self.load_base(b) if checked else None)
+            self._btn_group.addButton(btn)
+            self.files_layout.addWidget(btn)
+            self._base_buttons[base] = btn
+
+        self.files_layout.addStretch(1)
+
+        if self._current_base in self._base_buttons:
+            self._base_buttons[self._current_base].setChecked(True)
+            self.load_base(self._current_base)
+        elif base_names:
+            first = base_names[0]
+            self._base_buttons[first].setChecked(True)
+            self.load_base(first)
+        else:
+            self._current_base = None
+            self._current_arr = None
+            self._tracks_df = None
+            self._labels = None
+            fig = go.Figure()
+            fig.update_layout(annotations=[dict(text="No file loaded", x=0.5, y=0.5, showarrow=False)])
+            apply_plot_theme(fig, is3d=False)
+            self.view.update_fig(fig, reset_view=True, is3d=False)
+
+    def _selected_arr(self, base: str):
+        # Keep behavior aligned with multicolor viewer: refresh crop cache first,
+        # then resolve through the same accessor.
+        if getattr(self._mw, "_multicolor_crop_bounds", None):
+            self._mw._recompute_multicolor_crop_cache()
+
+        arr = self._mw._get_multicolor_arr_for_base(base)
+        if arr is not None:
+            return arr
+
+        arr = self._mw._get_arr_for_base(base)
+        if arr is not None:
+            return arr
+
+        if self._mw._current_ctx is not None and self._mw._current_ctx.get("base") == base:
+            return self._mw._current_ctx.get("arr")
+
+        return None
+
+    def _avg_tracks_df(self, arr):
+        if arr is None or len(arr) == 0:
+            return pd.DataFrame(columns=["track_id", "centroid_x", "centroid_y", "centroid_z", "n_localizations"])
+
+        # Use the exact same averaging path as the multicolor viewer.
+        xyz, _vals, tids_plot = scatter_points_and_color(arr, avg_tid=True)
+        if xyz is None or len(xyz) == 0:
+            return pd.DataFrame(columns=["track_id", "centroid_x", "centroid_y", "centroid_z", "n_localizations"])
+
+        xyz = np.asarray(xyz, dtype=float)
+        tids_plot = np.asarray(tids_plot)
+        if xyz.ndim != 2 or xyz.shape[1] < 2:
+            return pd.DataFrame(columns=["track_id", "centroid_x", "centroid_y", "centroid_z", "n_localizations"])
+
+        x = xyz[:, 0]
+        y = xyz[:, 1]
+        z = xyz[:, 2] if xyz.shape[1] >= 3 else np.zeros(len(x), dtype=float)
+        finite = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
+        x = x[finite]
+        y = y[finite]
+        z = z[finite]
+        tids_plot = tids_plot[finite]
+        if len(tids_plot) == 0:
+            return pd.DataFrame(columns=["track_id", "centroid_x", "centroid_y", "centroid_z", "n_localizations"])
+
+        # Track counts from the same array used to generate averages.
+        nloc_by_tid = {}
+        if "tid" in arr.dtype.names:
+            tids_all = np.asarray(arr["tid"])
+            ut, cnt = np.unique(tids_all, return_counts=True)
+            nloc_by_tid = {int(t): int(c) for t, c in zip(ut, cnt)}
+
+        n_localizations = np.array([nloc_by_tid.get(int(t), 0) for t in tids_plot], dtype=int)
+
+        return pd.DataFrame(
+            {
+                "track_id": np.asarray(tids_plot).astype(int),
+                "centroid_x": x.astype(float),
+                "centroid_y": y.astype(float),
+                "centroid_z": z.astype(float),
+                "n_localizations": n_localizations,
+            }
+        )
+
+    def _plot_tracks(self, tracks_df: pd.DataFrame, labels=None, title: str = None):
+        fig = go.Figure()
+        if tracks_df is None or len(tracks_df) == 0:
+            fig.update_layout(annotations=[dict(text="No avg loc (tid) data", x=0.5, y=0.5, showarrow=False)])
+            apply_plot_theme(fig, is3d=False)
+            html = pio.to_html(
+                fig,
+                include_plotlyjs="cdn",
+                full_html=False,
+                config={"scrollZoom": True, "displaylogo": False, "responsive": True},
+            )
+            self.view.web.setHtml(html, QUrl("about:blank"))
+            return
+
+        x = tracks_df["centroid_x"].to_numpy(dtype=float)
+        y = tracks_df["centroid_y"].to_numpy(dtype=float)
+        z = tracks_df["centroid_z"].to_numpy(dtype=float)
+        tid = tracks_df["track_id"].to_numpy(dtype=int)
+        nloc = tracks_df["n_localizations"].to_numpy(dtype=int)
+
+        if labels is None:
+            text = [f"track={int(t)}<br>n={int(n)}<br>z={zz:.2f}" for t, n, zz in zip(tid, nloc, z)]
+            fig.add_trace(
+                go.Scatter(
+                    x=x,
+                    y=y,
+                    mode="markers",
+                    marker=dict(size=7, color="#4C8BF5", opacity=0.9),
+                    text=text,
+                    hovertemplate="%{text}<extra></extra>",
+                    name="avg loc (tid)",
+                )
+            )
+        else:
+            labels = np.asarray(labels, dtype=int)
+            unique_labels = sorted(np.unique(labels))
+            palette = [
+                "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b",
+                "#e377c2", "#7f7f7f", "#bcbd22", "#17becf", "#4c78a8", "#f58518",
+            ]
+            for i, lab in enumerate(unique_labels):
+                m = labels == lab
+                if not np.any(m):
+                    continue
+                if lab == -1:
+                    name = f"Noise ({int(np.sum(m))})"
+                    color = "#9e9e9e"
+                    opacity = 0.45
+                else:
+                    name = f"Cluster {int(lab)} ({int(np.sum(m))})"
+                    color = palette[i % len(palette)]
+                    opacity = 0.85
+                text = [
+                    f"cluster={int(lab)}<br>track={int(t)}<br>n={int(n)}<br>z={zz:.2f}"
+                    for t, n, zz in zip(tid[m], nloc[m], z[m])
+                ]
+                fig.add_trace(
+                    go.Scatter(
+                        x=x[m],
+                        y=y[m],
+                        mode="markers",
+                        name=name,
+                        marker=dict(size=7, color=color, opacity=opacity),
+                        text=text,
+                        hovertemplate="%{text}<extra></extra>",
+                    )
+                )
+
+        finite = np.isfinite(x) & np.isfinite(y)
+        xf = x[finite]
+        yf = y[finite]
+        if len(xf) > 0 and len(yf) > 0:
+            xmin, xmax = float(np.min(xf)), float(np.max(xf))
+            ymin, ymax = float(np.min(yf)), float(np.max(yf))
+            dx = xmax - xmin
+            dy = ymax - ymin
+            pad_x = 0.05 * dx if dx > 0 else 5.0
+            pad_y = 0.05 * dy if dy > 0 else 5.0
+            fig.update_xaxes(range=[xmin - pad_x, xmax + pad_x], autorange=False)
+            fig.update_yaxes(range=[ymin - pad_y, ymax + pad_y], autorange=False)
+
+        # Diagnostics for render path
+        n_traces = len(fig.data)
+        n_points = int(len(x))
+        self._append_log(f"- plotting traces: {n_traces}, points: {n_points}")
+
+        fig.update_layout(
+            title=title,
+            xaxis_title="x (nm)",
+            yaxis_title="y (nm)",
+            legend_title="Label",
+            dragmode="pan",
+        )
+        apply_plot_theme(fig, is3d=False)
+        fig.update_layout(
+            title=dict(text=title, y=0.96, yanchor="top"),
+            margin=dict(l=0, r=0, t=64, b=0),
+        )
+        fig.update_yaxes(scaleanchor="x", scaleratio=1)
+
+        # Use plain Plotly HTML rendering in DBSCAN window to avoid sync/scalebar
+        # side effects that can hide markers in this panel.
+        html = pio.to_html(
+            fig,
+            include_plotlyjs="cdn",
+            full_html=False,
+            config={"scrollZoom": True, "displaylogo": False, "responsive": True},
+        )
+        self.view.web.setHtml(html, QUrl("about:blank"))
+
+    def load_base(self, base: str):
+        arr = self._selected_arr(base)
+        self._current_base = base
+        self._current_arr = arr
+        self._labels = None
+
+        if arr is None:
+            self._tracks_df = pd.DataFrame(columns=["track_id", "centroid_x", "centroid_y", "centroid_z", "n_localizations"])
+            self._append_log(f"Loaded: {base}")
+            self._append_log("No in-memory filtered/cropped data for this file yet. Run the file in main window first.")
+            fig = go.Figure()
+            fig.update_layout(
+                annotations=[dict(text="No loaded data for selected file", x=0.5, y=0.5, showarrow=False)]
+            )
+            apply_plot_theme(fig, is3d=False)
+            self.view.update_fig(fig, reset_view=True, is3d=False)
+            return
+
+        self._tracks_df = self._avg_tracks_df(arr)
+        self._append_log(f"Loaded: {base}")
+
+        n_locs = int(len(arr)) if arr is not None else 0
+        n_tracks = int(len(self._tracks_df))
+        self._append_log(f"Localizations: {n_locs}, avg loc tracks: {n_tracks}")
+        self.run_diagnostics()
+
+        self._plot_tracks(self._tracks_df, labels=None, title=f"{base} - avg loc (tid)")
+
+    def run_diagnostics(self):
+        if not self._current_base:
+            self._append_log("Diagnostics: no file selected")
+            return
+
+        arr = self._current_arr
+        self._append_log(f"Diagnostics for: {self._current_base}")
+        if arr is None:
+            self._append_log("- arr: None")
+            return
+
+        self._append_log(f"- arr length: {len(arr)}")
+        names = list(arr.dtype.names) if arr.dtype.names is not None else []
+        self._append_log(f"- fields: {names}")
+
+        if "loc" in names:
+            loc = np.asarray(arr["loc"])
+            self._append_log(f"- loc shape: {tuple(loc.shape)}")
+            try:
+                lf = np.asarray(loc, dtype=float)
+                if lf.ndim == 2 and lf.shape[1] >= 2:
+                    fx = np.isfinite(lf[:, 0])
+                    fy = np.isfinite(lf[:, 1])
+                    fxy = fx & fy
+                    self._append_log(f"- finite x/y: {int(np.sum(fxy))}/{len(lf)}")
+            except Exception:
+                pass
+
+        try:
+            xyz, _vals, tids_plot = scatter_points_and_color(arr, avg_tid=True)
+            if xyz is None:
+                self._append_log("- scatter_points_and_color(avg_tid=True): no data")
+                return
+
+            xyz = np.asarray(xyz, dtype=float)
+            tids_plot = np.asarray(tids_plot)
+            self._append_log(f"- avg xyz shape: {tuple(xyz.shape)}, tids: {len(tids_plot)}")
+
+            if xyz.ndim == 2 and xyz.shape[1] >= 2 and len(xyz) > 0:
+                x = xyz[:, 0]
+                y = xyz[:, 1]
+                z = xyz[:, 2] if xyz.shape[1] >= 3 else np.zeros(len(x), dtype=float)
+                finite = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
+                self._append_log(f"- finite avg points: {int(np.sum(finite))}/{len(xyz)}")
+                if np.any(finite):
+                    xf = x[finite]
+                    yf = y[finite]
+                    zf = z[finite]
+                    self._append_log(
+                        f"- x range: [{float(np.min(xf)):.3f}, {float(np.max(xf)):.3f}], "
+                        f"y range: [{float(np.min(yf)):.3f}, {float(np.max(yf)):.3f}], "
+                        f"z range: [{float(np.min(zf)):.3f}, {float(np.max(zf)):.3f}]"
+                    )
+        except Exception as exc:
+            self._append_log(f"- diagnostics error: {exc}")
+
+    def refresh_current_plot(self):
+        if not self._current_base:
+            return
+        self.load_base(self._current_base)
+
+    def run_dbscan(self):
+        if self._tracks_df is None or len(self._tracks_df) == 0:
+            self._append_log("No data for DBSCAN.")
+            return
+
+        eps = float(self.eps_spin.value())
+        min_samples = int(self.min_samples_spin.value())
+        use_2d = self.dimension_combo.currentText().startswith("2D")
+
+        self._append_log("running dbscan...")
+        if use_2d:
+            points = self._tracks_df[["centroid_x", "centroid_y"]].to_numpy(dtype=float)
+            dim_label = "2D"
+        else:
+            points = self._tracks_df[["centroid_x", "centroid_y", "centroid_z"]].to_numpy(dtype=float)
+            dim_label = "3D"
+
+        labels = dbscan_numpy(points, eps=eps, min_samples=min_samples)
+        self._labels = labels
+
+        n_noise = int(np.sum(labels == -1))
+        cluster_ids = sorted([int(cid) for cid in np.unique(labels) if int(cid) != -1])
+
+        self._append_log(f"DBSCAN finished with eps={eps}, min_samples={min_samples}, mode={dim_label}")
+        self._append_log(f"Clusters found: {len(cluster_ids)}")
+        self._append_log(f"Noise points: {n_noise} / {len(labels)}")
+        for cid in cluster_ids:
+            self._append_log(f"  Cluster {cid}: {int(np.sum(labels == cid))} points")
+
+        self._plot_tracks(
+            self._tracks_df,
+            labels=labels,
+            title=f"DBSCAN ({self._current_base}) - eps={eps}, min_samples={min_samples}",
+        )
+
+    def save_dbscan(self):
+        if not self._current_base or self._current_arr is None:
+            QtWidgets.QMessageBox.warning(self, "Save DBSCAN", "Load a file first.")
+            return
+        if self._tracks_df is None or len(self._tracks_df) == 0:
+            QtWidgets.QMessageBox.warning(self, "Save DBSCAN", "No avg loc (tid) data to save.")
+            return
+        if self._labels is None:
+            QtWidgets.QMessageBox.warning(self, "Save DBSCAN", "Run DBSCAN first.")
+            return
+
+        save_folder = self._mw.out_edit.text().strip()
+        if not save_folder:
+            QtWidgets.QMessageBox.critical(self, "Save DBSCAN", "Please set an output folder in the main window.")
+            return
+        os.makedirs(save_folder, exist_ok=True)
+
+        eps = float(self.eps_spin.value())
+        min_samples = int(self.min_samples_spin.value())
+        use_2d = self.dimension_combo.currentText().startswith("2D")
+        dim = "2D" if use_2d else "3D"
+        eps_token = f"{eps:.3f}".rstrip("0").rstrip(".").replace(".", "p")
+        stem = f"dbscan_{dim.lower()}_eps{eps_token}_min{min_samples}"
+        base_prefix = f"{self._current_base}_{stem}"
+
+        labels = np.asarray(self._labels, dtype=int)
+        tracks = self._tracks_df.copy()
+        tracks["cluster_id"] = labels
+
+        tracks_out = tracks[["track_id", "centroid_x", "centroid_y", "centroid_z", "n_localizations", "cluster_id"]]
+        tracks_path = os.path.join(save_folder, f"{base_prefix}_tracks_clustered.csv")
+        tracks_out.to_csv(tracks_path, index=False)
+
+        # propagate track labels back to all localizations
+        arr = self._current_arr
+        tid = np.asarray(arr["tid"]).astype(int) if "tid" in arr.dtype.names else np.array([], dtype=int)
+        loc = np.asarray(arr["loc"], dtype=float) if "loc" in arr.dtype.names else np.zeros((0, 3), dtype=float)
+        if loc.ndim != 2:
+            loc = np.zeros((len(tid), 3), dtype=float)
+        n = len(arr)
+
+        x = loc[:, 0] if loc.shape[1] >= 1 else np.full(n, np.nan)
+        y = loc[:, 1] if loc.shape[1] >= 2 else np.full(n, np.nan)
+        z = loc[:, 2] if loc.shape[1] >= 3 else np.full(n, np.nan)
+
+        if "tim" in arr.dtype.names:
+            t = np.asarray(arr["tim"], dtype=float)
+        else:
+            t = np.arange(n, dtype=float)
+
+        tid_to_cluster = {int(r.track_id): int(r.cluster_id) for r in tracks_out.itertuples(index=False)}
+        loc_cluster = np.array([tid_to_cluster.get(int(tr), -1) for tr in tid], dtype=int)
+
+        loc_df = pd.DataFrame(
+            {
+                "loc_id": np.arange(n, dtype=int),
+                "x": x,
+                "y": y,
+                "z": z,
+                "t": t,
+                "track_id": tid,
+                "cluster_id": loc_cluster,
+            }
+        )
+        loc_path = os.path.join(save_folder, f"{base_prefix}_localizations_clustered.csv")
+        loc_df.to_csv(loc_path, index=False)
+
+        # cluster summary
+        cl_rows = []
+        for cid in sorted(int(c) for c in np.unique(labels) if int(c) >= 0):
+            m = labels == cid
+            trk = tracks_out.loc[m]
+            if len(trk) == 0:
+                continue
+
+            cxyz = trk[["centroid_x", "centroid_y", "centroid_z"]].to_numpy(dtype=float)
+            center = np.nanmean(cxyz, axis=0)
+            d = np.sqrt(np.sum((cxyz - center[None, :]) ** 2, axis=1))
+            radius = float(np.nanmean(d)) if len(d) else float("nan")
+
+            cl_rows.append(
+                {
+                    "cluster_id": int(cid),
+                    "n_tracks": int(len(trk)),
+                    "n_localizations": int(np.sum(trk["n_localizations"].to_numpy(dtype=int))),
+                    "centroid_x": float(center[0]),
+                    "centroid_y": float(center[1]),
+                    "centroid_z": float(center[2]),
+                    "radius_estimate": radius,
+                }
+            )
+
+        cluster_summary_df = pd.DataFrame(
+            cl_rows,
+            columns=[
+                "cluster_id",
+                "n_tracks",
+                "n_localizations",
+                "centroid_x",
+                "centroid_y",
+                "centroid_z",
+                "radius_estimate",
+            ],
+        )
+        summary_path = os.path.join(save_folder, f"{base_prefix}_cluster_summary.csv")
+        cluster_summary_df.to_csv(summary_path, index=False)
+
+        params = {
+            "eps_nm": eps,
+            "min_samples": min_samples,
+            "dimension": dim,
+            "clustering_level": "track_centroids",
+            "centroid_definition": "mean_xyz",
+            "source_file": self._current_base,
+            "n_tracks": int(len(tracks_out)),
+            "n_localizations": int(len(loc_df)),
+        }
+        params_path = os.path.join(save_folder, f"{base_prefix}_dbscan_params.json")
+        with open(params_path, "w", encoding="utf-8") as f:
+            json.dump(params, f, indent=2)
+
+        self._append_log(f"Saved: {os.path.basename(tracks_path)}")
+        self._append_log(f"Saved: {os.path.basename(loc_path)}")
+        self._append_log(f"Saved: {os.path.basename(summary_path)}")
+        self._append_log(f"Saved: {os.path.basename(params_path)}")
+        self._append_log(f"Output folder: {save_folder}")
+
+        QtWidgets.QMessageBox.information(self, "Save DBSCAN", "DBSCAN outputs saved.")
+
 class PlotSyncBridge(QtCore.QObject):
     viewChanged = Signal(str, object)  # (source_id, payload dict)
     selectionChanged = Signal(str, object)  # (source_id, payload dict)
@@ -2962,10 +3661,6 @@ class MultiColorWindow(QtWidgets.QMainWindow):
         self._reset_crop_btn.setFixedHeight(24)
         self._reset_crop_btn.setMaximumWidth(110)
         self._reset_crop_btn.raise_()
-
-        self._sync_chk = QtWidgets.QCheckBox("Synch", central)
-        self._sync_chk.setChecked(True)
-        self._sync_chk.raise_()
 
         self._export_btn = QtWidgets.QPushButton("Export (SVG/PDF)", central)
         self._export_btn.clicked.connect(self._export_current)
@@ -3061,26 +3756,21 @@ class MultiColorWindow(QtWidgets.QMainWindow):
             hasattr(self, "_export_btn") and self._export_btn is not None
             and hasattr(self, "_crop_btn") and self._crop_btn is not None
             and hasattr(self, "_reset_crop_btn") and self._reset_crop_btn is not None
-            and hasattr(self, "_sync_chk") and self._sync_chk is not None
         ):
             m = 12  # margin from edges
             gap = 8
             btn_exp = self._export_btn
             btn_crop = self._crop_btn
             btn_reset = self._reset_crop_btn
-            chk_sync = self._sync_chk
             btn_exp.adjustSize()
             btn_crop.adjustSize()
             btn_reset.adjustSize()
-            chk_sync.adjustSize()
             y = self.centralWidget().height() - btn_exp.height() - m
             x_exp = self.centralWidget().width() - btn_exp.width() - m
-            x_sync = x_exp - chk_sync.width() - gap
-            x_reset = x_sync - btn_reset.width() - gap
+            x_reset = x_exp - btn_reset.width() - gap
             x_crop = x_reset - btn_crop.width() - gap
             btn_crop.move(x_crop, y)
             btn_reset.move(x_reset, y)
-            chk_sync.move(x_sync, y + max(0, (btn_exp.height() - chk_sync.height()) // 2))
             btn_exp.move(x_exp, y)
 
     def _on_plot_selection(self, _source_id, payload):
@@ -3123,10 +3813,7 @@ class MultiColorWindow(QtWidgets.QMainWindow):
         self._on_reset_crop_requested()
 
     def grid_sync_enabled(self) -> bool:
-        chk = getattr(self, "_sync_chk", None)
-        if chk is None:
-            return True
-        return bool(chk.isChecked())
+        return False
 
     def update_merged(self, fig, reset_view=False, is3d=False, scalebar_nm=100.0):
         self.merged_view.update_fig(fig, reset_view=reset_view, is3d=is3d, scalebar_nm=scalebar_nm)
@@ -3870,6 +4557,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setCentralWidget(central)
         root = QtWidgets.QVBoxLayout(central)
         self._binning_win = None
+        self._dbscan_win = None
 
         # ---- top area: controls + output ----
         top = QtWidgets.QHBoxLayout()
@@ -3977,7 +4665,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         right_controls.addLayout(row)
 
-        # --- Binning button (standalone, above multicolor section) ---
+        # --- Binning + DBSCAN buttons (above multicolor section) ---
         VIEWER_W = 150
         BTN_H = 34
 
@@ -3985,10 +4673,25 @@ class MainWindow(QtWidgets.QMainWindow):
             b.setFixedHeight(BTN_H)
             b.setFixedWidth(w)
 
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.setContentsMargins(0, 0, 0, 0)
+        btn_row.setSpacing(6)
+
+        half_w = (VIEWER_W - btn_row.spacing()) // 2
+
         self.binning_btn = QtWidgets.QPushButton("Binning")
         self.binning_btn.clicked.connect(self.open_binning_window)
-        tune_btn(self.binning_btn, VIEWER_W)
-        right_controls.addWidget(self.binning_btn, 0, Qt.AlignHCenter)
+        tune_btn(self.binning_btn, half_w)
+        btn_row.addWidget(self.binning_btn)
+
+        self.dbscan_btn = QtWidgets.QPushButton("DBSCAN")
+        self.dbscan_btn.clicked.connect(self.open_dbscan_window)
+        tune_btn(self.dbscan_btn, half_w)
+        btn_row.addWidget(self.dbscan_btn)
+
+        btn_wrap = QtWidgets.QWidget()
+        btn_wrap.setLayout(btn_row)
+        right_controls.addWidget(btn_wrap, 0, Qt.AlignHCenter)
 
         # --- Multicolor section (divider + controls) ---
         mc = QtWidgets.QWidget()
@@ -4203,6 +4906,17 @@ class MainWindow(QtWidgets.QMainWindow):
             self._binning_win.show()
             self._binning_win.raise_()
             self._binning_win.activateWindow()
+
+    def open_dbscan_window(self):
+            if self._dbscan_win is None:
+                self._dbscan_win = DBSCANWindow(self, self)
+
+            bases = self._dbscan_available_bases()
+            self._dbscan_win.rebuild(bases)
+
+            self._dbscan_win.show()
+            self._dbscan_win.raise_()
+            self._dbscan_win.activateWindow()
 
     def _on_plotly_load_finished(self, ok: bool):
         self._plotly_ready = bool(ok)
@@ -4540,6 +5254,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._multicolor_crop_bounds = (xmin, xmax, ymin, ymax)
         self._recompute_multicolor_crop_cache()
         self._refresh_multicolor_contents(reset_view=True)
+        if self._dbscan_win is not None and self._dbscan_win.isVisible():
+            self._dbscan_win.refresh_current_plot()
 
         n = int(sum(len(v) for v in self._multicolor_cropped_by_base.values() if v is not None))
         self.statusBar().showMessage(f"Multicolor crop applied: x=[{xmin:.2f}, {xmax:.2f}], y=[{ymin:.2f}, {ymax:.2f}], kept {n} locs")
@@ -4550,6 +5266,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._multicolor_crop_bounds = None
         self._multicolor_cropped_by_base.clear()
         self._refresh_multicolor_contents(reset_view=True)
+        if self._dbscan_win is not None and self._dbscan_win.isVisible():
+            self._dbscan_win.refresh_current_plot()
         self.statusBar().showMessage("Multicolor crop reset")
 
     def _recompute_multicolor_crop_cache(self):
@@ -4587,31 +5305,8 @@ class MainWindow(QtWidgets.QMainWindow):
         return self._get_arr_for_base(base)
 
     def on_any_plot_view_changed(self, source_id, payload):
-        if isinstance(payload, dict) and payload.get("mode") == "3d" and "camera" in payload:
-            payload = dict(payload)
-            payload["camera"] = _camera_slim(payload["camera"])
-
-        sync_grid = True
-        if self._multicolor_win is not None and self._multicolor_win.isVisible():
-            if self._multicolor_win.mode() == "grid":
-                sync_grid = bool(self._multicolor_win.grid_sync_enabled())
-
-        # main plot
-        if hasattr(self, "plot_view") and self.plot_view._id != source_id:
-            self.plot_view.apply_view(payload)
-
-        # multicolor
-        if self._multicolor_win is not None and self._multicolor_win.isVisible():
-            # merged view
-            if self._multicolor_win.merged_view._id != source_id:
-                self._multicolor_win.merged_view.apply_view(payload)
-
-            # grid views
-            if sync_grid:
-                for base, view in self._multicolor_win._views.items():
-                    if view._id == source_id:
-                        continue
-                    view.apply_view(payload)
+        # Synchronization intentionally disabled: each viewer keeps independent view state.
+        return
 
     def _multicolor_update_base(self, base, reset_view=False):
         if self._multicolor_win is None or not self._multicolor_win.isVisible():
@@ -4634,6 +5329,33 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         bases = [os.path.splitext(os.path.basename(f))[0] for f in self._all_files]
         self._multicolor_win.rebuild(bases)
+
+    def _dbscan_rebuild_if_open(self):
+        if self._dbscan_win is None or not self._dbscan_win.isVisible():
+            return
+        bases = self._dbscan_available_bases()
+        self._dbscan_win.rebuild(bases)
+
+    def _dbscan_available_bases(self):
+        # Match multicolor loading behavior: include bases that currently resolve
+        # to an array through _get_multicolor_arr_for_base/_get_arr_for_base.
+        ordered_all = [os.path.splitext(os.path.basename(f))[0] for f in self._all_files]
+
+        if getattr(self, "_multicolor_crop_bounds", None):
+            self._recompute_multicolor_crop_cache()
+
+        available = []
+        for b in ordered_all:
+            arr = self._get_multicolor_arr_for_base(b)
+            if arr is None:
+                arr = self._get_arr_for_base(b)
+            if arr is not None:
+                available.append(b)
+
+        if available:
+            return available
+
+        return ordered_all
 
     def update_plotly_fig(self, fig, reset_view=False):
         self.plot_view.update_fig(
@@ -4682,6 +5404,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._binning_win.close()
         except Exception:
             pass
+        try:
+            if getattr(self, "_dbscan_win", None) is not None:
+                self._dbscan_win.close()
+        except Exception:
+            pass
 
         event.accept()
         QtCore.QTimer.singleShot(1000, lambda: os._exit(0))
@@ -4717,6 +5444,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.file_combo.addItem(os.path.relpath(f, data_path))
         self.file_combo.blockSignals(False)
         self._multicolor_rebuild_if_open()
+        self._dbscan_rebuild_if_open()
 
         self._current_index = 0 if self._all_files else -1
         if self._all_files:
@@ -4813,6 +5541,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.redraw_scatter(reset_view=reset_view)
             self._refresh_multicolor_contents(reset_view=False)
             self._update_output_for_base(base, arr_filt, int(np.count_nonzero(mask)))
+            if self._dbscan_win is not None and self._dbscan_win.isVisible():
+                self._dbscan_win.refresh_current_plot()
 
     def run_start(self):
         data_path = self.data_edit.text().strip()
@@ -5124,6 +5854,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._apply_mbm_alignment()
         if self._binning_win is not None and self._binning_win.isVisible():
             self._binning_win.refresh_plot()
+        if self._dbscan_win is not None and self._dbscan_win.isVisible():
+            self._dbscan_win.refresh_current_plot()
 
     def reset_filter(self):
         if self._current_ctx is None:
@@ -5174,6 +5906,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._apply_mbm_alignment()
         if self._binning_win is not None and self._binning_win.isVisible():
             self._binning_win.refresh_plot()
+        if self._dbscan_win is not None and self._dbscan_win.isVisible():
+            self._dbscan_win.refresh_current_plot()
 
     def on_mbm_align_toggled(self, state):
         enabled = (state == Qt.Checked)
@@ -5334,6 +6068,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_multicolor_contents(reset_view=False)
         if self._binning_win is not None and self._binning_win.isVisible():
             self._binning_win.refresh_plot()
+        if self._dbscan_win is not None and self._dbscan_win.isVisible():
+            self._dbscan_win.refresh_current_plot()
 
     def _save_mbm_alignment_bead_plots(self, src_base: str, mov_base: str, diagnostics: dict, T=None):
         if not isinstance(diagnostics, dict):
@@ -5433,6 +6169,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # NEW: refresh binning window too
         if self._binning_win is not None and self._binning_win.isVisible():
             self._binning_win.refresh_plot(keep_view=True)
+        if self._dbscan_win is not None and self._dbscan_win.isVisible():
+            self._dbscan_win.refresh_current_plot()
 
     # ---------------- output / done ----------------
     def set_output(self, items):
