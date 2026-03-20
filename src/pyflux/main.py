@@ -479,6 +479,8 @@ def make_plotly_fig(arr, avg_tid: bool, is3d: bool, color_settings: dict = None,
 
     fig = go.Figure([trace])
 
+    has_colorbar_2d = False
+
     # Keep your functional layout bits separate from theme
     if is3d:
         fig.update_layout(
@@ -493,6 +495,14 @@ def make_plotly_fig(arr, avg_tid: bool, is3d: bool, color_settings: dict = None,
         fig.update_layout(dragmode="pan")
         fig.layout.margin.autoexpand = False
 
+        # Track whether this 2D trace uses a colorbar.
+        try:
+            mk = fig.data[0].marker if len(fig.data) > 0 else None
+            if mk is not None and bool(getattr(mk, "showscale", False)):
+                has_colorbar_2d = True
+        except Exception:
+            pass
+
         # Equal aspect ratio if non-degenerate
         dx = float(np.nanmax(x) - np.nanmin(x)) if len(x) else 0.0
         dy = float(np.nanmax(y) - np.nanmin(y)) if len(y) else 0.0
@@ -500,6 +510,10 @@ def make_plotly_fig(arr, avg_tid: bool, is3d: bool, color_settings: dict = None,
             fig.update_yaxes(scaleanchor="x", scaleratio=1)
 
     apply_plot_theme(fig, is3d=is3d)
+    if has_colorbar_2d:
+        fig.update_layout(margin=dict(l=0, r=120, t=20, b=0))
+    if not is3d:
+        add_scalebar_2d(fig, length_nm=float(scalebar_nm))
     return fig
 
 
@@ -515,6 +529,7 @@ def make_plotly_fig_merged(arr_by_base: dict, avg_tid: bool, is3d: bool, color_s
       size: int
     """
     traces = []
+    entries = []
 
     bases = list(arr_by_base.keys())
     if not bases:
@@ -547,16 +562,52 @@ def make_plotly_fig_merged(arr_by_base: dict, avg_tid: bool, is3d: bool, color_s
                 "size": cs.get("size", DEFAULT_SIZE_2D),
             }
 
+        entries.append((base, arr, cs))
+
+    # For merged depth mode, force one shared colorscale range across all datasets.
+    global_depth_min = None
+    global_depth_max = None
+    for _base, arr, cs in entries:
+        if cs.get("mode", DEFAULT_MODE) != MODE_DEPTH:
+            continue
+        xyz, _vals, _tids = scatter_points_and_color(arr, avg_tid)
+        if xyz is None or len(xyz) == 0:
+            continue
+        xyz = np.asarray(xyz, dtype=float)
+        if xyz.ndim != 2 or xyz.shape[1] < 3:
+            continue
+        z = xyz[:, 2]
+        z = z[np.isfinite(z)]
+        if len(z) == 0:
+            continue
+        zmin = float(np.min(z))
+        zmax = float(np.max(z))
+        global_depth_min = zmin if global_depth_min is None else min(global_depth_min, zmin)
+        global_depth_max = zmax if global_depth_max is None else max(global_depth_max, zmax)
+
+    colorbar_drawn = False
+    for base, arr, cs in entries:
+        cs_local = dict(cs)
+        mode = cs_local.get("mode", DEFAULT_MODE)
+        if mode == MODE_DEPTH and global_depth_min is not None and global_depth_max is not None:
+            cs_local["cmin"] = global_depth_min
+            cs_local["cmax"] = global_depth_max
+
+        needs_colorbar = mode in {MODE_DEPTH, MODE_E2E}
+        show_colorbar = needs_colorbar and (not colorbar_drawn)
+
         tr = make_trace_for_arr(
             arr,
             avg_tid=avg_tid,
             is3d=is3d,
-            color_settings=cs,
+            color_settings=cs_local,
             name=base,
-            show_colorbar=True,  # NOTE: can cause overlapping bars if many traces have a colorbar
+            show_colorbar=show_colorbar,
         )
         if tr is not None:
             traces.append(tr)
+            if show_colorbar:
+                colorbar_drawn = True
 
     if not traces:
         fig = go.Figure()
@@ -565,6 +616,42 @@ def make_plotly_fig_merged(arr_by_base: dict, avg_tid: bool, is3d: bool, color_s
         return fig
 
     fig = go.Figure(traces)
+
+    # Robust fallback: guarantee one visible colorbar for merged numeric colorscale traces.
+    if not is3d:
+        scale_owner = None
+        for tr in fig.data:
+            mk = getattr(tr, "marker", None)
+            if mk is None:
+                continue
+            if getattr(mk, "colorscale", None) is None:
+                continue
+            try:
+                c = np.asarray(getattr(mk, "color", []), dtype=float)
+            except Exception:
+                continue
+            if c.size == 0 or not np.any(np.isfinite(c)):
+                continue
+            scale_owner = tr
+            break
+
+        if scale_owner is not None:
+            for tr in fig.data:
+                mk = getattr(tr, "marker", None)
+                if mk is None or getattr(mk, "colorscale", None) is None:
+                    continue
+                mk.showscale = bool(tr is scale_owner)
+                if tr is scale_owner:
+                    title_text = "z"
+                    try:
+                        cb = getattr(mk, "colorbar", None)
+                        if cb is not None and getattr(cb, "title", None) is not None:
+                            t = getattr(cb.title, "text", None)
+                            if isinstance(t, str) and t.strip():
+                                title_text = t.strip()
+                    except Exception:
+                        pass
+                    mk.colorbar = dict(title=title_text, x=1.0, xanchor="left", len=0.9, thickness=16)
 
     # Functional layout bits (legend placement, pan, aspect)
     if is3d:
@@ -618,6 +705,11 @@ def make_plotly_fig_merged(arr_by_base: dict, avg_tid: bool, is3d: bool, color_s
             pass
 
     apply_plot_theme(fig, is3d=is3d)
+    if colorbar_drawn:
+        # Reserve space so a merged-mode colorbar is not clipped.
+        fig.update_layout(margin=dict(l=0, r=120, t=20, b=0))
+    if not is3d:
+        add_scalebar_2d(fig, length_nm=float(scalebar_nm))
     return fig
 
 def pointcloud_to_image(x_nm, y_nm, pixel_size_nm=4.0, padding_nm=0.0):
@@ -1181,8 +1273,13 @@ def make_trace_for_arr(arr, avg_tid: bool, is3d: bool, color_settings: dict, nam
             colorscale=lut,
             showscale=bool(show_colorbar),
         )
+        cmin = cs.get("cmin", None)
+        cmax = cs.get("cmax", None)
+        if cmin is not None and cmax is not None:
+            marker["cmin"] = float(cmin)
+            marker["cmax"] = float(cmax)
         if show_colorbar:
-            marker["colorbar"] = dict(title="z")
+            marker["colorbar"] = dict(title="z", x=1.0, xanchor="left", len=0.9, thickness=16)
 
     elif mode == "tid":
         # one color per point based on its tid (deterministic random)
@@ -1211,7 +1308,7 @@ def make_trace_for_arr(arr, avg_tid: bool, is3d: bool, color_settings: dict, nam
             showscale=bool(show_colorbar),
         )
         if show_colorbar:
-            marker["colorbar"] = dict(title="end-to-end")
+            marker["colorbar"] = dict(title="end-to-end", x=1.0, xanchor="left", len=0.9, thickness=16)
 
     # --- traces ---
     if is3d:
@@ -1348,8 +1445,15 @@ def add_scalebar_2d(fig: go.Figure, length_nm: float = 100.0):
     x1 = x0 + float(length_nm)
 
     # remove previous scalebar (if any)
-    fig.layout.shapes = tuple(s for s in (fig.layout.shapes or []) if s.get("name") != "scalebar")
-    fig.layout.annotations = tuple(a for a in (fig.layout.annotations or []) if a.get("name") != "scalebar_label")
+    def _obj_name(obj):
+        if obj is None:
+            return None
+        if isinstance(obj, dict):
+            return obj.get("name")
+        return getattr(obj, "name", None)
+
+    fig.layout.shapes = tuple(s for s in (fig.layout.shapes or []) if _obj_name(s) != "scalebar")
+    fig.layout.annotations = tuple(a for a in (fig.layout.annotations or []) if _obj_name(a) != "scalebar_label")
 
     # add line
     fig.add_shape(
@@ -3051,6 +3155,9 @@ class DBSCANWindow(QtWidgets.QMainWindow):
         self.files_scroll.setWidgetResizable(True)
         self.files_scroll.setMinimumWidth(300)
         self.files_scroll.setMaximumWidth(360)
+        self.files_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.files_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.files_scroll.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
 
         self.files_container = QtWidgets.QWidget()
         self.files_layout = QtWidgets.QVBoxLayout(self.files_container)
@@ -3059,7 +3166,29 @@ class DBSCANWindow(QtWidgets.QMainWindow):
         self.files_layout.addStretch(1)
         self.files_scroll.setWidget(self.files_container)
         files_v.addWidget(self.files_scroll, 1)
-        left.addWidget(files_group, 3)
+        left.addWidget(files_group, 0)
+
+        viz_group = QtWidgets.QGroupBox("Visualization")
+        viz_grid = QtWidgets.QGridLayout(viz_group)
+        viz_grid.setContentsMargins(8, 8, 8, 8)
+        viz_grid.setHorizontalSpacing(8)
+        viz_grid.setVerticalSpacing(8)
+
+        viz_grid.addWidget(QtWidgets.QLabel("Mode:"), 0, 0)
+        self.viz_mode_combo = QtWidgets.QComboBox()
+        self.viz_mode_combo.addItems(MODE_CHOICES)
+        self.viz_mode_combo.setCurrentText(DEFAULT_MODE if DEFAULT_MODE in MODE_CHOICES else MODE_CHOICES[0])
+        viz_grid.addWidget(self.viz_mode_combo, 0, 1)
+
+        viz_grid.addWidget(QtWidgets.QLabel("LUT / solid:"), 1, 0)
+        self.viz_palette_combo = QtWidgets.QComboBox()
+        viz_grid.addWidget(self.viz_palette_combo, 1, 1)
+
+        self.viz_mode_combo.currentTextChanged.connect(self._on_viz_mode_changed)
+        self.viz_palette_combo.currentTextChanged.connect(lambda _: self._refresh_tracks_plot())
+        self._fill_viz_palette_for_mode(self.viz_mode_combo.currentText())
+
+        left.addWidget(viz_group, 0)
 
         # Add clear visual separation between file list and DBSCAN action controls.
         left.addSpacing(14)
@@ -3086,8 +3215,9 @@ class DBSCANWindow(QtWidgets.QMainWindow):
 
         params_grid.addWidget(QtWidgets.QLabel("Clustering mode:"), 2, 0)
         self.dimension_combo = QtWidgets.QComboBox()
-        self.dimension_combo.addItems(["3D (x,y,z)", "2D (x,y)"])
+        self.dimension_combo.addItems(["2D (x,y)", "3D (x,y,z)"])
         self.dimension_combo.setCurrentIndex(0)
+        self.dimension_combo.currentTextChanged.connect(lambda _: self._refresh_tracks_plot())
         params_grid.addWidget(self.dimension_combo, 2, 1)
 
         self.run_btn = QtWidgets.QPushButton("Run DBSCAN")
@@ -3136,6 +3266,94 @@ class DBSCANWindow(QtWidgets.QMainWindow):
     def _append_log(self, text: str):
         self.log_text.appendPlainText(str(text))
 
+    def _is_3d_mode(self) -> bool:
+        return self.dimension_combo.currentText().startswith("3D")
+
+    def _on_viz_mode_changed(self, mode: str):
+        self._fill_viz_palette_for_mode(mode)
+        self._refresh_tracks_plot()
+
+    def _fill_viz_palette_for_mode(self, mode: str):
+        self.viz_palette_combo.blockSignals(True)
+        previous = self.viz_palette_combo.currentText()
+        self.viz_palette_combo.clear()
+
+        if mode == MODE_SOLID:
+            self.viz_palette_combo.addItems(SOLID_COLOR_CHOICES)
+            fallback = DEFAULT_SOLID if DEFAULT_SOLID in SOLID_COLOR_CHOICES else SOLID_COLOR_CHOICES[0]
+        elif mode == MODE_TID:
+            self.viz_palette_combo.addItem("—")
+            fallback = "—"
+        else:
+            self.viz_palette_combo.addItems(LUT_CHOICES)
+            fallback = DEFAULT_LUT if DEFAULT_LUT in LUT_CHOICES else LUT_CHOICES[0]
+
+        target = previous if self.viz_palette_combo.findText(previous) >= 0 else fallback
+        self.viz_palette_combo.setCurrentText(target)
+        self.viz_palette_combo.setEnabled(mode != MODE_TID)
+        self.viz_palette_combo.blockSignals(False)
+
+    def _current_viz_settings(self) -> dict:
+        mode = self.viz_mode_combo.currentText()
+        if mode not in MODE_CHOICES:
+            mode = DEFAULT_MODE
+
+        palette = self.viz_palette_combo.currentText()
+        lut = palette if palette in LUT_CHOICES else DEFAULT_LUT
+        solid = palette if palette in SOLID_COLOR_CHOICES else DEFAULT_SOLID
+
+        return {
+            "mode": mode,
+            "lut": lut,
+            "solid": solid,
+            "alpha": 0.9,
+            "size": 7,
+        }
+
+    def _track_end_to_end_by_tid(self) -> dict:
+        arr = self._current_arr
+        if arr is None or len(arr) == 0 or arr.dtype.names is None:
+            return {}
+        if "tid" not in arr.dtype.names or "loc" not in arr.dtype.names:
+            return {}
+
+        tids_all = np.asarray(arr["tid"])
+        locs = np.asarray(arr["loc"], dtype=float)
+        if locs.ndim != 2 or locs.shape[1] < 2:
+            return {}
+
+        out = {}
+        for tid in np.unique(tids_all):
+            pts = locs[tids_all == tid]
+            if len(pts) < 2:
+                out[int(tid)] = 0.0
+            else:
+                d = pts[-1] - pts[0]
+                out[int(tid)] = float(np.sqrt(np.sum(d * d)))
+        return out
+
+    def _refresh_tracks_plot(self):
+        if self._tracks_df is None:
+            return
+        self._plot_tracks(self._tracks_df, labels=self._labels, title=self._current_plot_title())
+
+    def _current_plot_title(self) -> str:
+        if self._current_base is None:
+            return "DBSCAN"
+        if self._labels is None:
+            return f"{self._current_base} - avg loc (tid)"
+        eps = float(self.eps_spin.value())
+        min_samples = int(self.min_samples_spin.value())
+        return f"DBSCAN ({self._current_base}) - eps={eps}, min_samples={min_samples}"
+
+    def _update_files_scroll_height(self, n_files: int):
+        visible_rows = min(max(int(n_files), 1), 4)
+        row_h = 38
+        spacing = self.files_layout.spacing()
+        margins = self.files_layout.contentsMargins()
+        fixed_h = margins.top() + margins.bottom() + (visible_rows * row_h) + (max(0, visible_rows - 1) * spacing) + 4
+        self.files_scroll.setFixedHeight(fixed_h)
+
     def rebuild(self, base_names):
         self._base_buttons.clear()
 
@@ -3151,6 +3369,7 @@ class DBSCANWindow(QtWidgets.QMainWindow):
         for base in base_names:
             btn = QtWidgets.QPushButton(base)
             btn.setCheckable(True)
+            btn.setFixedHeight(36)
             btn.setStyleSheet(
                 """
                 QPushButton {
@@ -3171,6 +3390,7 @@ class DBSCANWindow(QtWidgets.QMainWindow):
             self._base_buttons[base] = btn
 
         self.files_layout.addStretch(1)
+        self._update_files_scroll_height(len(base_names))
 
         if self._current_base in self._base_buttons:
             self._base_buttons[self._current_base].setChecked(True)
@@ -3254,14 +3474,24 @@ class DBSCANWindow(QtWidgets.QMainWindow):
 
     def _plot_tracks(self, tracks_df: pd.DataFrame, labels=None, title: str = None):
         fig = go.Figure()
+        is3d = self._is_3d_mode()
         if tracks_df is None or len(tracks_df) == 0:
             fig.update_layout(annotations=[dict(text="No avg loc (tid) data", x=0.5, y=0.5, showarrow=False)])
-            apply_plot_theme(fig, is3d=False)
+            apply_plot_theme(fig, is3d=is3d)
             html = pio.to_html(
                 fig,
                 include_plotlyjs="cdn",
                 full_html=False,
-                config={"scrollZoom": True, "displaylogo": False, "responsive": True},
+                config={
+                    "scrollZoom": True,
+                    "displaylogo": False,
+                    "responsive": True,
+                    "toImageButtonOptions": {
+                        "format": "png",
+                        "filename": "plot",
+                        "scale": 10,
+                    },
+                },
             )
             self.view.web.setHtml(html, QUrl("about:blank"))
             return
@@ -3273,18 +3503,62 @@ class DBSCANWindow(QtWidgets.QMainWindow):
         nloc = tracks_df["n_localizations"].to_numpy(dtype=int)
 
         if labels is None:
+            cs = self._current_viz_settings()
+            mode = cs.get("mode", DEFAULT_MODE)
+            marker = dict(size=7, opacity=0.9)
+
+            if mode == MODE_SOLID:
+                solid = cs.get("solid", DEFAULT_SOLID)
+                marker["color"] = SOLID_COLOR_MAP.get(solid, SOLID_COLOR_MAP[DEFAULT_SOLID])
+            elif mode == MODE_DEPTH:
+                lut = cs.get("lut", DEFAULT_LUT)
+                if lut not in LUT_CHOICES:
+                    lut = DEFAULT_LUT
+                marker["color"] = z
+                marker["colorscale"] = CUSTOM_LUTS.get(lut, lut) if lut.startswith("cu") else lut
+                marker["showscale"] = True
+                marker["colorbar"] = dict(title="z (nm)")
+            elif mode == MODE_E2E:
+                lut = cs.get("lut", DEFAULT_LUT)
+                if lut not in LUT_CHOICES:
+                    lut = DEFAULT_LUT
+                e2e_map = self._track_end_to_end_by_tid()
+                cvals = np.array([e2e_map.get(int(t), 0.0) for t in tid], dtype=float)
+                marker["color"] = cvals
+                marker["colorscale"] = CUSTOM_LUTS.get(lut, lut) if lut.startswith("cu") else lut
+                marker["showscale"] = True
+                marker["colorbar"] = dict(title="end-to-end")
+            else:  # MODE_TID
+                marker["color"] = [tid_to_color(t, alpha=1.0) for t in tid]
+
             text = [f"track={int(t)}<br>n={int(n)}<br>z={zz:.2f}" for t, n, zz in zip(tid, nloc, z)]
-            fig.add_trace(
-                go.Scatter(
-                    x=x,
-                    y=y,
-                    mode="markers",
-                    marker=dict(size=7, color="#4C8BF5", opacity=0.9),
-                    text=text,
-                    hovertemplate="%{text}<extra></extra>",
-                    name="avg loc (tid)",
+            if is3d:
+                fig.add_trace(
+                    go.Scatter3d(
+                        x=x,
+                        y=y,
+                        z=z,
+                        mode="markers",
+                        marker=marker,
+                        text=text,
+                        hovertemplate="%{text}<extra></extra>",
+                        name="avg loc (tid)",
+                        showlegend=False,
+                    )
                 )
-            )
+            else:
+                fig.add_trace(
+                    go.Scatter(
+                        x=x,
+                        y=y,
+                        mode="markers",
+                        marker=marker,
+                        text=text,
+                        hovertemplate="%{text}<extra></extra>",
+                        name="avg loc (tid)",
+                        showlegend=False,
+                    )
+                )
         else:
             labels = np.asarray(labels, dtype=int)
             unique_labels = sorted(np.unique(labels))
@@ -3308,21 +3582,36 @@ class DBSCANWindow(QtWidgets.QMainWindow):
                     f"cluster={int(lab)}<br>track={int(t)}<br>n={int(n)}<br>z={zz:.2f}"
                     for t, n, zz in zip(tid[m], nloc[m], z[m])
                 ]
-                fig.add_trace(
-                    go.Scatter(
-                        x=x[m],
-                        y=y[m],
-                        mode="markers",
-                        name=name,
-                        marker=dict(size=7, color=color, opacity=opacity),
-                        text=text,
-                        hovertemplate="%{text}<extra></extra>",
+                if is3d:
+                    fig.add_trace(
+                        go.Scatter3d(
+                            x=x[m],
+                            y=y[m],
+                            z=z[m],
+                            mode="markers",
+                            name=name,
+                            marker=dict(size=5, color=color, opacity=opacity),
+                            text=text,
+                            hovertemplate="%{text}<extra></extra>",
+                        )
                     )
-                )
+                else:
+                    fig.add_trace(
+                        go.Scatter(
+                            x=x[m],
+                            y=y[m],
+                            mode="markers",
+                            name=name,
+                            marker=dict(size=7, color=color, opacity=opacity),
+                            text=text,
+                            hovertemplate="%{text}<extra></extra>",
+                        )
+                    )
 
         finite = np.isfinite(x) & np.isfinite(y)
         xf = x[finite]
         yf = y[finite]
+        zf = z[finite]
         if len(xf) > 0 and len(yf) > 0:
             xmin, xmax = float(np.min(xf)), float(np.max(xf))
             ymin, ymax = float(np.min(yf)), float(np.max(yf))
@@ -3330,8 +3619,21 @@ class DBSCANWindow(QtWidgets.QMainWindow):
             dy = ymax - ymin
             pad_x = 0.05 * dx if dx > 0 else 5.0
             pad_y = 0.05 * dy if dy > 0 else 5.0
-            fig.update_xaxes(range=[xmin - pad_x, xmax + pad_x], autorange=False)
-            fig.update_yaxes(range=[ymin - pad_y, ymax + pad_y], autorange=False)
+            if is3d:
+                zmin, zmax = float(np.min(zf)), float(np.max(zf))
+                dz = zmax - zmin
+                pad_z = 0.05 * dz if dz > 0 else 5.0
+                fig.update_layout(
+                    scene=dict(
+                        xaxis=dict(range=[xmin - pad_x, xmax + pad_x], autorange=False),
+                        yaxis=dict(range=[ymin - pad_y, ymax + pad_y], autorange=False),
+                        zaxis=dict(range=[zmin - pad_z, zmax + pad_z], autorange=False),
+                        aspectmode="data",
+                    )
+                )
+            else:
+                fig.update_xaxes(range=[xmin - pad_x, xmax + pad_x], autorange=False)
+                fig.update_yaxes(range=[ymin - pad_y, ymax + pad_y], autorange=False)
 
         # Diagnostics for render path
         n_traces = len(fig.data)
@@ -3344,13 +3646,31 @@ class DBSCANWindow(QtWidgets.QMainWindow):
             yaxis_title="y (nm)",
             legend_title="Label",
             dragmode="pan",
+            showlegend=labels is not None,
+            legend=dict(
+                orientation="v",
+                yanchor="top",
+                y=1.0,
+                xanchor="left",
+                x=1.02,
+            ),
         )
-        apply_plot_theme(fig, is3d=False)
+        if is3d:
+            fig.update_layout(
+                scene=dict(
+                    xaxis_title="x (nm)",
+                    yaxis_title="y (nm)",
+                    zaxis_title="z (nm)",
+                )
+            )
+        apply_plot_theme(fig, is3d=is3d)
         fig.update_layout(
             title=dict(text=title, y=0.96, yanchor="top"),
-            margin=dict(l=0, r=0, t=64, b=0),
+            margin=dict(l=0, r=190, t=64, b=0),
         )
-        fig.update_yaxes(scaleanchor="x", scaleratio=1)
+        if not is3d:
+            fig.update_yaxes(scaleanchor="x", scaleratio=1)
+            add_scalebar_2d(fig, length_nm=float(getattr(self._mw, "_scalebar_nm", 100.0)))
 
         # Use plain Plotly HTML rendering in DBSCAN window to avoid sync/scalebar
         # side effects that can hide markers in this panel.
@@ -3358,7 +3678,16 @@ class DBSCANWindow(QtWidgets.QMainWindow):
             fig,
             include_plotlyjs="cdn",
             full_html=False,
-            config={"scrollZoom": True, "displaylogo": False, "responsive": True},
+            config={
+                "scrollZoom": True,
+                "displaylogo": False,
+                "responsive": True,
+                "toImageButtonOptions": {
+                    "format": "png",
+                    "filename": "plot",
+                    "scale": 10,
+                },
+            },
         )
         self.view.web.setHtml(html, QUrl("about:blank"))
 
@@ -3376,8 +3705,9 @@ class DBSCANWindow(QtWidgets.QMainWindow):
             fig.update_layout(
                 annotations=[dict(text="No loaded data for selected file", x=0.5, y=0.5, showarrow=False)]
             )
-            apply_plot_theme(fig, is3d=False)
-            self.view.update_fig(fig, reset_view=True, is3d=False)
+            is3d = self._is_3d_mode()
+            apply_plot_theme(fig, is3d=is3d)
+            self.view.update_fig(fig, reset_view=True, is3d=is3d)
             return
 
         self._tracks_df = self._avg_tracks_df(arr)
@@ -3458,7 +3788,7 @@ class DBSCANWindow(QtWidgets.QMainWindow):
 
         eps = float(self.eps_spin.value())
         min_samples = int(self.min_samples_spin.value())
-        use_2d = self.dimension_combo.currentText().startswith("2D")
+        use_2d = not self._is_3d_mode()
 
         self._append_log("running dbscan...")
         if use_2d:
@@ -3649,7 +3979,7 @@ class MultiColorWindow(QtWidgets.QMainWindow):
         self.stack = QtWidgets.QStackedWidget()
         outer.addWidget(self.stack, 1)
 
-        # --- crop/export buttons overlaid bottom-right ---
+        # --- crop buttons overlaid bottom-right ---
         self._crop_btn = QtWidgets.QPushButton("Crop", central)
         self._crop_btn.clicked.connect(self._crop_current_selection)
         self._crop_btn.setFixedHeight(24)
@@ -3661,12 +3991,6 @@ class MultiColorWindow(QtWidgets.QMainWindow):
         self._reset_crop_btn.setFixedHeight(24)
         self._reset_crop_btn.setMaximumWidth(110)
         self._reset_crop_btn.raise_()
-
-        self._export_btn = QtWidgets.QPushButton("Export (SVG/PDF)", central)
-        self._export_btn.clicked.connect(self._export_current)
-        self._export_btn.setFixedHeight(24)
-        self._export_btn.setMaximumWidth(140)
-        self._export_btn.raise_()
 
         # --- grid page ---
         self.grid_page = QtWidgets.QWidget()
@@ -3695,14 +4019,6 @@ class MultiColorWindow(QtWidgets.QMainWindow):
         mode = "merged" if mode == "merged" else "grid"
         self._mode = mode
         self.stack.setCurrentIndex(1 if mode == "merged" else 0)
-
-    def _export_current(self):
-        if self.mode() == "merged":
-            self.merged_view.export_vector()
-        else:
-            # export the first grid view (or you can choose)
-            if self._views:
-                next(iter(self._views.values())).export_vector()
 
     def mode(self):
         return self._mode
@@ -3743,6 +4059,8 @@ class MultiColorWindow(QtWidgets.QMainWindow):
         view = self._views.get(base)
         if view is None:
             return
+        if (not is3d) and fig is not None:
+            add_scalebar_2d(fig, length_nm=float(scalebar_nm))
         view.update_fig(fig, reset_view=reset_view, is3d=is3d, scalebar_nm=scalebar_nm)
 
     def update_all(self, figs_by_base, reset_view=False, is3d=False, scalebar_nm=100.0):
@@ -3753,25 +4071,20 @@ class MultiColorWindow(QtWidgets.QMainWindow):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if (
-            hasattr(self, "_export_btn") and self._export_btn is not None
-            and hasattr(self, "_crop_btn") and self._crop_btn is not None
+            hasattr(self, "_crop_btn") and self._crop_btn is not None
             and hasattr(self, "_reset_crop_btn") and self._reset_crop_btn is not None
         ):
             m = 12  # margin from edges
             gap = 8
-            btn_exp = self._export_btn
             btn_crop = self._crop_btn
             btn_reset = self._reset_crop_btn
-            btn_exp.adjustSize()
             btn_crop.adjustSize()
             btn_reset.adjustSize()
-            y = self.centralWidget().height() - btn_exp.height() - m
-            x_exp = self.centralWidget().width() - btn_exp.width() - m
-            x_reset = x_exp - btn_reset.width() - gap
+            y = self.centralWidget().height() - btn_reset.height() - m
+            x_reset = self.centralWidget().width() - btn_reset.width() - m
             x_crop = x_reset - btn_crop.width() - gap
             btn_crop.move(x_crop, y)
             btn_reset.move(x_reset, y)
-            btn_exp.move(x_exp, y)
 
     def _on_plot_selection(self, _source_id, payload):
         if not isinstance(payload, dict):
@@ -3932,10 +4245,41 @@ class PlotlyView(QtWidgets.QWidget):
 
         const xa = gd._fullLayout.xaxis;
         const ya = gd._fullLayout.yaxis;
-        if (!xa || !ya || !xa.range || !ya.range) return;
+        if (!xa || !ya) return;
 
-        const xMin = xa.range[0], xMax = xa.range[1];
-        const yMin = ya.range[0], yMax = ya.range[1];
+        let xMin = null, xMax = null, yMin = null, yMax = null;
+        if (xa.range && ya.range && xa.range.length >= 2 && ya.range.length >= 2) {{
+            xMin = Number(xa.range[0]);
+            xMax = Number(xa.range[1]);
+            yMin = Number(ya.range[0]);
+            yMax = Number(ya.range[1]);
+        }}
+
+        // Fallback for cases where axis ranges are not initialized yet.
+        if (![xMin, xMax, yMin, yMax].every(v => Number.isFinite(v))) {{
+            const xs = [];
+            const ys = [];
+            const data = (gd.data || []);
+            for (const tr of data) {{
+                if (Array.isArray(tr.x)) {{
+                    for (const v of tr.x) {{
+                        const n = Number(v);
+                        if (Number.isFinite(n)) xs.push(n);
+                    }}
+                }}
+                if (Array.isArray(tr.y)) {{
+                    for (const v of tr.y) {{
+                        const n = Number(v);
+                        if (Number.isFinite(n)) ys.push(n);
+                    }}
+                }}
+            }}
+            if (!xs.length || !ys.length) return;
+            xMin = Math.min(...xs);
+            xMax = Math.max(...xs);
+            yMin = Math.min(...ys);
+            yMax = Math.max(...ys);
+        }}
 
         const dx = xMax - xMin;
         const dy = yMax - yMin;
@@ -4234,43 +4578,6 @@ function installRelayoutHandler() {{
             self._pending_fig = None
             self.update_fig(fig, reset_view=reset_view, is3d=is3d)
 
-    def export_vector(self):
-        if self._last_fig is None:
-            QtWidgets.QMessageBox.information(self, "Export", "No figure to export yet.")
-            return
-
-        path, filt = QtWidgets.QFileDialog.getSaveFileName(
-            self,
-            "Export figure",
-            "plot.svg",
-            "SVG (*.svg);;PDF (*.pdf)"
-        )
-        if not path:
-            return
-
-        ext = os.path.splitext(path)[1].lower()
-        if ext not in (".svg", ".pdf"):
-            # infer from filter if user omitted extension
-            if "PDF" in filt:
-                path += ".pdf"
-            else:
-                path += ".svg"
-            ext = os.path.splitext(path)[1].lower()
-
-        fmt = ext.lstrip(".")  # "svg" or "pdf"
-
-        try:
-            pio.write_image(self._last_fig, path, format=fmt, scale=1)
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(
-                self, "Export failed",
-                f"Could not export {fmt.upper()}.\n\n"
-                f"Make sure kaleido is installed.\n\nError:\n{e}"
-            )
-            return
-
-        QtWidgets.QMessageBox.information(self, "Export", f"Saved:\n{path}")
-
     def update_fig(self, fig, reset_view=False, is3d=False, scalebar_nm=None):
         self.ensure_page()
         if not self._plotly_ready:
@@ -4310,7 +4617,16 @@ function installRelayoutHandler() {{
         const currently3D = !!(gd._fullLayout && gd._fullLayout.scene);
         const modeChanged = (targetIs3D !== currently3D);
 
-        const config = {{ scrollZoom: true, displaylogo: false, responsive: true }};
+        const config = {{
+            scrollZoom: true,
+            displaylogo: false,
+            responsive: true,
+            toImageButtonOptions: {{
+                format: "png",
+                filename: "plot",
+                scale: 10
+            }}
+        }};
 
         // Prevent relayout events from being broadcast while we update
         window._plotSync.sourceId = "{source_id}";
@@ -5316,7 +5632,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if arr is None:
             return
         cs = self._color_settings_by_base.get(base, {"mode": DEFAULT_MODE, "solid": DEFAULT_SOLID, "lut": DEFAULT_LUT, "alpha": DEFAULT_ALPHA, "size": DEFAULT_SIZE_2D})
-        fig = make_plotly_fig(arr, self.avg_tid.isChecked(), self.is3d.isChecked(), color_settings=cs)
+        fig = make_plotly_fig(
+            arr,
+            self.avg_tid.isChecked(),
+            self.is3d.isChecked(),
+            color_settings=cs,
+            scalebar_nm=getattr(self, "_scalebar_nm", 100.0),
+        )
         self._multicolor_win.update_one(
             base, fig,
             reset_view=reset_view,
@@ -5358,6 +5680,8 @@ class MainWindow(QtWidgets.QMainWindow):
         return ordered_all
 
     def update_plotly_fig(self, fig, reset_view=False):
+        if (not self.is3d.isChecked()) and fig is not None:
+            add_scalebar_2d(fig, length_nm=float(getattr(self, "_scalebar_nm", 100.0)))
         self.plot_view.update_fig(
             fig,
             reset_view=reset_view,
