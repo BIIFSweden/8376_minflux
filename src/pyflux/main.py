@@ -81,10 +81,14 @@ def icp(source, target, max_iterations=50, tolerance=0.5e-9):
         prev_err = mean_err
     return src, T_total
 
+
 def load_mbm_points(grd_mbm_path):
     g = zarr.open_group(grd_mbm_path, mode="r")
     points = g["points"][:]
+    # DEBUGGING: Flip y to match MINFLUX data convention.
+    points['xyz'][:, 1] *= -1.0
     return points
+
 
 def bead_initial_positions(points, k=4, min_count=10):
     gri_vals = np.asarray(points["gri"])
@@ -251,7 +255,16 @@ def avg_loc_by_tid(arr):
 
     return unique_tids.astype(int), centroids, counts.astype(int)
 
-def compute_mbm_transform(mbm_ref_dir, mbm_mov_dir, k=4, scale=1.0, return_diagnostics: bool = False):
+def _preprocess_xyz_points(points, *, z_corr=1.0, scale=1.0):
+    pts = np.asarray(points, dtype=float).copy()
+    if pts.ndim != 2 or pts.shape[1] < 3:
+        return pts
+    pts[:, 2] *= float(z_corr)
+    pts *= float(scale)
+    return pts
+
+
+def compute_mbm_transform(mbm_ref_dir, mbm_mov_dir, k=4, scale=1.0, z_corr=1.0, return_diagnostics: bool = False):
     pts_ref = load_mbm_points(mbm_ref_dir)
     pts_mov = load_mbm_points(mbm_mov_dir)
 
@@ -266,13 +279,17 @@ def compute_mbm_transform(mbm_ref_dir, mbm_mov_dir, k=4, scale=1.0, return_diagn
     else:
         ref_pts, mov_pts, common = match_and_filter_beads(beads_ref, beads_mov)
 
-    # IMPORTANT: match units to MINFLUX loc units
-    ref_pts = ref_pts * scale
-    mov_pts = mov_pts * scale
+    # Match MBM bead coordinates to the same coordinate frame used by loaded MINFLUX data.
+    ref_pts = _preprocess_xyz_points(ref_pts, z_corr=z_corr, scale=scale)
+    mov_pts = _preprocess_xyz_points(mov_pts, z_corr=z_corr, scale=scale)
 
     if diagnostics is not None:
-        diagnostics["ref_common_scaled"] = np.asarray(diagnostics["ref_common"], dtype=float) * float(scale)
-        diagnostics["mov_common_scaled"] = np.asarray(diagnostics["mov_common"], dtype=float) * float(scale)
+        diagnostics["ref_common_scaled"] = _preprocess_xyz_points(
+            diagnostics["ref_common"], z_corr=z_corr, scale=scale
+        )
+        diagnostics["mov_common_scaled"] = _preprocess_xyz_points(
+            diagnostics["mov_common"], z_corr=z_corr, scale=scale
+        )
 
     _, T_total = icp(mov_pts, ref_pts, max_iterations=50, tolerance=0.5e-9 * scale)
     if return_diagnostics:
@@ -2120,6 +2137,15 @@ class ParametersDialog(QtWidgets.QDialog):
         self.bin_size.setDecimals(1)
         self.bin_size.setRange(1, 1e9)
 
+        self.cfr_bin_count = QtWidgets.QSpinBox()
+        self.cfr_bin_count.setRange(5, 500)
+        self.cfr_bin_count.setValue(50)
+
+        self.scalebar_nm = QtWidgets.QDoubleSpinBox()
+        self.scalebar_nm.setDecimals(1)
+        self.scalebar_nm.setRange(1, 1e9)
+        self.scalebar_nm.setSingleStep(10.0)
+
         form.addWidget(QtWidgets.QLabel("Min trace length:"), 0, 0)
         form.addWidget(self.min_trace, 0, 1)
         form.addWidget(QtWidgets.QLabel("Z correction factor:"), 0, 2)
@@ -2129,23 +2155,16 @@ class ParametersDialog(QtWidgets.QDialog):
         form.addWidget(self.scale, 1, 1)
         form.addWidget(QtWidgets.QLabel("EFO histogram bin size:"), 1, 2)
         form.addWidget(self.bin_size, 1, 3)
-
-        self.scalebar_nm = QtWidgets.QDoubleSpinBox()
-        self.scalebar_nm.setDecimals(1)
-        self.scalebar_nm.setRange(1, 1e9)
-        self.scalebar_nm.setSingleStep(10.0)
-
         form.addWidget(QtWidgets.QLabel("Scale bar size (nm):"), 2, 0)
         form.addWidget(self.scalebar_nm, 2, 1)
-        form.addWidget(QtWidgets.QLabel(""), 2, 2)
-        form.addWidget(QtWidgets.QLabel(""), 2, 3)
+        form.addWidget(QtWidgets.QLabel("CFR histogram bins:"), 2, 2)
+        form.addWidget(self.cfr_bin_count, 2, 3)
+
 
         note = QtWidgets.QLabel("Data is usually recorded in meters, set scale factor to 1e9 to convert to nanometers.")
         note.setWordWrap(True)
-        # optional: make it look like a hint
-        note.setStyleSheet("color: #B0B3B8;")  # or remove if you don't want styling
+        note.setStyleSheet("color: #B0B3B8;")
 
-        # row 2, start at column 0, span 1 row x 4 columns
         form.addWidget(note, 3, 0, 1, 4)
 
         self.mbm_table = QtWidgets.QTableWidget(0, 3)
@@ -2156,12 +2175,11 @@ class ParametersDialog(QtWidgets.QDialog):
         self.mbm_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
         self.mbm_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
         self.mbm_table.setColumnWidth(2, 120)
-        self.mbm_table.setMinimumHeight(180)   # adjust (e.g. 300–450)
+        self.mbm_table.setMinimumHeight(180)
 
         root.addWidget(QtWidgets.QLabel("MBM folders (per file):"))
         root.addWidget(self.mbm_table)
 
-        # buttons
         btns = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
         )
@@ -2169,11 +2187,12 @@ class ParametersDialog(QtWidgets.QDialog):
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
 
-    def set_values(self, *, min_trace_len, z_corr, scale, bin_size, scalebar_nm):
+    def set_values(self, *, min_trace_len, z_corr, scale, bin_size, cfr_bin_count, scalebar_nm):
         self.min_trace.setValue(int(min_trace_len))
         self.zcorr.setValue(float(z_corr))
         self.scale.setValue(float(scale))
         self.bin_size.setValue(float(bin_size))
+        self.cfr_bin_count.setValue(int(cfr_bin_count))
         self.scalebar_nm.setValue(float(scalebar_nm))
 
     def values(self):
@@ -2182,6 +2201,7 @@ class ParametersDialog(QtWidgets.QDialog):
             z_corr=float(self.zcorr.value()),
             scale=float(self.scale.value()),
             bin_size=float(self.bin_size.value()),
+            cfr_bin_count=int(self.cfr_bin_count.value()),
             scalebar_nm=float(self.scalebar_nm.value()),
         )
 
@@ -2341,8 +2361,21 @@ class BinningWindow(QtWidgets.QMainWindow):
         self.confocal_max_spin.valueChanged.connect(self._on_confocal_max_value_changed)
         ctrl.addWidget(self.confocal_max_spin, 5, 3)
 
+        ctrl.addWidget(QtWidgets.QLabel("rotate/flip:"), 6, 0)
+        self.confocal_orient_combo = QtWidgets.QComboBox()
+        self.confocal_orient_combo.addItems([
+            "none",
+            "flip vertical",
+            "flip horizontal",
+            "rotate 90",
+            "rotate 180",
+            "rotate 270",
+        ])
+        self.confocal_orient_combo.currentTextChanged.connect(lambda _: self.refresh_plot(keep_view=True))
+        ctrl.addWidget(self.confocal_orient_combo, 6, 1, 1, 3)
+
         self.intensity_sep = make_labeled_separator("Intensity adjustment")
-        ctrl.addWidget(self.intensity_sep, 6, 0, 1, 6)
+        ctrl.addWidget(self.intensity_sep, 7, 0, 1, 6)
 
         self._max_value_label_widgets = []
         self._max_value_spin_widgets = []
@@ -2527,6 +2560,11 @@ class BinningWindow(QtWidgets.QMainWindow):
             self.confocal_scale_spin.setValue(1)
             self.confocal_scale_spin.blockSignals(False)
 
+        if hasattr(self, "confocal_orient_combo"):
+            self.confocal_orient_combo.blockSignals(True)
+            self.confocal_orient_combo.setCurrentText("none")
+            self.confocal_orient_combo.blockSignals(False)
+
         self.confocal_path_edit.setText(path)
         if self.confocal_show_chk.isChecked():
             self._confocal_reset_pending = True
@@ -2569,17 +2607,26 @@ class BinningWindow(QtWidgets.QMainWindow):
             largest = np.argsort(shape)[-2:]
             spatial_axes = tuple(sorted(int(a) for a in largest))
 
-            # Keep spatial axes in (y, x) order, then project over remaining axes.
-            move_from = tuple(a for a in range(img.ndim) if a not in spatial_axes) + spatial_axes
-            img = np.transpose(img, axes=move_from)
+            # Project non-spatial axes without reordering/flipping/rotating image axes.
+            non_spatial_axes = tuple(a for a in range(img.ndim) if a not in spatial_axes)
+            if len(non_spatial_axes) == 1 and img.shape[non_spatial_axes[0]] in (3, 4):
+                color_axis = non_spatial_axes[0]
+                img = np.mean(np.take(img, indices=(0, 1, 2), axis=color_axis), axis=color_axis)
+            elif non_spatial_axes:
+                img = np.max(img, axis=non_spatial_axes)
 
-            if img.shape[-1] in (3, 4) and img.ndim == 3:
-                # RGB/RGBA after reordering.
-                img = np.mean(img[..., :3], axis=-1)
-            else:
-                lead_axes = tuple(range(img.ndim - 2))
-                if lead_axes:
-                    img = np.max(img, axis=lead_axes)
+        if hasattr(self, "confocal_orient_combo"):
+            orient = self.confocal_orient_combo.currentText().strip().lower()
+            if orient == "flip vertical":
+                img = np.flipud(img)
+            elif orient == "flip horizontal":
+                img = np.fliplr(img)
+            elif orient == "rotate 90":
+                img = np.rot90(img, 1)
+            elif orient == "rotate 180":
+                img = np.rot90(img, 2)
+            elif orient == "rotate 270":
+                img = np.rot90(img, 3)
 
         # Keep native 8-bit values unchanged.
         if img.dtype == np.uint8:
@@ -2847,12 +2894,12 @@ class BinningWindow(QtWidgets.QMainWindow):
         if not all_bases:
             self._max_value_placeholder = QtWidgets.QLabel("No images loaded.")
             self._max_value_placeholder.setStyleSheet("color: #B0B3B8;")
-            self.ctrl.addWidget(self._max_value_placeholder, 7, 0, 1, 4)
+            self.ctrl.addWidget(self._max_value_placeholder, 8, 0, 1, 4)
         else:
             max_rows_used = max(1, (len(all_bases) + 1) // 2)
 
         for idx, base in enumerate(all_bases):
-            row = 7 + (idx // 2)
+            row = 8 + (idx // 2)
             col_block = (idx % 2) * 2
 
             label = QtWidgets.QLabel(f"Max value {idx + 1}:")
@@ -2869,7 +2916,7 @@ class BinningWindow(QtWidgets.QMainWindow):
             self._max_value_spin_widgets.append(spin)
             self._max_value_spin_by_base[base] = spin
 
-        actions_row = 7 + max_rows_used
+        actions_row = 8 + max_rows_used
         self._sync_action_button_sizes()
         self.ctrl.addWidget(self.actions_widget, actions_row, 0, 1, 4)
 
@@ -3003,8 +3050,7 @@ class BinningWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self, "Save as tif", str(exc))
             return
 
-        # TIFF viewers use row-0 at top; flip y so saved stack matches on-screen orientation
-        stack_cxy = np.stack([np.flipud(im) for im in images], axis=0).astype(np.float32)
+        stack_cxy = np.stack(images, axis=0).astype(np.float32)
 
         default_name = "_".join(channel_names) + ".tif"
         out_path, _ = QtWidgets.QFileDialog.getSaveFileName(
@@ -3115,6 +3161,13 @@ class BinningWindow(QtWidgets.QMainWindow):
             is3d=False,
             scalebar_nm=getattr(self._mw, "_scalebar_nm", 100.0),
         )
+
+    def shutdown(self):
+        try:
+            if self.view is not None:
+                self.view.shutdown()
+        except Exception:
+            pass
 
 
 class DBSCANWindow(QtWidgets.QMainWindow):
@@ -3945,6 +3998,14 @@ class DBSCANWindow(QtWidgets.QMainWindow):
 
         QtWidgets.QMessageBox.information(self, "Save DBSCAN", "DBSCAN outputs saved.")
 
+    def shutdown(self):
+        try:
+            if self.view is not None:
+                self.view.shutdown()
+        except Exception:
+            pass
+
+
 class PlotSyncBridge(QtCore.QObject):
     viewChanged = Signal(str, object)  # (source_id, payload dict)
     selectionChanged = Signal(str, object)  # (source_id, payload dict)
@@ -4130,6 +4191,19 @@ class MultiColorWindow(QtWidgets.QMainWindow):
 
     def update_merged(self, fig, reset_view=False, is3d=False, scalebar_nm=100.0):
         self.merged_view.update_fig(fig, reset_view=reset_view, is3d=is3d, scalebar_nm=scalebar_nm)
+
+    def shutdown(self):
+        try:
+            if self.merged_view is not None:
+                self.merged_view.shutdown()
+        except Exception:
+            pass
+
+        for view in self._views.values():
+            try:
+                view.shutdown()
+            except Exception:
+                pass
 
 class PlotlyView(QtWidgets.QWidget):
     """Widget hosting Plotly in a QWebEngineView + emits view changes."""
@@ -4732,6 +4806,18 @@ function installRelayoutHandler() {{
 }})();
 """
         self.web.page().runJavaScript(js)
+    
+    def shutdown(self):
+        try:
+            if self.web is not None:
+                page = self.web.page()
+                self.web.setParent(None)
+                self.web.deleteLater()
+                if page is not None:
+                    page.deleteLater()
+        except Exception:
+            pass
+
 
 
 # -------------------- worker --------------------
@@ -4774,6 +4860,7 @@ class FileWorker(QtCore.QThread):
             self.status.emit(f"ERROR: {e}")
             self.done_one.emit(None)
 
+
     def _process_one_file(self):
         p = self.params
         file = self.file_path
@@ -4782,8 +4869,6 @@ class FileWorker(QtCore.QThread):
 
         MFX_Data = np.load(file, allow_pickle=False)
         MFX_Data = MFX_Data.copy()
-        # Flip vertically immediately after loading.
-        MFX_Data["loc"][:, 1] *= -1.0
         if self.isInterruptionRequested():
             return None
         self._check_cancel()
@@ -4801,9 +4886,10 @@ class FileWorker(QtCore.QThread):
 
         MFX_Data["loc"][:, -1] *= p["z_corr"]
         MFX_Data["loc"] *= p["scale"]
+        MFX_Data["loc"][:, 1] *= -1.0
 
         last_itr = int(np.max(MFX_Data["itr"]))
-        MFX_Data_vld_fnl = MFX_Data[MFX_Data["itr"] == last_itr]
+        MFX_Data_vld_fnl = MFX_Data[MFX_Data["itr"] == last_itr].copy()
         last_iteration_loc = len(MFX_Data_vld_fnl)
         self._check_cancel()
 
@@ -4816,12 +4902,36 @@ class FileWorker(QtCore.QThread):
             self.status.emit(f"Skipping {base}: no data after trace filtering.")
             return None
 
-        max_itr = np.max(MFX_Data_vld_fnl_filt["itr"])
-        efo_vals = MFX_Data_vld_fnl_filt["efo"][MFX_Data_vld_fnl_filt["itr"] == max_itr]
-        if "cfr" not in MFX_Data_vld_fnl_filt.dtype.names:
+        if "cfr" not in MFX_Data.dtype.names:
             self.status.emit(f"Skipping {base}: no CFR field.")
             return None
-        cfr_vals = MFX_Data_vld_fnl_filt["cfr"][MFX_Data_vld_fnl_filt["itr"] == max_itr]
+
+        # last valid CFR iteration = last itr with std(cfr) > 0
+        iters = np.sort(np.unique(MFX_Data["itr"]))
+        valid_cfr_iters = [it for it in iters if np.std(MFX_Data["cfr"][MFX_Data["itr"] == it]) > 0.0]
+        last_cfr_itr = int(valid_cfr_iters[-1]) if len(valid_cfr_iters) else last_itr
+
+        max_itr = np.max(MFX_Data_vld_fnl_filt["itr"])
+        efo_vals = MFX_Data_vld_fnl_filt["efo"][MFX_Data_vld_fnl_filt["itr"] == max_itr]
+
+        # get CFR for final tids from last valid CFR iteration
+        final_tids = pd.DataFrame({"tid": MFX_Data_vld_fnl_filt["tid"]})
+        cfr_df = pd.DataFrame({
+            "tid": MFX_Data[MFX_Data["itr"] == last_cfr_itr]["tid"],
+            "cfr": MFX_Data[MFX_Data["itr"] == last_cfr_itr]["cfr"],
+        })
+        merged = final_tids.merge(cfr_df, on="tid", how="left")
+        cfr_vals = merged["cfr"].dropna().to_numpy()
+
+        # optionally also overwrite cfr in the returned array for downstream filtering/saving
+        if len(merged) == len(MFX_Data_vld_fnl_filt):
+            cfr_arr = merged["cfr"].to_numpy()
+            valid = np.isfinite(cfr_arr)
+            MFX_Data_vld_fnl_filt = MFX_Data_vld_fnl_filt[valid].copy()
+            MFX_Data_vld_fnl_filt["cfr"] = cfr_arr[valid]
+            efo_vals = efo_vals[valid]
+            cfr_vals = cfr_arr[valid]
+
         self._check_cancel()
         if len(efo_vals) == 0:
             self.status.emit(f"Skipping {base}: no EFO values.")
@@ -4934,6 +5044,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.bin_size.setDecimals(1)
         self.bin_size.setRange(1, 1e9)
         self.bin_size.setValue(3000)
+
+        self.cfr_bin_count = QtWidgets.QSpinBox()
+        self.cfr_bin_count.setRange(5, 500)
+        self.cfr_bin_count.setValue(50)
 
         self._workers = set()
 
@@ -5437,6 +5551,7 @@ class MainWindow(QtWidgets.QMainWindow):
             z_corr=self.zcorr.value(),
             scale=self.scale.value(),
             bin_size=self.bin_size.value(),
+            cfr_bin_count=self.cfr_bin_count.value(),
             scalebar_nm=getattr(self, "_scalebar_nm", 100.0),
         )
 
@@ -5444,6 +5559,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if dlg.exec() == QtWidgets.QDialog.Accepted:
             self._mbm_dir_by_base = dlg.mbm_map()
             vals = dlg.values()
+            self.cfr_bin_count.setValue(vals["cfr_bin_count"])
             self.min_trace.setValue(vals["min_trace_len"])
             self.zcorr.setValue(vals["z_corr"])
             self.scale.setValue(vals["scale"])
@@ -5709,33 +5825,42 @@ class MainWindow(QtWidgets.QMainWindow):
     def closeEvent(self, event):
         self._closing = True
 
-        # cancel worker if running
         try:
             if self._current_worker is not None and self._current_worker.isRunning():
                 self._current_worker.cancel()
-                self._current_worker.wait(1000)  # wait up to 1s
+                self._current_worker.wait(1000)
         except Exception:
             pass
 
-        # close multicolor window if open
+        try:
+            if self.plot_view is not None:
+                self.plot_view.shutdown()
+        except Exception:
+            pass
+
         try:
             if self._multicolor_win is not None:
+                self._multicolor_win.shutdown()
                 self._multicolor_win.close()
         except Exception:
             pass
+
         try:
-            if getattr(self, "_binning_win", None) is not None:
+            if self._binning_win is not None:
+                self._binning_win.shutdown()
                 self._binning_win.close()
         except Exception:
             pass
+
         try:
-            if getattr(self, "_dbscan_win", None) is not None:
+            if self._dbscan_win is not None:
+                self._dbscan_win.shutdown()
                 self._dbscan_win.close()
         except Exception:
             pass
 
         event.accept()
-        QtCore.QTimer.singleShot(1000, lambda: os._exit(0))
+        QtWidgets.QApplication.quit()
         
     def _on_worker_finished(self, worker):
         """Clean up worker reference when it finishes."""
@@ -5973,6 +6098,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 color=HIST_THEME["hist_face"],
             )
 
+            efo_med = float(np.median(efo_vals))
+            self.ax_efo.axvline(efo_med, color="red", linewidth=2)
+            self.ax_efo.text(
+                efo_med,
+                self.ax_efo.get_ylim()[1] * 0.95,
+                f"median={efo_med:.2f}",
+                color="red",
+                ha="left",
+                va="top",
+            )
         #self.ax_efo.set_xlabel("EFO")
         self.ax_efo.set_ylabel("Count")
         self.ax_efo.set_title(base)
@@ -6017,14 +6152,23 @@ class MainWindow(QtWidgets.QMainWindow):
         # ---- CFR histogram ----
         self.ax_cfr.clear()
         if len(cfr_vals) > 0:
-            bins = np.arange(cfr_vals.min(), cfr_vals.max() + bin_size, bin_size)
             self.ax_cfr.hist(
                 cfr_vals,
-                bins=bins,
+                bins=int(self.cfr_bin_count.value()),
                 edgecolor=HIST_THEME["hist_edge"],
                 color=HIST_THEME["hist_face"],
             )
 
+            cfr_med = float(np.median(cfr_vals))
+            self.ax_cfr.axvline(cfr_med, color="red", linewidth=2)
+            self.ax_cfr.text(
+                cfr_med,
+                self.ax_cfr.get_ylim()[1] * 0.95,
+                f"median={cfr_med:.2f}",
+                color="red",
+                ha="left",
+                va="top",
+            )
         #self.ax_cfr.set_xlabel("CFR")
         self.ax_cfr.set_ylabel("Count")
         self.ax_cfr.set_title(base)
@@ -6375,6 +6519,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     mbm_mov,
                     k=4,
                     scale=float(self.scale.value()),
+                    z_corr=float(self.zcorr.value()),
                     return_diagnostics=True,
                 )
                 self._T_by_base[base] = T
@@ -6543,6 +6688,7 @@ def handle_download_requested(download):
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(True)
     apply_gui_theme(app)
 
     from PySide6.QtWebEngineCore import QWebEngineProfile
