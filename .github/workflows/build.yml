@@ -54,7 +54,7 @@ jobs:
 
   macos_x86_64:
     name: Build macOS x86_64 (Intel)
-    runs-on: macos-13   # Intel runner; macos-latest is now arm64
+    runs-on: macos-latest   # macos-13 did not work or was backed up too much
     steps:
       - uses: actions/checkout@v4
 
@@ -64,18 +64,22 @@ jobs:
           python-version: "3.12"
           architecture: "x64"
 
-      - name: Install deps
+      - name: Create Intel venv + install deps (x86_64)
         shell: bash
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pyinstaller
-          python -c "import platform; print('python arch:', platform.machine())"
+          arch -x86_64 python -m venv .venv-x86_64
+          source .venv-x86_64/bin/activate
+
+          arch -x86_64 python -m pip install --upgrade pip
+          arch -x86_64 pip install -r requirements.txt
+          arch -x86_64 pip install pyinstaller
+
+          arch -x86_64 python -c "import platform; print('python arch:', platform.machine())"
 
       - name: Build (x86_64)
         shell: bash
         run: |
-          pyinstaller --clean --noconfirm --windowed \
+          arch -x86_64 pyinstaller --clean --noconfirm --windowed \
             --target-architecture x86_64 \
             --name "pyflux" \
             --icon "assets/appicon.icns" \
