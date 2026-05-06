@@ -16,22 +16,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
         with:
-          python-version: "3.12"
-          architecture: "x64"
+          enable-cache: true
+          cache-dependency-glob: "requirements.txt"
 
-      - name: Install dependencies
+      - name: Setup Python 3.12 (x64)
+        run: uv python install 3.12
+
+      - name: Create venv & install deps
         shell: bash
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
-          python -m pip install pyinstaller
+          uv venv --python 3.12 .venv
+          uv pip install --python .venv/Scripts/python.exe -r requirements.txt pyinstaller
 
       - name: Build (Windows)
         shell: powershell
         run: |
+          .\.venv\Scripts\Activate.ps1
           pyinstaller --clean --noconfirm --windowed `
             --name "pyflux" `
             --icon "assets/appicon.ico" `
@@ -58,23 +61,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Python (Intel)
-        uses: actions/setup-python@v5
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
         with:
-          python-version: "3.12"
-          architecture: "x64"
+          enable-cache: true
+          cache-dependency-glob: "requirements.txt"
 
-      - name: Create Intel venv + install deps (x86_64)
+      - name: Create Intel venv & install deps (x86_64)
         shell: bash
         run: |
-          arch -x86_64 python -m venv .venv-x86_64
-          source .venv-x86_64/bin/activate
+          # Install an x86_64 Python via uv
+          arch -x86_64 uv python install 3.12
+          arch -x86_64 uv venv --python 3.12 .venv-x86_64
 
-          arch -x86_64 python -m pip install --upgrade pip
-          arch -x86_64 pip install -r requirements.txt
-          arch -x86_64 pip install pyinstaller
+          arch -x86_64 uv pip install --python .venv-x86_64/bin/python \
+            -r requirements.txt pyinstaller
 
-          arch -x86_64 python -c "import platform; print('python arch:', platform.machine())"
+          arch -x86_64 .venv-x86_64/bin/python -c "import platform; print('python arch:', platform.machine())"
 
       - name: Build (x86_64)
         shell: bash
@@ -92,9 +95,7 @@ jobs:
             src/pyflux/main.py
 
       - name: Ad-hoc sign (deep)
-        shell: bash
-        run: |
-          codesign --force --deep --sign - "dist/pyflux.app"
+        run: codesign --force --deep --sign - "dist/pyflux.app"
 
       - name: Zip
         shell: bash
@@ -113,22 +114,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
         with:
-          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: "requirements.txt"
 
-      - name: Install deps
+      - name: Setup Python 3.12
+        run: uv python install 3.12
+
+      - name: Create venv & install deps
         shell: bash
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pyinstaller
-          python -c "import platform; print('python arch:', platform.machine())"
+          uv venv --python 3.12 .venv
+          uv pip install --python .venv/bin/python -r requirements.txt pyinstaller
+          .venv/bin/python -c "import platform; print('python arch:', platform.machine())"
 
       - name: Build (arm64)
         shell: bash
         run: |
+          source .venv/bin/activate
           pyinstaller --clean --noconfirm --windowed \
             --target-architecture arm64 \
             --name "pyflux" \
@@ -141,9 +146,7 @@ jobs:
             src/pyflux/main.py
 
       - name: Ad-hoc sign (deep)
-        shell: bash
-        run: |
-          codesign --force --deep --sign - "dist/pyflux.app"
+        run: codesign --force --deep --sign - "dist/pyflux.app"
 
       - name: Verify QtWebEngineProcess is bundled
         shell: bash
