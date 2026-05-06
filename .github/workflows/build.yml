@@ -79,6 +79,7 @@ jobs:
       - name: Build (x86_64)
         shell: bash
         run: |
+          source .venv-x86_64/bin/activate
           arch -x86_64 pyinstaller --clean --noconfirm --windowed \
             --target-architecture x86_64 \
             --name "pyflux" \
