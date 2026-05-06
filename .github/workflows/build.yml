@@ -56,57 +56,65 @@ jobs:
           path: dist/pyflux-windows-x64.zip
 
   macos_x86_64:
-    name: Build macOS x86_64 (Intel)
-    runs-on: macos-latest   # macos-13 did not work or was backed up too much
-    steps:
-      - uses: actions/checkout@v4
+      name: Build macOS x86_64 (Intel)
+      runs-on: macos-latest   # arm64 host; we cross-build x86_64 via Rosetta
+      steps:
+        - uses: actions/checkout@v4
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v3
-        with:
-          enable-cache: true
-          cache-dependency-glob: "requirements.txt"
+        - name: Install uv
+          uses: astral-sh/setup-uv@v3
+          with:
+            enable-cache: true
+            cache-dependency-glob: "requirements.txt"
 
-      - name: Create Intel venv & install deps (x86_64)
-        shell: bash
-        run: |
-          # Install an x86_64 Python via uv
-          arch -x86_64 uv python install 3.12
-          arch -x86_64 uv venv --python 3.12 .venv-x86_64
+        - name: Install x86_64 CPython 3.12 via uv
+          shell: bash
+          run: |
+            # uv itself is arm64, but it can fetch an x86_64 Python build.
+            uv python install cpython-3.12-macos-x86_64-none
 
-          arch -x86_64 uv pip install --python .venv-x86_64/bin/python \
-            -r requirements.txt pyinstaller
+        - name: Create x86_64 venv & install deps
+          shell: bash
+          run: |
+            uv venv --python cpython-3.12-macos-x86_64-none .venv-x86_64
 
-          arch -x86_64 .venv-x86_64/bin/python -c "import platform; print('python arch:', platform.machine())"
+            # uv resolves wheels against the *target* interpreter, so this pulls x86_64 wheels.
+            uv pip install --python .venv-x86_64/bin/python \
+              -r requirements.txt pyinstaller
 
-      - name: Build (x86_64)
-        shell: bash
-        run: |
-          source .venv-x86_64/bin/activate
-          arch -x86_64 pyinstaller --clean --noconfirm --windowed \
-            --target-architecture x86_64 \
-            --name "pyflux" \
-            --icon "assets/appicon.icns" \
-            --osx-bundle-identifier com.yourname.pyflux \
-            --collect-all PySide6 \
-            --hidden-import PySide6.QtWebEngineCore \
-            --hidden-import PySide6.QtWebEngineWidgets \
-            --hidden-import PySide6.QtWebChannel \
-            src/pyflux/main.py
+            # Sanity check — should print 'x86_64'
+            .venv-x86_64/bin/python -c "import platform; print('python arch:', platform.machine())"
 
-      - name: Ad-hoc sign (deep)
-        run: codesign --force --deep --sign - "dist/pyflux.app"
+        - name: Build (x86_64)
+          shell: bash
+          run: |
+            source .venv-x86_64/bin/activate
+            # pyinstaller's shebang points to the x86_64 python, so macOS
+            # auto-launches it under Rosetta. No `arch -x86_64` needed.
+            pyinstaller --clean --noconfirm --windowed \
+              --target-architecture x86_64 \
+              --name "pyflux" \
+              --icon "assets/appicon.icns" \
+              --osx-bundle-identifier com.yourname.pyflux \
+              --collect-all PySide6 \
+              --hidden-import PySide6.QtWebEngineCore \
+              --hidden-import PySide6.QtWebEngineWidgets \
+              --hidden-import PySide6.QtWebChannel \
+              src/pyflux/main.py
 
-      - name: Zip
-        shell: bash
-        run: |
-          cd dist
-          ditto -c -k --sequesterRsrc --keepParent "pyflux.app" "pyflux-macos-x86_64.zip"
+        - name: Ad-hoc sign (deep)
+          run: codesign --force --deep --sign - "dist/pyflux.app"
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: pyflux-macos-x86_64
-          path: dist/pyflux-macos-x86_64.zip
+        - name: Zip
+          shell: bash
+          run: |
+            cd dist
+            ditto -c -k --sequesterRsrc --keepParent "pyflux.app" "pyflux-macos-x86_64.zip"
+
+        - uses: actions/upload-artifact@v4
+          with:
+            name: pyflux-macos-x86_64
+            path: dist/pyflux-macos-x86_64.zip
 
   macos_arm64:
     name: Build macOS arm64
