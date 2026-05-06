@@ -12,12 +12,19 @@ A desktop GUI for loading, filtering, visualizing, aligning, clustering, and exp
 
 Built with PySide6, Plotly, Matplotlib, NumPy, Pandas, SciPy, and Zarr.
 
+## Installation
+
+- Download the current release
+- Unzip
+- For Macos: Allow app to run under Privacy & Security/Security -> Run anyway
+- For Windows: Trust developer
+
 ## TODO 
 
 - add more filtering options
 - fix mbm bead plots
 
-## Bugs pyflux
+## Known bugs pyflux
 
 - sometimes opens second window
 - when building with pyinstaller, scipy is not detected even though it is installed in .venv, see (workaround)[https://stackoverflow.com/questions/49559770/how-do-you-resolve-hidden-imports-not-found-warnings-in-pyinstaller-for-scipy?rq=1]

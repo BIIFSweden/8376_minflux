@@ -35,14 +35,17 @@ jobs:
           pyinstaller --clean --noconfirm --windowed `
             --name "pyflux" `
             --icon "assets/appicon.ico" `
+            --collect-all PySide6 `
+            --hidden-import PySide6.QtWebEngineCore `
+            --hidden-import PySide6.QtWebEngineWidgets `
+            --hidden-import PySide6.QtWebChannel `
             src/pyflux/main.py
 
       - name: Zip
         shell: powershell
         run: |
           cd dist
-          $zipName = "pyflux-windows-x64.zip"
-          Compress-Archive -Path "pyflux" -DestinationPath $zipName
+          Compress-Archive -Path "pyflux" -DestinationPath "pyflux-windows-x64.zip"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -51,7 +54,7 @@ jobs:
 
   macos_x86_64:
     name: Build macOS x86_64 (Intel)
-    runs-on: macos-latest
+    runs-on: macos-13   # Intel runner; macos-latest is now arm64
     steps:
       - uses: actions/checkout@v4
 
@@ -61,27 +64,32 @@ jobs:
           python-version: "3.12"
           architecture: "x64"
 
-      - name: Create Intel venv + install deps (x86_64)
+      - name: Install deps
         shell: bash
         run: |
-          arch -x86_64 python -m venv .venv-x86_64
-          source .venv-x86_64/bin/activate
-
-          arch -x86_64 python -m pip install --upgrade pip
-          arch -x86_64 pip install -r requirements.txt
-          arch -x86_64 pip install pyinstaller
-
-          arch -x86_64 python -c "import platform; print('python arch:', platform.machine())"
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+          python -c "import platform; print('python arch:', platform.machine())"
 
       - name: Build (x86_64)
         shell: bash
         run: |
-          source .venv-x86_64/bin/activate
-          arch -x86_64 pyinstaller --clean --noconfirm --windowed \
+          pyinstaller --clean --noconfirm --windowed \
             --target-architecture x86_64 \
             --name "pyflux" \
             --icon "assets/appicon.icns" \
+            --osx-bundle-identifier com.yourname.pyflux \
+            --collect-all PySide6 \
+            --hidden-import PySide6.QtWebEngineCore \
+            --hidden-import PySide6.QtWebEngineWidgets \
+            --hidden-import PySide6.QtWebChannel \
             src/pyflux/main.py
+
+      - name: Ad-hoc sign (deep)
+        shell: bash
+        run: |
+          codesign --force --deep --sign - "dist/pyflux.app"
 
       - name: Zip
         shell: bash
@@ -96,7 +104,7 @@ jobs:
 
   macos_arm64:
     name: Build macOS arm64
-    runs-on: macos-latest
+    runs-on: macos-latest   # arm64
     steps:
       - uses: actions/checkout@v4
 
@@ -105,7 +113,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install dependencies
+      - name: Install deps
         shell: bash
         run: |
           python -m pip install --upgrade pip
@@ -120,7 +128,23 @@ jobs:
             --target-architecture arm64 \
             --name "pyflux" \
             --icon "assets/appicon.icns" \
+            --osx-bundle-identifier com.yourname.pyflux \
+            --collect-all PySide6 \
+            --hidden-import PySide6.QtWebEngineCore \
+            --hidden-import PySide6.QtWebEngineWidgets \
+            --hidden-import PySide6.QtWebChannel \
             src/pyflux/main.py
+
+      - name: Ad-hoc sign (deep)
+        shell: bash
+        run: |
+          codesign --force --deep --sign - "dist/pyflux.app"
+
+      - name: Verify QtWebEngineProcess is bundled
+        shell: bash
+        run: |
+          ls "dist/pyflux.app/Contents/Frameworks/QtWebEngineCore.framework/Helpers/" || true
+          ls "dist/pyflux.app/Contents/Frameworks/QtWebEngineCore.framework/Versions/A/Helpers/" || true
 
       - name: Zip
         shell: bash
