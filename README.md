@@ -2,7 +2,7 @@
 
 A desktop GUI for loading, filtering, visualizing, aligning, clustering, and exporting MINFLUX localization data from .npy files.
 
-![Demo GIF](./assets/vid2.gif)
+![Demo GIF](./assets/vid3.gif)
 
 - Filter localizations by trace length, EFO, and CFR
 - View data in interactive 2D/3D scatter plots
