@@ -25,24 +25,27 @@ import pytest
 # Make src importable
 sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
 
-from pyflux.main import (
-    save_to_csv,
-    moving_average_1d,
-    best_rigid_transform,
+from pyflux.core import (
     apply_T,
-    icp,
-    bead_initial_positions,
-    match_and_filter_beads,
-    dbscan_numpy,
-    avg_loc_by_tid,
-    _preprocess_xyz_points,
     apply_transform_to_arr,
+    avg_loc_by_tid,
+    bead_initial_positions,
+    best_rigid_transform,
+    dbscan_numpy,
+    icp,
+    match_and_filter_beads,
+    moving_average_1d,
     np_to_df,
     preview_localization_precision,
+    save_to_csv,
+    _preprocess_xyz_points,
+)
+from pyflux.plotting import (
+    _clip_to_scale_max,
+    pointcloud_to_image,
+    render_gaussians_xy,
     scatter_points_and_color,
     tid_to_color,
-    pointcloud_to_image,
-    _clip_to_scale_max,
 )
 
 
@@ -432,6 +435,26 @@ def test_clip_to_scale_max_invalid_max_returns_zeros():
     img = np.array([[1.0, 2.0]])
     out = _clip_to_scale_max(img, max_value=0.0)
     assert np.allclose(out, np.zeros_like(img))
+
+
+# ----------------------------
+# render_gaussians_xy
+# ----------------------------
+
+def test_render_gaussians_xy_returns_image_and_bounds():
+    x = np.array([0.0, 2.0])
+    y = np.array([0.0, 2.0])
+    img, bounds = render_gaussians_xy(x, y, sigma_nm=1.0, pixel_size_nm=1.0)
+    assert img.ndim == 2
+    assert img.size > 0
+    assert len(bounds) == 4
+
+
+def test_render_gaussians_xy_empty_input():
+    img, bounds = render_gaussians_xy([], [], sigma_nm=1.0, pixel_size_nm=1.0)
+    assert img.shape == (1, 1)
+    assert np.allclose(img, 0.0)
+    assert bounds == (0.0, 1.0, 0.0, 1.0)
 
 
 # ----------------------------
