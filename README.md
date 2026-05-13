@@ -2,7 +2,7 @@
 
 A desktop GUI for loading, filtering, visualizing, aligning, clustering, and exporting MINFLUX localization data from .npy files.
 
-![Demo GIF](./assets/vid3.gif)
+![Demo GIF](./assets/vid.gif)
 
 - Filter localizations by trace length, EFO, and CFR
 - View data in interactive 2D/3D scatter plots
@@ -12,7 +12,7 @@ A desktop GUI for loading, filtering, visualizing, aligning, clustering, and exp
 - Run DBSCAN clustering on track-averaged localizations
 - Export filtered data and summary statistics to CSV
 
-Built with PySide6, Plotly, Matplotlib, NumPy, Pandas, SciPy, and Zarr.
+Built with PySide6, Plotly, Pandas, SciPy, and Zarr.
 
 ## Installation
 
@@ -20,6 +20,10 @@ Built with PySide6, Plotly, Matplotlib, NumPy, Pandas, SciPy, and Zarr.
 - Unzip
 - For Macos: Allow app to run under Privacy & Security/Security -> Run anyway
 - For Windows: Trust developer
+
+## Manual
+
+Soon to come.
 
 ## TODO 
 
