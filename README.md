@@ -33,7 +33,6 @@ Soon to come.
 ## Known bugs pyflux
 
 - sometimes opens second window
-- when building with pyinstaller, scipy is not detected even though it is installed in .venv, see (workaround)[https://stackoverflow.com/questions/49559770/how-do-you-resolve-hidden-imports-not-found-warnings-in-pyinstaller-for-scipy?rq=1]
 
 ## License
 

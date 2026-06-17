@@ -1717,7 +1717,7 @@ class DBSCANWindow(QtWidgets.QMainWindow):
         self.eps_spin.setDecimals(1)
         self.eps_spin.setRange(0.1, 1e6)
         self.eps_spin.setSingleStep(5.0)
-        self.eps_spin.setValue(200.0)
+        self.eps_spin.setValue(80.0)
         params_grid.addWidget(self.eps_spin, 0, 1)
 
         params_grid.addWidget(QtWidgets.QLabel("min_samples:"), 1, 0)
@@ -2174,6 +2174,7 @@ class DBSCANWindow(QtWidgets.QMainWindow):
                     xaxis_title="x (nm)",
                     yaxis_title="y (nm)",
                     zaxis_title="z (nm)",
+                    dragmode="turntable",
                 )
             )
         apply_plot_theme(fig, is3d=is3d)
@@ -2490,6 +2491,7 @@ class MultiColorWindow(QtWidgets.QMainWindow):
         self._on_crop_requested = on_crop_requested
         self._on_reset_crop_requested = on_reset_crop_requested
         self._last_selection_payload = None
+        self._last_selection_source_id = None
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -2606,6 +2608,12 @@ class MultiColorWindow(QtWidgets.QMainWindow):
             btn_crop.move(x_crop, y)
             btn_reset.move(x_reset, y)
 
+    def _source_id_to_base(self, source_id: str):
+        for base, view in self._views.items():
+            if view._id == source_id:
+                return base
+        return None
+
     def _on_plot_selection(self, _source_id, payload):
         if not isinstance(payload, dict):
             return
@@ -2616,6 +2624,7 @@ class MultiColorWindow(QtWidgets.QMainWindow):
         if not (isinstance(xr, (list, tuple)) and isinstance(yr, (list, tuple)) and len(xr) == 2 and len(yr) == 2):
             return
         self._last_selection_payload = payload
+        self._last_selection_source_id = _source_id
 
     def _crop_current_selection(self):
         if self._on_crop_requested is None:
@@ -2638,6 +2647,11 @@ class MultiColorWindow(QtWidgets.QMainWindow):
         except Exception:
             QtWidgets.QMessageBox.information(self, "Crop", "Invalid box selection values.")
             return
+        if self._mode != "merged":
+            src_id = getattr(self, "_last_selection_source_id", None)
+            base = self._source_id_to_base(src_id) if src_id else None
+            if base is not None:
+                payload["base"] = base
         self._on_crop_requested(payload)
 
     def _reset_crop(self):
@@ -3429,7 +3443,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._arr_by_base = {}  # base -> currently active array for plotting (trace-filtered or EFO-filtered)
         self._base_by_file = {}  # file_path -> base (optional convenience)
         self._multicolor_win = None
-        self._multicolor_crop_bounds = None  # (xmin, xmax, ymin, ymax) for multicolor-only crop
+        self._multicolor_crop_bounds = None  # (xmin, xmax, ymin, ymax) for merged-mode crop
+        self._multicolor_crop_bounds_by_base = {}  # base -> (xmin, xmax, ymin, ymax) for per-sample crop in grid mode
         self._multicolor_cropped_by_base = {}  # base -> cropped array used only in multicolor viewer
 
         self._ctx_by_base = {}  # base -> ctx (from worker)
@@ -4139,19 +4154,28 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(self, "Crop", "Crop range must be finite.")
             return
 
-        self._multicolor_crop_bounds = (xmin, xmax, ymin, ymax)
+        bounds = (xmin, xmax, ymin, ymax)
+        crop_base = payload.get("base")
+        if crop_base is not None:
+            self._multicolor_crop_bounds_by_base[crop_base] = bounds
+        else:
+            self._multicolor_crop_bounds = bounds
         self._recompute_multicolor_crop_cache()
         self._refresh_multicolor_contents(reset_view=True)
         if self._dbscan_win is not None and self._dbscan_win.isVisible():
             self._dbscan_win.refresh_current_plot()
 
         n = int(sum(len(v) for v in self._multicolor_cropped_by_base.values() if v is not None))
-        self.statusBar().showMessage(f"Multicolor crop applied: x=[{xmin:.2f}, {xmax:.2f}], y=[{ymin:.2f}, {ymax:.2f}], kept {n} locs")
+        label = crop_base if crop_base else "all"
+        self.statusBar().showMessage(f"Crop ({label}): x=[{xmin:.2f}, {xmax:.2f}], y=[{ymin:.2f}, {ymax:.2f}], kept {n} locs")
 
     def _on_multicolor_reset_crop_requested(self):
-        if not getattr(self, "_multicolor_crop_bounds", None):
+        has_global = getattr(self, "_multicolor_crop_bounds", None)
+        has_per_base = bool(getattr(self, "_multicolor_crop_bounds_by_base", {}))
+        if not has_global and not has_per_base:
             return
         self._multicolor_crop_bounds = None
+        self._multicolor_crop_bounds_by_base.clear()
         self._multicolor_cropped_by_base.clear()
         self._refresh_multicolor_contents(reset_view=True)
         if self._dbscan_win is not None and self._dbscan_win.isVisible():
@@ -4160,13 +4184,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _recompute_multicolor_crop_cache(self):
         self._multicolor_cropped_by_base = {}
-        bounds = getattr(self, "_multicolor_crop_bounds", None)
-        if not bounds:
+        global_bounds = getattr(self, "_multicolor_crop_bounds", None)
+        per_base_bounds = getattr(self, "_multicolor_crop_bounds_by_base", {})
+        if not global_bounds and not per_base_bounds:
             return
 
-        xmin, xmax, ymin, ymax = bounds
         for f in self._all_files:
             base = os.path.splitext(os.path.basename(f))[0]
+            bounds = per_base_bounds.get(base, global_bounds)
+            if not bounds:
+                continue
             arr = self._get_arr_for_base(base)
             if arr is None:
                 continue
@@ -4174,6 +4201,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._multicolor_cropped_by_base[base] = arr
                 continue
 
+            xmin, xmax, ymin, ymax = bounds
             try:
                 loc = np.asarray(arr["loc"], dtype=float)
                 if loc.ndim != 2 or loc.shape[1] < 2:
@@ -4188,8 +4216,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._multicolor_cropped_by_base[base] = arr
 
     def _get_multicolor_arr_for_base(self, base: str):
-        if getattr(self, "_multicolor_crop_bounds", None):
-            return self._multicolor_cropped_by_base.get(base)
+        if getattr(self, "_multicolor_crop_bounds", None) or base in getattr(self, "_multicolor_crop_bounds_by_base", {}):
+            cropped = self._multicolor_cropped_by_base.get(base)
+            if cropped is not None:
+                return cropped
         return self._get_arr_for_base(base)
 
     def on_any_plot_view_changed(self, source_id, payload):
