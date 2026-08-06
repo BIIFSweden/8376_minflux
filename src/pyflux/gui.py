@@ -4043,7 +4043,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("MINFLUX Filter GUI (PyQt + Matplotlib + Plotly)")
+        self.setWindowTitle("pyflux")
         self.resize(1500, 950)
         self._plotly_tmp = None
         # state
