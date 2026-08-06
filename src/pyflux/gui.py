@@ -3,6 +3,8 @@ import json
 import os
 import sys
 import tempfile
+import time
+from collections import Counter
 from functools import partial
 
 import matplotlib
@@ -60,6 +62,7 @@ from .plotting import (
     add_scalebar_2d,
     apply_hist_theme,
     apply_plot_theme,
+    hist_edges,
     make_plotly_fig,
     make_plotly_fig_merged,
     make_plotly_gaussian_from_arr,
@@ -451,7 +454,13 @@ class ColorSettingsPanel(QtWidgets.QGroupBox):
 
         palette.blockSignals(False)
 
-    def rebuild(self, base_names, current_settings_by_base: dict):
+    def rebuild(self, base_names, current_settings_by_base: dict, mbm_source_base=None):
+        """Repopulate the table. `mbm_source_base` is the single authority for the
+        MBM source column — exactly one row can be checked, so the flag is derived
+        from MainWindow._mbm_source_base rather than stored per base in
+        current_settings_by_base (nothing ever wrote it there, so every rebuild
+        used to silently uncheck the source while _mbm_source_base stayed set).
+        """
         self.table.setRowCount(0)
         self._row_by_base.clear()
         self._widgets_by_base.clear()
@@ -501,7 +510,7 @@ class ColorSettingsPanel(QtWidgets.QGroupBox):
 
             # --- mbm source ---
             src_chk = QtWidgets.QCheckBox()
-            src_chk.setChecked(bool(s.get("mbm_source", False)))
+            src_chk.setChecked(mbm_source_base is not None and base == mbm_source_base)
             src_chk.stateChanged.connect(partial(self._on_source_toggled, base))
 
             cell = QtWidgets.QWidget()
@@ -552,7 +561,12 @@ class ColorSettingsPanel(QtWidgets.QGroupBox):
         self._emit_row(base)
 
     def _on_source_toggled(self, base: str, state: int):
-        if state != Qt.Checked:
+        # stateChanged delivers a plain int and Qt.CheckState is not an IntEnum in
+        # PySide6 6.9, so `state != Qt.Checked` is always True. Read the widget.
+        chk_self = (self._widgets_by_base.get(base) or {}).get("mbm_source")
+        checked = chk_self.isChecked() if chk_self is not None else int(state) == Qt.Checked.value
+
+        if not checked:
             self.changed.emit(base, {"mbm_source": False})
             return
 
@@ -664,16 +678,25 @@ class ParametersDialog(QtWidgets.QDialog):
             scalebar_nm=float(self.scalebar_nm.value()),
         )
 
-    def set_mbm_rows(self, file_paths):
+    def set_mbm_rows(self, file_paths, current=None, bases=None):
+        """One row per file. `current` maps base -> already-chosen MBM folder; a base
+        missing from it (or mapped to "") falls back to the <dir of .npy>/grd/mbm
+        default. Without it a custom path would be overwritten by the default every
+        time the dialog is opened, since mbm_map() is written back on OK.
+
+        `bases` are the dataset keys parallel to `file_paths` (MainWindow.all_bases());
+        deriving them here from the basename would reintroduce the collision between
+        two identically named .npy files in different subfolders."""
+        current = current or {}
         self.mbm_table.setRowCount(0)
         for r, fp in enumerate(file_paths):
-            base = os.path.splitext(os.path.basename(fp))[0]
+            base = bases[r] if bases else os.path.splitext(os.path.basename(fp))[0]
             default_mbm = os.path.join(os.path.dirname(fp), "grd", "mbm")
 
             self.mbm_table.insertRow(r)
             self.mbm_table.setItem(r, 0, QtWidgets.QTableWidgetItem(base))
 
-            le = QtWidgets.QLineEdit(default_mbm)
+            le = QtWidgets.QLineEdit(current.get(base) or default_mbm)
             self.mbm_table.setCellWidget(r, 1, le)
 
             btn = QtWidgets.QPushButton("Browse mbm…")
@@ -1920,12 +1943,13 @@ class DBSCANWindow(QtWidgets.QMainWindow):
             fig = go.Figure()
             fig.update_layout(annotations=[dict(text="No file loaded", x=0.5, y=0.5, showarrow=False)])
             apply_plot_theme(fig, is3d=False)
-            self.view.update_fig(fig, reset_view=True, is3d=False)
+            self._show_fig(fig)
 
     def _selected_arr(self, base: str):
         # Keep behavior aligned with multicolor viewer: refresh crop cache first,
-        # then resolve through the same accessor.
-        if getattr(self._mw, "_multicolor_crop_bounds", None):
+        # then resolve through the same accessor. Must cover per-base crops too —
+        # _get_multicolor_arr_for_base serves them whether or not a global crop exists.
+        if self._mw._has_any_crop():
             self._mw._recompute_multicolor_crop_cache()
 
         arr = self._mw._get_multicolor_arr_for_base(base)
@@ -1968,7 +1992,7 @@ class DBSCANWindow(QtWidgets.QMainWindow):
 
         # Track counts from the same array used to generate averages.
         nloc_by_tid = {}
-        if "tid" in arr.dtype.names:
+        if "tid" in (arr.dtype.names or ()):
             tids_all = np.asarray(arr["tid"])
             ut, cnt = np.unique(tids_all, return_counts=True)
             nloc_by_tid = {int(t): int(c) for t, c in zip(ut, cnt)}
@@ -1985,28 +2009,46 @@ class DBSCANWindow(QtWidgets.QMainWindow):
             }
         )
 
+    def _show_fig(self, fig):
+        """Render a figure into this window's view via a full page load.
+
+        This window deliberately bypasses PlotlyView's Plotly.react path to avoid
+        the sync/scalebar side effects that were hiding markers here. setHtml
+        replaces the bootstrap DOM (#plot, #container, window._plotSync) and
+        ensure_page() will not rebuild it, since _plotly_loaded was set when
+        PlotlyView was constructed — so *every* figure in this window must go
+        through here. A stray view.update_fig() would inject JS into a page with no
+        #plot, hit its `return "error: container missing"` guard and do nothing,
+        with no error anywhere: the previous plot would simply stay on screen.
+
+        Cost of the full reload is pan/zoom state, which this window does not try
+        to preserve. include_plotlyjs="cdn" is now the window's only CDN reference,
+        so vendoring plotly.min.js means changing this one call.
+        """
+        html = pio.to_html(
+            fig,
+            include_plotlyjs="cdn",
+            full_html=False,
+            config={
+                "scrollZoom": True,
+                "displaylogo": False,
+                "responsive": True,
+                "toImageButtonOptions": {
+                    "format": "png",
+                    "filename": "plot",
+                    "scale": 10,
+                },
+            },
+        )
+        self.view.web.setHtml(html, QUrl("about:blank"))
+
     def _plot_tracks(self, tracks_df: pd.DataFrame, labels=None, title: str = None):
         fig = go.Figure()
         is3d = self._is_3d_mode()
         if tracks_df is None or len(tracks_df) == 0:
             fig.update_layout(annotations=[dict(text="No avg loc (tid) data", x=0.5, y=0.5, showarrow=False)])
             apply_plot_theme(fig, is3d=is3d)
-            html = pio.to_html(
-                fig,
-                include_plotlyjs="cdn",
-                full_html=False,
-                config={
-                    "scrollZoom": True,
-                    "displaylogo": False,
-                    "responsive": True,
-                    "toImageButtonOptions": {
-                        "format": "png",
-                        "filename": "plot",
-                        "scale": 10,
-                    },
-                },
-            )
-            self.view.web.setHtml(html, QUrl("about:blank"))
+            self._show_fig(fig)
             return
 
         x = tracks_df["centroid_x"].to_numpy(dtype=float)
@@ -2186,24 +2228,7 @@ class DBSCANWindow(QtWidgets.QMainWindow):
             fig.update_yaxes(scaleanchor="x", scaleratio=1)
             add_scalebar_2d(fig, length_nm=float(getattr(self._mw, "_scalebar_nm", 100.0)))
 
-        # Use plain Plotly HTML rendering in DBSCAN window to avoid sync/scalebar
-        # side effects that can hide markers in this panel.
-        html = pio.to_html(
-            fig,
-            include_plotlyjs="cdn",
-            full_html=False,
-            config={
-                "scrollZoom": True,
-                "displaylogo": False,
-                "responsive": True,
-                "toImageButtonOptions": {
-                    "format": "png",
-                    "filename": "plot",
-                    "scale": 10,
-                },
-            },
-        )
-        self.view.web.setHtml(html, QUrl("about:blank"))
+        self._show_fig(fig)
 
     def load_base(self, base: str):
         arr = self._selected_arr(base)
@@ -2221,7 +2246,7 @@ class DBSCANWindow(QtWidgets.QMainWindow):
             )
             is3d = self._is_3d_mode()
             apply_plot_theme(fig, is3d=is3d)
-            self.view.update_fig(fig, reset_view=True, is3d=is3d)
+            self._show_fig(fig)
             return
 
         self._tracks_df = self._avg_tracks_df(arr)
@@ -2365,17 +2390,21 @@ class DBSCANWindow(QtWidgets.QMainWindow):
 
         # propagate track labels back to all localizations
         arr = self._current_arr
-        tid = np.asarray(arr["tid"]).astype(int) if "tid" in arr.dtype.names else np.array([], dtype=int)
-        loc = np.asarray(arr["loc"], dtype=float) if "loc" in arr.dtype.names else np.zeros((0, 3), dtype=float)
-        if loc.ndim != 2:
-            loc = np.zeros((len(tid), 3), dtype=float)
+        # `dtype.names` is None for a plain (non-structured) array, so membership has
+        # to be tested against a tuple. The fallbacks must also all be length n or the
+        # DataFrame below raises on mismatched column lengths.
+        names = arr.dtype.names or ()
         n = len(arr)
+        tid = np.asarray(arr["tid"]).astype(int) if "tid" in names else np.full(n, -1, dtype=int)
+        loc = np.asarray(arr["loc"], dtype=float) if "loc" in names else np.full((n, 3), np.nan)
+        if loc.ndim != 2 or len(loc) != n:
+            loc = np.full((n, 3), np.nan)
 
         x = loc[:, 0] if loc.shape[1] >= 1 else np.full(n, np.nan)
         y = loc[:, 1] if loc.shape[1] >= 2 else np.full(n, np.nan)
         z = loc[:, 2] if loc.shape[1] >= 3 else np.full(n, np.nan)
 
-        if "tim" in arr.dtype.names:
+        if "tim" in names:
             t = np.asarray(arr["tim"], dtype=float)
         else:
             t = np.arange(n, dtype=float)
@@ -2515,6 +2544,18 @@ class MultiColorWindow(QtWidgets.QMainWindow):
         self._reset_crop_btn.setMaximumWidth(110)
         self._reset_crop_btn.raise_()
 
+        self._grid_on = True
+        self._axis_titles = {}       # 3-D axis titles, learned from each pushed figure
+        self._grid_chk = QtWidgets.QCheckBox("Grid", central)
+        self._grid_chk.setChecked(True)
+        self._grid_chk.setToolTip(
+            "Show the plot grid.\n"
+            "In 3-D this hides the whole coordinate system (grid, ticks, labels, axes)."
+        )
+        self._grid_chk.toggled.connect(self._on_grid_toggled)
+        self._grid_chk.setFixedHeight(24)
+        self._grid_chk.raise_()
+
         # --- grid page ---
         self.grid_page = QtWidgets.QWidget()
         self.grid = QtWidgets.QGridLayout(self.grid_page)
@@ -2538,6 +2579,17 @@ class MultiColorWindow(QtWidgets.QMainWindow):
         self._views = {}  # base -> PlotlyView
         self._mode = "grid"  # or "merged"
 
+        # --- per-sample view synchronization (grid mode only) ---
+        self._sync_by_base = {}      # base -> bool, survives rebuild()
+        self._sync_boxes = {}        # base -> QCheckBox
+        self._last_view_by_base = {}  # base -> last relayout payload, to seed a newly ticked view
+        # base -> (deadline, payload just pushed). A view we pushed a range/camera into
+        # may echo that same relayout straight back; JS's `ignore` flag catches the
+        # common case and this is the backstop that stops an echo becoming a loop.
+        # Matching on the payload as well as the time window matters: suppressing a
+        # base outright would swallow a real gesture made right after it was synced.
+        self._sync_suppress = {}
+
     def set_mode(self, mode: str):
         mode = "merged" if mode == "merged" else "grid"
         self._mode = mode
@@ -2555,6 +2607,11 @@ class MultiColorWindow(QtWidgets.QMainWindow):
                 w.deleteLater()
 
         self._views.clear()
+        self._sync_boxes.clear()
+        # keep the ticks the user set, but only for samples this folder still has
+        self._sync_by_base = {b: v for b, v in self._sync_by_base.items() if b in base_names}
+        self._last_view_by_base = {b: v for b, v in self._last_view_by_base.items() if b in base_names}
+        self._sync_suppress.clear()
 
         n = max(1, len(base_names))
         cols = 2 if n <= 4 else 3
@@ -2565,12 +2622,29 @@ class MultiColorWindow(QtWidgets.QMainWindow):
             vbox = QtWidgets.QVBoxLayout(box)
             vbox.setContentsMargins(4, 8, 4, 4)
 
+            header = QtWidgets.QHBoxLayout()
+            header.setContentsMargins(0, 0, 0, 0)
+            sync_chk = QtWidgets.QCheckBox("Synchronize")
+            sync_chk.setToolTip(
+                "Pan, zoom and 3-D rotation done here are applied to every other\n"
+                "sample with Synchronize ticked. Cropping a synchronized sample\n"
+                "crops all of them."
+            )
+            sync_chk.setChecked(bool(self._sync_by_base.get(base, False)))
+            sync_chk.toggled.connect(partial(self._on_sync_toggled, base))
+            header.addWidget(sync_chk)
+            header.addStretch(1)
+            vbox.addLayout(header)
+
             view = PlotlyView()
-            view.viewChanged.connect(self._on_view_changed)
+            view.viewChanged.connect(self._on_grid_view_changed)
             view.selectionChanged.connect(self._on_plot_selection)
+            # set before the page exists: update_fig re-asserts it into the new page
+            view.set_live_sync(self._sync_by_base.get(base, False))
             vbox.addWidget(view, 1)
 
             self._views[base] = view
+            self._sync_boxes[base] = sync_chk
             self.grid.addWidget(box, r, c)
 
             c += 1
@@ -2578,10 +2652,65 @@ class MultiColorWindow(QtWidgets.QMainWindow):
                 c = 0
                 r += 1
 
+    # ---------------- grid visibility ----------------
+
+    def _apply_grid_to_fig(self, fig, is3d: bool, grid_on: bool):
+        """Bake the Grid setting into a figure before it is pushed.
+
+        Applied at the two places figures reach a view, so a redraw (filter, crop,
+        colour change, mode switch) cannot quietly bring the grid back. When the
+        grid is on the figure is left untouched rather than forced to `True`, so
+        "reinstate" restores exactly what `apply_plot_theme` produced.
+        """
+        if fig is None or not hasattr(fig, "update_layout"):
+            return fig
+        if is3d:
+            # Read off the *untouched* figure, which always carries the themed
+            # titles whichever way the checkbox is set — the live page cannot be
+            # asked for them once they have been blanked below, and hard-coding
+            # "X"/"Y"/"Z" here would silently drift from plotting.py.
+            try:
+                sc = fig.layout.scene
+                seen = {a: getattr(sc, a).title.text for a in ("xaxis", "yaxis", "zaxis")}
+                if all(seen.values()):
+                    self._axis_titles = seen
+            except Exception:
+                pass
+        if grid_on:
+            return fig
+        if is3d:
+            # component by component rather than `visible`, and matching
+            # PlotlyView.set_grid_visible exactly — see the note there on why
+            # hiding a scene axis outright is a one-way door for the titles
+            off = dict(showgrid=False, zeroline=False, showticklabels=False,
+                       showline=False, ticks="", title=dict(text=""))
+            fig.update_layout(scene=dict(xaxis=off, yaxis=off, zaxis=off))
+        else:
+            fig.update_xaxes(showgrid=False, zeroline=False)
+            fig.update_yaxes(showgrid=False, zeroline=False)
+        return fig
+
+    def _on_grid_toggled(self, checked: bool):
+        self._grid_on = bool(checked)
+        # relayout the live pages for instant feedback instead of re-rendering every
+        # figure; the figure-side bake above keeps it stuck on the next redraw
+        for view in list(self._views.values()) + [self.merged_view]:
+            if view is not None:
+                try:
+                    view.set_grid_visible(self._grid_on, self._axis_titles)
+                except Exception:
+                    pass
+
     def update_one(self, base, fig, reset_view=False, is3d=False, scalebar_nm=100.0):
         view = self._views.get(base)
         if view is None:
             return
+        self._apply_grid_to_fig(fig, is3d, self._grid_on)
+        if reset_view:
+            # the remembered range/camera no longer describes what is on screen, and
+            # after a 2D/3D switch it is the wrong kind of payload entirely
+            self._last_view_by_base.pop(base, None)
+            self._sync_suppress.pop(base, None)
         if (not is3d) and fig is not None:
             add_scalebar_2d(fig, length_nm=float(scalebar_nm))
         view.update_fig(fig, reset_view=reset_view, is3d=is3d, scalebar_nm=scalebar_nm)
@@ -2608,11 +2737,101 @@ class MultiColorWindow(QtWidgets.QMainWindow):
             btn_crop.move(x_crop, y)
             btn_reset.move(x_reset, y)
 
+            chk = getattr(self, "_grid_chk", None)
+            if chk is not None:
+                chk.adjustSize()
+                # sits to the left of Crop, baseline-aligned with the two buttons
+                chk.move(x_crop - chk.width() - gap,
+                         y + (btn_crop.height() - chk.height()) // 2)
+
     def _source_id_to_base(self, source_id: str):
         for base, view in self._views.items():
             if view._id == source_id:
                 return base
         return None
+
+    # ---------------- per-sample view synchronization ----------------
+
+    SYNC_ECHO_SUPPRESS_S = 0.15
+
+    def synced_bases(self):
+        """Bases whose Synchronize box is ticked, in grid order."""
+        return [b for b in self._views if self._sync_by_base.get(b, False)]
+
+    def _on_sync_toggled(self, base: str, checked: bool):
+        self._sync_by_base[base] = bool(checked)
+        # only a ticked panel streams during-drag events, so an unused feature costs
+        # nothing and the per-frame traffic stops the moment the box is cleared
+        view = self._views.get(base)
+        if view is not None:
+            view.set_live_sync(bool(checked))
+        if not checked:
+            return
+        # adopt whatever the group is currently looking at, so ticking the box does
+        # not leave this sample on a different region until the next mouse move
+        for other in self.synced_bases():
+            if other == base:
+                continue
+            payload = self._last_view_by_base.get(other)
+            if isinstance(payload, dict):
+                self._push_view(base, payload)
+                break
+
+    @staticmethod
+    def _same_view(a, b):
+        """Structural comparison of two relayout payloads, tolerant of float drift."""
+        if isinstance(a, dict) and isinstance(b, dict):
+            return a.keys() == b.keys() and all(MultiColorWindow._same_view(a[k], b[k]) for k in a)
+        if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+            return len(a) == len(b) and all(MultiColorWindow._same_view(x, y) for x, y in zip(a, b))
+        if isinstance(a, bool) or isinstance(b, bool):
+            return a is b
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+            return abs(float(a) - float(b)) <= 1e-9 * max(1.0, abs(float(a)), abs(float(b)))
+        return a == b
+
+    @staticmethod
+    def _strip_live(payload):
+        """A payload minus the transport-only `live` marker.
+
+        `live` records how a frame was produced (mid-gesture vs gesture end), not
+        what the view is, and only mid-gesture frames carry it. Echo suppression
+        compares key sets, so leaving it in means a pushed live frame can never
+        match the echo it provokes — the echo is then re-broadcast as if it were a
+        fresh gesture and bounces around the synchronized group.
+        """
+        if isinstance(payload, dict) and "live" in payload:
+            return {k: v for k, v in payload.items() if k != "live"}
+        return payload
+
+    def _push_view(self, base: str, payload: dict):
+        view = self._views.get(base)
+        if view is None:
+            return
+        self._sync_suppress[base] = (time.monotonic() + self.SYNC_ECHO_SUPPRESS_S,
+                                     self._strip_live(payload))
+        try:
+            view.apply_view(payload)
+        except Exception:
+            pass
+
+    def _on_grid_view_changed(self, source_id, payload):
+        """Relay one grid view's pan/zoom/camera to the other synchronized ones."""
+        base = self._source_id_to_base(source_id)
+        if base is not None and isinstance(payload, dict):
+            deadline, pushed = self._sync_suppress.get(base, (0.0, None))
+            if deadline > time.monotonic() and self._same_view(self._strip_live(payload), pushed):
+                # the echo of what we just pushed here, not a gesture the user made
+                return
+            self._last_view_by_base[base] = payload
+            if self._mode != "merged" and self._sync_by_base.get(base, False):
+                for other in self.synced_bases():
+                    if other == base:
+                        continue
+                    self._last_view_by_base[other] = payload
+                    self._push_view(other, payload)
+        if self._on_view_changed is not None:
+            self._on_view_changed(source_id, payload)
 
     def _on_plot_selection(self, _source_id, payload):
         if not isinstance(payload, dict):
@@ -2652,6 +2871,9 @@ class MultiColorWindow(QtWidgets.QMainWindow):
             base = self._source_id_to_base(src_id) if src_id else None
             if base is not None:
                 payload["base"] = base
+                if self._sync_by_base.get(base, False):
+                    # a synchronized sample crops its whole group, not just itself
+                    payload["bases"] = self.synced_bases()
         self._on_crop_requested(payload)
 
     def _reset_crop(self):
@@ -2663,6 +2885,7 @@ class MultiColorWindow(QtWidgets.QMainWindow):
         return False
 
     def update_merged(self, fig, reset_view=False, is3d=False, scalebar_nm=100.0):
+        self._apply_grid_to_fig(fig, is3d, self._grid_on)
         self.merged_view.update_fig(fig, reset_view=reset_view, is3d=is3d, scalebar_nm=scalebar_nm)
 
     def shutdown(self):
@@ -2702,6 +2925,7 @@ class PlotlyView(QtWidgets.QWidget):
         self._plotly_ready = False
         self._pending_fig = None
         self._id = hex(id(self))
+        self._live_sync = False  # during-drag broadcast; see set_live_sync
 
         # WebChannel bridge
         self._bridge = PlotSyncBridge()
@@ -2719,27 +2943,20 @@ class PlotlyView(QtWidgets.QWidget):
         self.web.page().setBackgroundColor(QColor(PLOTLY_HTML_BG))
         self.ensure_page()
 
-    def _on_download_requested(self, download: "QtWebEngineCore.QWebEngineDownloadRequest"):
-        # Suggest a filename
-        suggested = download.suggestedFileName() or "plot.png"
-
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self,
-            "Save Plot",
-            suggested,
-            "PNG Image (*.png);;All Files (*)"
-        )
-        if not path:
-            download.cancel()
-            return
-
-        # Ensure .png extension if user omitted it
-        if not os.path.splitext(path)[1]:
-            path += ".png"
-
-        download.setDownloadDirectory(os.path.dirname(path))
-        download.setDownloadFileName(os.path.basename(path))
-        download.accept()
+    # Never connected to any signal; the real handler is the module-level
+    # handle_download_requested wired up in main.py.
+    # def _on_download_requested(self, download):
+    #     suggested = download.suggestedFileName() or "plot.png"
+    #     path, _ = QtWidgets.QFileDialog.getSaveFileName(
+    #         self, "Save Plot", suggested, "PNG Image (*.png);;All Files (*)")
+    #     if not path:
+    #         download.cancel()
+    #         return
+    #     if not os.path.splitext(path)[1]:
+    #         path += ".png"
+    #     download.setDownloadDirectory(os.path.dirname(path))
+    #     download.setDownloadFileName(os.path.basename(path))
+    #     download.accept()
 
     def _bootstrap_html(self):
         bg = PLOTLY_HTML_BG
@@ -2779,7 +2996,10 @@ class PlotlyView(QtWidgets.QWidget):
     <div id="container"><div id="plot"></div></div>
 
     <script>
-    window._plotSync = {{ ready:false, bridge:null, sourceId:null, ignore:false, _scalebarUpdating:false, scalebarNm: 100.0 }};
+    window._plotSync = {{ ready:false, bridge:null, sourceId:null, ignore:false, _scalebarUpdating:false, scalebarNm: 100.0,
+                          liveSync:false, _applying:false, _queued:null, gestureActive:false,
+                          _settleRaf:null, _settleCommit:false, _lastCamSent:null,
+                          pointerDown:false }};
 
     new QWebChannel(qt.webChannelTransport, function(channel) {{
     window._plotSync.bridge = channel.objects.plotSync;
@@ -2886,18 +3106,86 @@ class PlotlyView(QtWidgets.QWidget):
     const gd = document.getElementById('plot');
     if (!gd) return;
 
-    if (gd.removeAllListeners) gd.removeAllListeners('plotly_relayout');
+    // This runs after EVERY Plotly.react, not just a DOM rebuild. Only
+    // 'plotly_relayout' used to be cleared, so one live-sync handler was left
+    // behind per redraw — each with its own _pending/_timer/_lastSent, all
+    // broadcasting, older ones bypassing the throttle with a stale _lastSent and
+    // sending snapshots taken at different instants. Clear both.
+    if (gd.removeAllListeners) {{
+        gd.removeAllListeners('plotly_relayout');
+        gd.removeAllListeners('plotly_relayouting');
+    }}
+    // A 2-D/3-D switch rebuilds the node but keeps _plotSync, so a settle watcher
+    // left running from the old scene would commit a camera to a detached div.
+    if (window._plotSync._settleRaf) {{
+        cancelAnimationFrame(window._plotSync._settleRaf);
+        window._plotSync._settleRaf = null;
+    }}
 
     let _lastSent = 0;
     let _timer = null;
     let _pending = null;
+
+    // A 3-D gesture is only ever started by an input event. gl-plot3d keeps
+    // interpolating the camera for a few frames after the button is released, so
+    // plotly_relayouting carries on firing AFTER the gesture-end plotly_relayout —
+    // and whatever arrives last wins on the receiving side, leaving the other
+    // panels on the settled camera while this one's _fullLayout is frozen at the
+    // mouse-up value. They then disagree on the next full redraw. Gating live
+    // frames on a real gesture drops those trailing frames exactly, with no timer.
+    // Flag lives on _plotSync, and the DOM listeners are attached once per node:
+    // this function re-runs on every redraw, and addEventListener has no
+    // removeAllListeners equivalent, so a per-call closure would accumulate.
+    // A 2-D/3-D switch rebuilds the node, which drops the marker with it.
+    if (!gd.__gestureHooked) {{
+        gd.__gestureHooked = true;
+        ['mousedown', 'wheel', 'touchstart'].forEach(function(evt) {{
+        gd.addEventListener(evt, function() {{
+            window._plotSync.gestureActive = true;
+        }}, true);
+        }});
+        gd.addEventListener('mousedown', function() {{
+        window._plotSync.pointerDown = true;
+        }}, true);
+    }}
+    // Whether a button is held is tracked separately from gestureActive, because
+    // the relayout handler clears gestureActive on EVERY relayout including a
+    // mid-drag one — which let the settle watcher run against a gesture still in
+    // progress, commit a scene.camera on top of it and cancel the user's rotation
+    // outright (observed as source_moved=False while the targets had followed).
+    // The button can be released outside the plot div, so this goes on the window,
+    // once per page rather than once per node.
+    if (!window.__plotSyncPointerHooked) {{
+        window.__plotSyncPointerHooked = true;
+        ['mouseup', 'touchend', 'touchcancel'].forEach(function(evt) {{
+        window.addEventListener(evt, function() {{
+            window._plotSync.pointerDown = false;
+        }}, true);
+        }});
+    }}
 
     function buildPayload(gd) {{
         const is3d = !!(gd._fullLayout && gd._fullLayout.scene);
         const payload = {{ mode: is3d ? "3d" : "2d" }};
 
         if (is3d) {{
-        const cam = gd._fullLayout.scene && gd._fullLayout.scene.camera;
+        const sc = gd._fullLayout.scene;
+        let cam = null;
+        // Always the RENDERED camera, never _fullLayout.scene.camera. plotly does
+        // not commit the stored one during a gesture (measured: 2 distinct values
+        // across a drag versus 26 from getCamera()), and — the part that was missed
+        // first time round — it has still not committed it when the gesture-end
+        // plotly_relayout fires either. Building that frame from the stored value
+        // broadcast the PRE-GESTURE camera, so every target visibly snapped back to
+        // where the gesture started and was only corrected ~100 ms later by the
+        // settle broadcast below. Same {{up, center, eye, projection}} shape
+        // apply_view feeds to scene.camera. Stored value kept only as the fallback
+        // for a page with no WebGL, or before gl-plot3d has come up.
+        try {{
+            const s = sc && sc._scene;
+            if (s && s.glplot && s.getCamera) cam = s.getCamera();
+        }} catch (e) {{}}
+        if (!cam) cam = sc && sc.camera;
         if (cam) payload.camera = cam;
         }} else {{
         const xa = gd._fullLayout.xaxis, ya = gd._fullLayout.yaxis;
@@ -2913,7 +3201,11 @@ class PlotlyView(QtWidgets.QWidget):
         _timer = null;
         if (!_pending) return;
 
-        if (window._plotSync.ignore || window._plotSync._scalebarUpdating) {{
+        // Only `ignore` is re-checked here. _scalebarUpdating is deliberately not:
+        // the handler already rejected the scalebar's own relayout on the way in,
+        // and on the immediate path this flag is still true from the update that
+        // this very gesture just kicked off.
+        if (window._plotSync.ignore) {{
         _pending = null;
         return;
         }}
@@ -2921,20 +3213,137 @@ class PlotlyView(QtWidgets.QWidget):
         const payload = _pending;
         _pending = null;
 
+        // Remember the camera we last put on the wire, so the settle watcher can
+        // tell "the ease carried on past this" from "nothing has changed".
+        if (payload.camera) {{
+        try {{
+            const c = payload.camera;
+            window._plotSync._lastCamSent = [c.eye.x, c.eye.y, c.eye.z,
+                                             c.center.x, c.center.y, c.center.z,
+                                             c.up.x, c.up.y, c.up.z];
+        }} catch (e) {{}}
+        }}
+
         if (window._plotSync.ready && window._plotSync.bridge) {{
         window._plotSync.bridge.relayView(window._plotSync.sourceId || "unknown", payload);
         }}
     }}
 
+    // gl-plot3d EASES the camera toward its target over several frames. A scroll
+    // zoom emits one plotly_relayout per notch, each carrying the camera as it
+    // stands at that instant — mid-ease — and then emits nothing whatsoever once
+    // the wheel stops, so the settled camera is never broadcast at all and every
+    // synchronized panel is left one animation tail behind. Measured over six
+    // notches: the source ends at eye-distance 0.889 and the targets at 1.033, a
+    // visibly shallower zoom that reads as the other panels snapping back to a
+    // previous view. A drag escapes this only because its gesture-end relayout
+    // arrives after the ease has already finished (residual 2e-4). So watch the
+    // RENDERED camera until it stops moving, then broadcast that.
+    function scheduleSettleBroadcast(gd) {{
+        const sc = gd._fullLayout && gd._fullLayout.scene;
+        const s = sc && sc._scene;
+        if (!s || !s.glplot || !s.getCamera) return;
+
+        if (window._plotSync._settleRaf) {{
+        cancelAnimationFrame(window._plotSync._settleRaf);
+        window._plotSync._settleRaf = null;
+        }}
+
+        const flat = (c) => [c.eye.x, c.eye.y, c.eye.z,
+                             c.center.x, c.center.y, c.center.z,
+                             c.up.x, c.up.y, c.up.z];
+        let prev = null, stillFor = 0;
+        const giveUpAt = Date.now() + 1500;
+
+        const step = function() {{
+        window._plotSync._settleRaf = null;
+        // a gesture owns the camera now, and will schedule its own watcher when it
+        // ends. pointerDown covers the case gestureActive cannot: a mid-drag
+        // relayout clears gestureActive while the button is still held.
+        if (window._plotSync.gestureActive || window._plotSync.pointerDown) return;
+        let cam = null;
+        try {{ cam = s.getCamera(); }} catch (e) {{ return; }}
+        if (!cam || !cam.eye) return;
+        const cur = flat(cam);
+        const moved = !prev || cur.some((v, i) => Math.abs(v - prev[i]) > 1e-7);
+        prev = cur;
+        stillFor = moved ? 0 : stillFor + 1;
+        // two identical frames, or a cap so this can never spin indefinitely
+        if (stillFor < 2 && Date.now() < giveUpAt) {{
+            window._plotSync._settleRaf = requestAnimationFrame(step);
+            return;
+        }}
+
+        // Broadcasting and committing are decided SEPARATELY. Tying them to one
+        // "has anything changed" test meant that whenever the ease had already
+        // finished by mouse-up — so the gesture-end frame was already correct and
+        // needed no follow-up — the commit was skipped along with it, and the
+        // source kept plotly's stale stored camera while the targets moved on
+        // (seen as source_moved=False in the loop harness). Between them these two
+        // tests are also what stops the commit feeding itself: after it lands,
+        // stored == cur == _lastCamSent and the next watcher finds nothing to do.
+        const off = (a) => !a || a.some((v, i) => Math.abs(v - cur[i]) > 1e-6);
+        const last = window._plotSync._lastCamSent;
+        const storedCam = sc && sc.camera;
+        const needBroadcast = off(last);
+        const needCommit = off(storedCam && flat(storedCam));
+        if (!needBroadcast && !needCommit) return;
+
+        // Out through the same throttled channel as every other frame, dropping
+        // anything still queued behind the throttle. The gesture-end frame is
+        // usually sitting in that 40 ms timer while this watcher finishes in ~32 ms;
+        // broadcasting around it let the older frame land last and leave the targets
+        // a fraction behind the source (measured: 1e-3 off, 6/8 drags in the loop
+        // harness, reproducibly 8/8 with this watcher disabled).
+        if (needBroadcast) {{
+            window._plotSync._lastCamSent = cur;
+            if (_timer) {{ clearTimeout(_timer); _timer = null; }}
+            _pending = {{ mode: "3d", camera: cam }};
+            _lastSent = Date.now();
+            maybeSend();
+        }}
+
+        // Commit it to this page as well: plotly's stored camera is still the
+        // mid-ease value, so without this the SOURCE is the one that jumps, on
+        // its next Plotly.react, while the targets stay put. The page is already
+        // rendering this camera, so the relayout is visually a no-op.
+        //
+        // Suppressed by a consume-once flag rather than by holding `ignore` over a
+        // time window: a window swallows whatever real gesture happens to land
+        // inside it, which cost a scroll zoom its final notch (measured: the last
+        // wheel of six produced no broadcast at all).
+        if (needCommit) {{
+            window._plotSync._settleCommit = true;
+            const clear = () => {{ window._plotSync._settleCommit = false; }};
+            try {{
+            const r = Plotly.relayout(gd, {{"scene.camera": cam}});
+            if (r && r.then) {{ r.then(clear).catch(clear); }} else {{ clear(); }}
+            }} catch (e) {{ clear(); }}
+        }}
+        }};
+        window._plotSync._settleRaf = requestAnimationFrame(step);
+    }}
+
     gd.on('plotly_relayout', function(e) {{
         try {{
+        // Decide whether this relayout is the user's BEFORE touching the scalebar:
+        // updateScaleBar2D sets _scalebarUpdating synchronously, so a guard read
+        // after the call always sees our own update and 2D never broadcasts at all.
+        // The settle commit is consumed here rather than timed out, so it can only
+        // ever swallow its own single event.
+        const settleEcho = window._plotSync._settleCommit;
+        if (settleEcho) window._plotSync._settleCommit = false;
+        const suppressed = window._plotSync.ignore || window._plotSync._scalebarUpdating || settleEcho;
+
         // ALWAYS update scalebar for user pan/zoom (skip only if we are updating it ourselves)
         if (!window._plotSync._scalebarUpdating) {{
             updateScaleBar2D(gd);
         }}
 
         // broadcasting part
-        if (window._plotSync.ignore || window._plotSync._scalebarUpdating) return;
+        // the gesture is over either way, even if this relayout is one of ours
+        window._plotSync.gestureActive = false;
+        if (suppressed) return;
 
         const now = Date.now();
         _pending = buildPayload(gd);
@@ -2952,8 +3361,44 @@ class PlotlyView(QtWidgets.QWidget):
             maybeSend();
             }}, minInterval - dt);
         }}
+
+        // 3-D only, and a no-op if the camera is already at rest
+        scheduleSettleBroadcast(gd);
         }} catch(err) {{
         console.log("relayout hook error", err);
+        }}
+    }});
+
+    // A 2-D pan/zoom emits plotly_relayout only ONCE, at mouse-up, while a 3-D
+    // camera drag emits it continuously — which is why 2-D synchronization used to
+    // land in one jump at the end of the gesture and 3-D followed live. The live
+    // stream for 2-D is plotly_relayouting (38 events for the same drag that
+    // produced 1 relayout). Gated on liveSync so only panels with Synchronize
+    // ticked pay for it: an unticked panel and the main viewer emit nothing extra.
+    gd.on('plotly_relayouting', function(e) {{
+        try {{
+        if (!window._plotSync.liveSync || window._plotSync.ignore) return;
+        if (!window._plotSync.gestureActive) return;  // post-gesture settling, not the user
+        // no updateScaleBar2D here on purpose: that is a second relayout per frame,
+        // and the gesture-end plotly_relayout above places the bar correctly anyway
+        _pending = buildPayload(gd);
+        _pending.live = true;
+
+        const now = Date.now();
+        const minInterval = 40;
+        const dt = now - _lastSent;
+        if (dt >= minInterval) {{
+            _lastSent = now;
+            maybeSend();
+        }} else {{
+            if (_timer) clearTimeout(_timer);
+            _timer = setTimeout(() => {{
+            _lastSent = Date.now();
+            maybeSend();
+            }}, minInterval - dt);
+        }}
+        }} catch(err) {{
+        console.log("relayouting hook error", err);
         }}
     }});
     }}
@@ -3122,19 +3567,22 @@ function installRelayoutHandler() {{
     def _on_load_finished(self, ok: bool):
         self._plotly_ready = bool(ok)
         if ok and self._pending_fig is not None:
-            fig, reset_view, is3d = self._pending_fig
+            fig, reset_view, is3d, scalebar_nm = self._pending_fig
             self._pending_fig = None
-            self.update_fig(fig, reset_view=reset_view, is3d=is3d)
+            self.update_fig(fig, reset_view=reset_view, is3d=is3d, scalebar_nm=scalebar_nm)
 
     def update_fig(self, fig, reset_view=False, is3d=False, scalebar_nm=None):
         self.ensure_page()
         if not self._plotly_ready:
-            self._pending_fig = (fig, reset_view, is3d)
+            # scalebar_nm must be carried too: replaying without it in
+            # _on_load_finished would silently fall back to the 100 nm default
+            self._pending_fig = (fig, reset_view, is3d, scalebar_nm)
             return
         self._last_fig = fig
         fig_json = pio.to_json(fig, validate=False)
         source_id = self._id
         sb = 100.0 if scalebar_nm is None else float(scalebar_nm)
+        live_sync = "true" if getattr(self, "_live_sync", False) else "false"
         js = f"""
     (async function() {{
     try {{
@@ -3180,6 +3628,8 @@ function installRelayoutHandler() {{
         window._plotSync.sourceId = "{source_id}";
         window._plotSync.ignore = true;
         window._plotSync.scalebarNm = {sb};
+        // re-asserted here because a page reload rebuilds _plotSync with liveSync:false
+        window._plotSync.liveSync = {live_sync};
         if (modeChanged || !gd.data) {{
         try {{ Plotly.purge(gd); }} catch(e) {{}}
         container.innerHTML = '<div id="plot" style="width:100%;height:100%;"></div>';
@@ -3246,7 +3696,12 @@ function installRelayoutHandler() {{
         self.web.page().runJavaScript(js)
 
     def apply_view(self, payload: dict):
-        """Apply external view state to this plot (ranges/camera) without re-broadcast."""
+        """Apply external view state to this plot (ranges/camera) without re-broadcast.
+
+        Used by MultiColorWindow's per-sample "Synchronize" boxes. `ignore` is held
+        for the whole `Plotly.relayout` — clearing it on a fixed timer instead would
+        let the applied relayout echo back out and bounce between synced views.
+        """
         self.ensure_page()
         if not self._plotly_ready:
             return
@@ -3258,28 +3713,135 @@ function installRelayoutHandler() {{
   if (!gd || !gd._fullLayout) return "no gd";
 
   const p = {payload_json};
-  window._plotSync.ignore = true;
-  try {{
-    if (p.mode === "2d" && p.xRange && p.yRange) {{
-      Plotly.relayout(gd, {{
-        "xaxis.range": p.xRange,
-        "yaxis.range": p.yRange,
-        "xaxis.autorange": false,
-        "yaxis.autorange": false
-      }});
-    }} else if (p.mode === "3d" && p.camera) {{
-      Plotly.relayout(gd, {{
-        "scene.camera": p.camera
-      }});
+  // the source's mode can be stale (someone toggled 2D/3D since it was captured),
+  // and relayouting xaxis.range on a scene — or scene.camera on a 2-D plot — is junk
+  const is3d = !!gd._fullLayout.scene;
+  let update = null;
+  if (p.mode === "2d" && !is3d && p.xRange && p.yRange) {{
+    update = {{
+      "xaxis.range": p.xRange,
+      "yaxis.range": p.yRange,
+      "xaxis.autorange": false,
+      "yaxis.autorange": false
+    }};
+  }} else if (p.mode === "3d" && is3d && p.camera) {{
+    update = {{ "scene.camera": p.camera }};
+  }}
+  if (!update) return "mode mismatch";
+
+  // Coalesce instead of queueing. During a live drag these arrive faster than a
+  // big scattergl panel can redraw; without this the backlog grows for as long as
+  // the gesture lasts and the panel keeps animating after the mouse stops. Holding
+  // only the newest pending update makes the cost self-limiting: a fast machine
+  // follows every frame, a slow one drops intermediate frames and still lands on
+  // the exact final view, because the last update always gets applied.
+  if (window._plotSync._applying) {{
+    window._plotSync._queued = update;
+    return "coalesced";
+  }}
+
+  const run = (u) => {{
+    window._plotSync._applying = true;
+    window._plotSync.ignore = true;
+    const done = () => {{
+      const next = window._plotSync._queued;
+      window._plotSync._queued = null;
+      if (next) {{ run(next); return; }}
+      window._plotSync._applying = false;
+      setTimeout(() => {{ window._plotSync.ignore = false; }}, 30);
+    }};
+    try {{
+      const r = Plotly.relayout(gd, u);
+      if (r && r.then) {{ r.then(done).catch(done); }} else {{ done(); }}
+    }} catch (e) {{
+      window._plotSync._queued = null;
+      window._plotSync._applying = false;
+      setTimeout(() => {{ window._plotSync.ignore = false; }}, 30);
     }}
-  }} finally {{
-    const delay = (p.mode === "3d") ? 50 : 10;
-    setTimeout(() => {{ window._plotSync.ignore = false; }}, delay);
+  }};
+  run(update);
+  return "applied";
+}})();
+"""
+        self.web.page().runJavaScript(js)
+
+    def set_grid_visible(self, on: bool, axis_titles=None):
+        """Show/hide the grid on the live page without rebuilding the figure.
+
+        2-D toggles the grid and zero lines. 3-D switches off each part of the
+        coordinate system separately and blanks the axis titles, which together
+        render identically to hiding the axes — deliberately *not* `visible`,
+        even though that is the obvious one-liner: plotly's AxesOptions.merge
+        sets `labelEnable=false` for an invisible scene axis and never sets it
+        back, so one off/on cycle would cost the X/Y/Z titles for the lifetime
+        of the scene. Every attribute used here is re-derived on the way back.
+
+        `axis_titles` is the {axis: text} the themed figure carries, since the
+        page cannot know it once the titles have been blanked.
+        """
+        self.ensure_page()
+        if not self._plotly_ready:
+            return
+        flag = "true" if on else "false"
+        titles = json.dumps(axis_titles or {})
+        js = f"""
+(function() {{
+  const gd = document.getElementById('plot');
+  if (!gd || !gd._fullLayout) return "no gd";
+  const on = {flag};
+  const titles = {titles};
+  const is3d = !!gd._fullLayout.scene;
+  let u;
+  if (is3d) {{
+    u = {{}};
+    ['xaxis', 'yaxis', 'zaxis'].forEach(function(a) {{
+      const p = 'scene.' + a + '.';
+      // null deletes the key, so plotly re-derives it from the themed figure
+      u[p + 'showgrid']       = on ? null : false;
+      u[p + 'zeroline']       = on ? null : false;
+      u[p + 'showticklabels'] = on ? null : false;
+      u[p + 'showline']       = on ? null : false;
+      u[p + 'ticks']          = on ? null : '';
+      if (!on) {{
+        u[p + 'title.text'] = '';
+      }} else if (titles[a] !== undefined) {{
+        u[p + 'title.text'] = titles[a];
+      }}
+    }});
+  }} else {{
+    u = {{ "xaxis.showgrid": on, "yaxis.showgrid": on,
+          "xaxis.zeroline": on, "yaxis.zeroline": on }};
+  }}
+  // not a view change: suppress the broadcast so a synchronized group does not
+  // treat a grid toggle as a pan
+  window._plotSync.ignore = true;
+  const release = () => setTimeout(() => {{ window._plotSync.ignore = false; }}, 30);
+  try {{
+    const r = Plotly.relayout(gd, u);
+    if (r && r.then) {{ r.then(release).catch(release); }} else {{ release(); }}
+  }} catch (e) {{
+    release();
+    return "error: " + e;
   }}
   return "applied";
 }})();
 """
         self.web.page().runJavaScript(js)
+
+    def set_live_sync(self, on: bool):
+        """Turn the during-drag (plotly_relayouting) broadcast on or off for this view.
+
+        Off by default and re-asserted by update_fig, so a panel without Synchronize
+        ticked — and the main viewer, which never calls this — emits nothing extra.
+        """
+        self._live_sync = bool(on)
+        self.ensure_page()
+        if not self._plotly_ready:
+            return
+        flag = "true" if self._live_sync else "false"
+        self.web.page().runJavaScript(
+            f"(function(){{ if (window._plotSync) window._plotSync.liveSync = {flag}; }})();"
+        )
 
     def shutdown(self):
         try:
@@ -3298,6 +3860,11 @@ class FileWorker(QtCore.QThread):
     need_efo = Signal(object)  # ctx dict -> GUI should show histogram + scatter and let user choose
     status = Signal(str)
     done_one = Signal(object)  # result dict (final stats row items), None if skipped
+
+    # Every field _process_one_file reads off the loaded array. Checked up front so
+    # a non-MINFLUX or truncated .npy is reported as a skipped file instead of
+    # surfacing a raw KeyError/IndexError through run()'s except handler.
+    REQUIRED_FIELDS = ("tim", "vld", "loc", "itr", "tid", "efo", "cfr")
 
     def __init__(self, file_path, params, parent=None):
         super().__init__(parent)
@@ -3333,17 +3900,59 @@ class FileWorker(QtCore.QThread):
             self.status.emit(f"ERROR: {e}")
             self.done_one.emit(None)
 
+    def _load_interruptible(self, file, chunk=100_000):
+        """`np.load` split into cancellable pieces.
+
+        A plain `np.load` of a large file is one uninterruptible C call with no
+        `_check_cancel()` inside it, so `MainWindow.closeEvent`'s cancel + wait
+        times out and Qt destroys a still-running QThread — a hard crash on quit.
+        Memory-mapping and copying row blocks gives cancellation somewhere to fire.
+        """
+        try:
+            mm = np.load(file, allow_pickle=False, mmap_mode="r")
+        except Exception:
+            # not memory-mappable (unusual layout, or a container) — one shot
+            return np.load(file, allow_pickle=False).copy()
+
+        if mm.ndim == 0 or len(mm) <= chunk:
+            return np.asarray(mm).copy()
+
+        out = np.empty(mm.shape, dtype=mm.dtype)
+        for i in range(0, len(mm), chunk):
+            self._check_cancel()
+            out[i:i + chunk] = mm[i:i + chunk]
+        return out
+
     def _process_one_file(self):
         p = self.params
         file = self.file_path
-        base = os.path.splitext(os.path.basename(file))[0]
+        # the key is assigned by MainWindow (see _unique_bases); the stem is only a
+        # fallback for a caller that did not pass one
+        base = p.get("base") or os.path.splitext(os.path.basename(file))[0]
         self.status.emit(f"Loading: {base}")
 
-        MFX_Data = np.load(file, allow_pickle=False)
-        MFX_Data = MFX_Data.copy()
+        MFX_Data = self._load_interruptible(file)
         if self.isInterruptionRequested():
             return None
         self._check_cancel()
+
+        # Validate before touching any field. `dtype.names` is None for a plain
+        # (non-structured) array, so testing membership against it directly would
+        # raise TypeError instead of reporting an unusable file.
+        names = MFX_Data.dtype.names or ()
+        missing = [f for f in self.REQUIRED_FIELDS if f not in names]
+        if missing:
+            what = "not a structured array" if not names else f"missing field(s): {', '.join(missing)}"
+            self.status.emit(f"Skipping {base}: not MINFLUX data — {what}.")
+            return None
+        if len(MFX_Data) == 0:
+            self.status.emit(f"Skipping {base}: file contains no localizations.")
+            return None
+        # loc is indexed as [:, -1] and [:, 1] below
+        loc_shape = MFX_Data["loc"].shape
+        if len(loc_shape) != 2 or loc_shape[1] < 2:
+            self.status.emit(f"Skipping {base}: 'loc' has shape {loc_shape}, expected (N, 2) or (N, 3).")
+            return None
 
         total_tim = MFX_Data["tim"][-1] - MFX_Data["tim"][0]
         total_loc = len(MFX_Data)
@@ -3374,10 +3983,6 @@ class FileWorker(QtCore.QThread):
             self.status.emit(f"Skipping {base}: no data after trace filtering.")
             return None
 
-        if "cfr" not in MFX_Data.dtype.names:
-            self.status.emit(f"Skipping {base}: no CFR field.")
-            return None
-
         # last valid CFR iteration = last itr with std(cfr) > 0
         iters = np.sort(np.unique(MFX_Data["itr"]))
         valid_cfr_iters = [it for it in iters if np.std(MFX_Data["cfr"][MFX_Data["itr"] == it]) > 0.0]
@@ -3386,23 +3991,27 @@ class FileWorker(QtCore.QThread):
         max_itr = np.max(MFX_Data_vld_fnl_filt["itr"])
         efo_vals = MFX_Data_vld_fnl_filt["efo"][MFX_Data_vld_fnl_filt["itr"] == max_itr]
 
-        # get CFR for final tids from last valid CFR iteration
+        # get CFR for the final localizations from the last valid CFR iteration.
+        # Both frames hold one row per localization of a trace, so the join key is
+        # (tid, occurrence within tid): row k of a tid at last_cfr_itr belongs to the
+        # same localization cycle as row k of that tid at last_itr. Joining on tid
+        # alone would be a per-tid cartesian product (n rows in -> n**2 rows out).
         final_tids = pd.DataFrame({"tid": MFX_Data_vld_fnl_filt["tid"]})
-        cfr_df = pd.DataFrame({
-            "tid": MFX_Data[MFX_Data["itr"] == last_cfr_itr]["tid"],
-            "cfr": MFX_Data[MFX_Data["itr"] == last_cfr_itr]["cfr"],
-        })
-        merged = final_tids.merge(cfr_df, on="tid", how="left")
-        cfr_vals = merged["cfr"].dropna().to_numpy()
+        final_tids["occ"] = final_tids.groupby("tid").cumcount()
+        cfr_src = MFX_Data[MFX_Data["itr"] == last_cfr_itr]
+        cfr_df = pd.DataFrame({"tid": cfr_src["tid"], "cfr": cfr_src["cfr"]})
+        cfr_df["occ"] = cfr_df.groupby("tid").cumcount()
 
-        # optionally also overwrite cfr in the returned array for downstream filtering/saving
-        if len(merged) == len(MFX_Data_vld_fnl_filt):
-            cfr_arr = merged["cfr"].to_numpy()
-            valid = np.isfinite(cfr_arr)
-            MFX_Data_vld_fnl_filt = MFX_Data_vld_fnl_filt[valid].copy()
-            MFX_Data_vld_fnl_filt["cfr"] = cfr_arr[valid]
-            efo_vals = efo_vals[valid]
-            cfr_vals = cfr_arr[valid]
+        merged = final_tids.merge(cfr_df, on=["tid", "occ"], how="left")
+
+        # overwrite cfr in the returned array so the histogram and the span filter
+        # both see the values from last_cfr_itr instead of the constant final ones
+        cfr_arr = merged["cfr"].to_numpy(dtype=float)
+        valid = np.isfinite(cfr_arr)
+        MFX_Data_vld_fnl_filt = MFX_Data_vld_fnl_filt[valid].copy()
+        MFX_Data_vld_fnl_filt["cfr"] = cfr_arr[valid]
+        efo_vals = efo_vals[valid]
+        cfr_vals = cfr_arr[valid]
 
         self._check_cancel()
         if len(efo_vals) == 0:
@@ -3428,6 +4037,10 @@ class FileWorker(QtCore.QThread):
 
 # -------------------- main window --------------------
 class MainWindow(QtWidgets.QMainWindow):
+    # Workers that outlived closeEvent's wait budget. Held at class scope so neither
+    # Qt nor Python destroys a thread that is still running (see closeEvent).
+    _orphaned_workers = set()
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("MINFLUX Filter GUI (PyQt + Matplotlib + Plotly)")
@@ -3441,7 +4054,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_span = (None, None)
         self._current_is_3d = False  # Track current plot mode
         self._arr_by_base = {}  # base -> currently active array for plotting (trace-filtered or EFO-filtered)
-        self._base_by_file = {}  # file_path -> base (optional convenience)
+        self._base_by_file = {}  # file_path -> base; the authority for every _by_base key
         self._multicolor_win = None
         self._multicolor_crop_bounds = None  # (xmin, xmax, ymin, ymax) for merged-mode crop
         self._multicolor_crop_bounds_by_base = {}  # base -> (xmin, xmax, ymin, ymax) for per-sample crop in grid mode
@@ -3771,39 +4384,23 @@ class MainWindow(QtWidgets.QMainWindow):
         # status
         self.statusBar().showMessage("Ready.")
 
-    def _plotly_bootstrap_html(self):
-            return """<!doctype html>
-    <html>
-    <head>
-    <meta charset="utf-8"/>
-    <meta name="viewport" content="width=device-width, initial-scale=1"/>
-    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
-    <style>
-        html, body { margin:0; padding:0; width:100%; height:100%; overflow:hidden; }
-        #container { width:100%; height:100%; }
-        #plot { width:100%; height:100%; }
-    </style>
-    </head>
-    <body>
-    <div id="container"><div id="plot"></div></div>
-    <script>
-        window._plotState = { camera3d: null, range2d: null, currentMode: null };
-    </script>
-    </body>
-    </html>"""
-
-    def ensure_plotly_page(self):
-        if self._plotly_loaded:
-            return
-        self._plotly_loaded = True
-        self._plotly_ready = False
-        self.web.setHtml(self._plotly_bootstrap_html(), QUrl("about:blank"))
+    # --- Dead code: references self.web which MainWindow never creates ---
+    # --- (leftover from before the PlotlyView extraction) ---
+    # def _plotly_bootstrap_html(self):
+    #         return """<!doctype html> ..."""
+    #
+    # def ensure_plotly_page(self):
+    #     if self._plotly_loaded:
+    #         return
+    #     self._plotly_loaded = True
+    #     self._plotly_ready = False
+    #     self.web.setHtml(self._plotly_bootstrap_html(), QUrl("about:blank"))
 
     def open_binning_window(self):
             if self._binning_win is None:
                 self._binning_win = BinningWindow(self, self)
 
-            bases = [os.path.splitext(os.path.basename(f))[0] for f in self._all_files]
+            bases = self.all_bases()
             self._binning_win.rebuild(bases)
 
             self._binning_win.show()
@@ -3821,15 +4418,25 @@ class MainWindow(QtWidgets.QMainWindow):
             self._dbscan_win.raise_()
             self._dbscan_win.activateWindow()
 
-    def _on_plotly_load_finished(self, ok: bool):
-        self._plotly_ready = bool(ok)
-        if ok and self._pending_fig is not None:
-            fig = self._pending_fig
-            self._pending_fig = None
-            self.update_plotly_fig(fig)
+    # def _on_plotly_load_finished(self, ok: bool):
+    #     self._plotly_ready = bool(ok)
+    #     if ok and self._pending_fig is not None:
+    #         fig = self._pending_fig
+    #         self._pending_fig = None
+    #         self.update_plotly_fig(fig)
 
     def reset_session(self):
-        """Reset all analysis state so a new folder starts from scratch."""
+        """Reset all analysis state so a new folder starts from scratch.
+
+        Called from browse_folder when the folder actually changes, so *every*
+        per-base dict must be cleared — including the user configuration that
+        reload_all_data deliberately keeps. Base keys are only unique within one
+        folder (see _unique_bases), so a surviving entry silently attaches to an
+        unrelated dataset that happens to share a stem, and `_mbm_dir_by_base`
+        would still point into the previous folder (`_ensure_mbm_defaults` only
+        fills in keys that are missing or empty, so a stale path is never
+        overwritten). refresh_files repopulates all of these right after.
+        """
         # cancel any running worker
         try:
             if self._current_worker is not None and self._current_worker.isRunning():
@@ -3855,10 +4462,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self._aligned_arr_by_base.clear()
         self._T_by_base.clear()
         self._multicolor_crop_bounds = None
+        self._multicolor_crop_bounds_by_base.clear()
         self._multicolor_cropped_by_base.clear()
+
+        # per-base user configuration: meaningless in a new folder, and the MBM
+        # paths would still resolve into the old one
+        self._color_settings_by_base.clear()
+        self._mbm_dir_by_base.clear()
+        self._base_by_file.clear()
 
         self._mbm_enabled = False
         self._mbm_source_base = None
+
+        # the span selectors are rebuilt from these, so stale bounds would draw a
+        # selection over the new folder's histograms (the labels below already reset)
+        self._span_efo_xmin = self._span_efo_xmax = None
+        self._span_cfr_xmin = self._span_cfr_xmax = None
 
         # reset UI controls
         self.apply_btn.setEnabled(False)
@@ -3894,6 +4513,58 @@ class MainWindow(QtWidgets.QMainWindow):
         # re-enable Run
         self.run_btn.setEnabled(True)
         self.statusBar().showMessage("Ready.")
+
+    def reload_all_data(self, reason=""):
+        """Drop every derived result and reload the .npy files from disk.
+
+        min_trace_len / z_corr / scale are baked into the cached arrays by
+        FileWorker, so changing one invalidates everything downstream: the EFO/CFR
+        ranges were picked against the old values, and _apply_mbm_alignment reads
+        scale/z_corr fresh for the bead transforms — leaving the old arrays in place
+        would register beads and localizations in different units.
+
+        Keeps the file selection, the MBM folders, the MBM source and the per-base
+        colour settings; those are user configuration, not derived data. Only the
+        current file is reloaded eagerly — the rest reload on selection, since
+        clearing _ctx_by_base is what on_file_changed keys off.
+        """
+        try:
+            if self._current_worker is not None and self._current_worker.isRunning():
+                self._current_worker.cancel()
+                self._current_worker.wait(1000)
+        except Exception:
+            pass
+        self._current_worker = None
+
+        # alignment off
+        self._mbm_enabled = False
+        self._aligned_arr_by_base.clear()
+        self._T_by_base.clear()
+
+        # filtering off
+        self._efo_range_by_base.clear()
+        self._cfr_range_by_base.clear()
+        self._filtered_by_base.clear()
+        self._span_efo_xmin = self._span_efo_xmax = None
+        self._span_cfr_xmin = self._span_cfr_xmax = None
+        self.efo_range_lbl.setText("Selected EFO range: —")
+        self.cfr_range_lbl.setText("Selected CFR range: —")
+
+        # cached loads
+        self._ctx_by_base.clear()
+        self._raw_arr_by_base.clear()
+        self._arr_by_base.clear()
+        self._current_ctx = None
+        self._plot_arr = None
+        self._plot_is_filtered = False
+
+        # crops were drawn in the old coordinates
+        self._multicolor_crop_bounds = None
+        self._multicolor_crop_bounds_by_base.clear()
+        self._multicolor_cropped_by_base.clear()
+
+        self.statusBar().showMessage(f"Reloading after {reason} change…" if reason else "Reloading…")
+        self.start_worker_for_current()
 
     def on_mbm_align_clicked(self):
         # infer source if needed
@@ -3957,7 +4628,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # build base -> file_path map from _all_files
         for fp in self._all_files:
-            base = os.path.splitext(os.path.basename(fp))[0]
+            base = self.base_of(fp)
             if base in self._mbm_dir_by_base and self._mbm_dir_by_base[base]:
                 continue
             self._mbm_dir_by_base[base] = os.path.join(os.path.dirname(fp), "grd", "mbm")
@@ -4026,16 +4697,36 @@ class MainWindow(QtWidgets.QMainWindow):
             scalebar_nm=getattr(self, "_scalebar_nm", 100.0),
         )
 
-        dlg.set_mbm_rows(self._all_files)  # <-- required
+        dlg.set_mbm_rows(self._all_files, self._mbm_dir_by_base, self.all_bases())  # <-- required
         if dlg.exec() == QtWidgets.QDialog.Accepted:
-            self._mbm_dir_by_base = dlg.mbm_map()
+            # update, not replace: the table only holds rows for _all_files, so a
+            # wholesale assignment would drop every path when no folder is loaded
+            self._mbm_dir_by_base.update(dlg.mbm_map())
             vals = dlg.values()
+
+            # compare before writing the new values into the spinboxes: these three
+            # are consumed by FileWorker at load time and baked into every cached
+            # array, so a change means the data on screen is stale
+            changed = [
+                label
+                for label, new, old in (
+                    ("min trace length", int(vals["min_trace_len"]), int(self.min_trace.value())),
+                    ("z correction", float(vals["z_corr"]), float(self.zcorr.value())),
+                    ("scale", float(vals["scale"]), float(self.scale.value())),
+                )
+                if new != old
+            ]
+
             self.cfr_bin_count.setValue(vals["cfr_bin_count"])
             self.min_trace.setValue(vals["min_trace_len"])
             self.zcorr.setValue(vals["z_corr"])
             self.scale.setValue(vals["scale"])
             self.bin_size.setValue(vals["bin_size"])
             self._scalebar_nm = float(vals["scalebar_nm"])
+
+            if changed and self._ctx_by_base:
+                self.reload_all_data(reason=" / ".join(changed))
+                return
 
             self.redraw_scatter(reset_view=False)
             self._refresh_multicolor_contents(reset_view=False)
@@ -4061,7 +4752,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self,
             )
 
-        bases = [os.path.splitext(os.path.basename(f))[0] for f in self._all_files]
+        bases = self.all_bases()
         self._multicolor_win.rebuild(bases)
 
         mode = "merged" if getattr(self, "merged_chk", None) and self.merged_chk.isChecked() else "grid"
@@ -4099,7 +4790,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # preserve insertion order from _all_files:
             arr_by_base = {}
             for f in self._all_files:
-                base = os.path.splitext(os.path.basename(f))[0]
+                base = self.base_of(f)
                 arr = self._get_multicolor_arr_for_base(base)
                 if arr is not None:
                     arr_by_base[base] = arr
@@ -4115,7 +4806,7 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             figs = {}
             for f in self._all_files:
-                base = os.path.splitext(os.path.basename(f))[0]
+                base = self.base_of(f)
                 cs = self._color_settings_by_base.get(base, {"mode": DEFAULT_MODE, "solid": DEFAULT_SOLID, "lut": DEFAULT_LUT, "alpha": DEFAULT_ALPHA, "size": DEFAULT_SIZE_2D})
                 arr = self._get_multicolor_arr_for_base(base)
                 if arr is None:
@@ -4155,9 +4846,16 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         bounds = (xmin, xmax, ymin, ymax)
-        crop_base = payload.get("base")
-        if crop_base is not None:
-            self._multicolor_crop_bounds_by_base[crop_base] = bounds
+        # "bases" is set when the box-selected sample has Synchronize ticked, so the
+        # crop lands on the whole synchronized group; "base" alone is one sample;
+        # neither means merged mode, i.e. the global crop
+        crop_bases = payload.get("bases")
+        if not crop_bases:
+            one = payload.get("base")
+            crop_bases = [one] if one is not None else []
+        if crop_bases:
+            for b in crop_bases:
+                self._multicolor_crop_bounds_by_base[b] = bounds
         else:
             self._multicolor_crop_bounds = bounds
         self._recompute_multicolor_crop_cache()
@@ -4166,13 +4864,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self._dbscan_win.refresh_current_plot()
 
         n = int(sum(len(v) for v in self._multicolor_cropped_by_base.values() if v is not None))
-        label = crop_base if crop_base else "all"
+        label = ", ".join(crop_bases) if crop_bases else "all"
         self.statusBar().showMessage(f"Crop ({label}): x=[{xmin:.2f}, {xmax:.2f}], y=[{ymin:.2f}, {ymax:.2f}], kept {n} locs")
 
     def _on_multicolor_reset_crop_requested(self):
-        has_global = getattr(self, "_multicolor_crop_bounds", None)
-        has_per_base = bool(getattr(self, "_multicolor_crop_bounds_by_base", {}))
-        if not has_global and not has_per_base:
+        if not self._has_any_crop():
             return
         self._multicolor_crop_bounds = None
         self._multicolor_crop_bounds_by_base.clear()
@@ -4182,6 +4878,20 @@ class MainWindow(QtWidgets.QMainWindow):
             self._dbscan_win.refresh_current_plot()
         self.statusBar().showMessage("Multicolor crop reset")
 
+    def _has_any_crop(self):
+        """True if any crop is active: the global one from a merged-mode box-select,
+        or a per-base one from a grid-mode box-select.
+
+        This is the condition `_get_multicolor_arr_for_base` tests before serving
+        `_multicolor_cropped_by_base`, so anything that refreshes that cache must
+        test the same thing. DBSCAN's two refresh sites used to check only the
+        global crop and so served a stale cache for per-base crops.
+        """
+        return bool(
+            getattr(self, "_multicolor_crop_bounds", None)
+            or getattr(self, "_multicolor_crop_bounds_by_base", None)
+        )
+
     def _recompute_multicolor_crop_cache(self):
         self._multicolor_cropped_by_base = {}
         global_bounds = getattr(self, "_multicolor_crop_bounds", None)
@@ -4190,7 +4900,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         for f in self._all_files:
-            base = os.path.splitext(os.path.basename(f))[0]
+            base = self.base_of(f)
             bounds = per_base_bounds.get(base, global_bounds)
             if not bounds:
                 continue
@@ -4251,7 +4961,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _multicolor_rebuild_if_open(self):
         if self._multicolor_win is None or not self._multicolor_win.isVisible():
             return
-        bases = [os.path.splitext(os.path.basename(f))[0] for f in self._all_files]
+        bases = self.all_bases()
         self._multicolor_win.rebuild(bases)
 
     def _dbscan_rebuild_if_open(self):
@@ -4263,9 +4973,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def _dbscan_available_bases(self):
         # Match multicolor loading behavior: include bases that currently resolve
         # to an array through _get_multicolor_arr_for_base/_get_arr_for_base.
-        ordered_all = [os.path.splitext(os.path.basename(f))[0] for f in self._all_files]
+        ordered_all = self.all_bases()
 
-        if getattr(self, "_multicolor_crop_bounds", None):
+        if self._has_any_crop():
             self._recompute_multicolor_crop_cache()
 
         available = []
@@ -4312,12 +5022,33 @@ class MainWindow(QtWidgets.QMainWindow):
     def closeEvent(self, event):
         self._closing = True
 
-        try:
-            if self._current_worker is not None and self._current_worker.isRunning():
-                self._current_worker.cancel()
-                self._current_worker.wait(1000)
-        except Exception:
-            pass
+        # Cancel *every* worker, not only the current one: rapid file switching can
+        # leave several running (see start_worker_for_current) and they are all
+        # parented to this window, so ~MainWindow would delete a live QThread.
+        workers = [w for w in list(getattr(self, "_workers", ())) if w is not None]
+        if self._current_worker is not None and self._current_worker not in workers:
+            workers.append(self._current_worker)
+        for w in workers:
+            try:
+                if w.isRunning():
+                    w.cancel()
+            except Exception:
+                pass
+        deadline = QtCore.QDeadlineTimer(2000)
+        for w in workers:
+            try:
+                if not w.isRunning():
+                    continue
+                w.wait(max(0, deadline.remainingTime()))
+                if w.isRunning():
+                    # blew the budget anyway: detach so Qt does not destroy a running
+                    # thread, and keep a reference so Python does not collect it either
+                    w.setParent(None)
+                    MainWindow._orphaned_workers.add(w)
+                    w.finished.connect(lambda w=w: MainWindow._orphaned_workers.discard(w))
+            except Exception:
+                pass
+        self._current_worker = None
 
         try:
             if self.plot_view is not None:
@@ -4354,16 +5085,58 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._current_worker is worker:
             self._current_worker = None
 
-    def show_plotly(self, html: str):
-        if self._plotly_tmp is None:
-            fd, path = tempfile.mkstemp(suffix=".html")
-            os.close(fd)
-            self._plotly_tmp = path
+    # def show_plotly(self, html: str):
+    #     if self._plotly_tmp is None:
+    #         fd, path = tempfile.mkstemp(suffix=".html")
+    #         os.close(fd)
+    #         self._plotly_tmp = path
+    #
+    #     with open(self._plotly_tmp, "w", encoding="utf-8") as f:
+    #         f.write(html)
+    #
+    #     self.web.load(QUrl.fromLocalFile(self._plotly_tmp))
 
-        with open(self._plotly_tmp, "w", encoding="utf-8") as f:
-            f.write(html)
+    @staticmethod
+    def _unique_bases(file_paths, root=None):
+        """Map file path -> dataset key, the key every `_by_base` dict is keyed on.
 
-        self.web.load(QUrl.fromLocalFile(self._plotly_tmp))
+        `refresh_files` globs recursively, so two subfolders can hold a `cell1.npy`
+        each; keying on the plain basename stem made them overwrite each other's
+        arrays, filters, colours and MBM paths — and collide again on export.
+
+        A stem that occurs once keeps its plain name, so output filenames and the
+        `<dir>/grd/mbm` defaults are unchanged for the common case. Only colliding
+        stems fall back to the flattened relative path (`A__cell1`), which is unique
+        because the paths are. The counter covers the residual case where that
+        flattened name happens to equal some other file's plain stem.
+        """
+        stems = [os.path.splitext(os.path.basename(p))[0] for p in file_paths]
+        counts = Counter(stems)
+
+        # reserve the unaffected stems first so they are never mangled
+        used = {s for s in stems if counts[s] == 1}
+        keys = []
+        for p, stem in zip(file_paths, stems):
+            if counts[stem] == 1:
+                keys.append(stem)
+                continue
+            rel = os.path.relpath(p, root) if root else p
+            cand = os.path.splitext(rel)[0].replace(os.sep, "__").replace("/", "__").strip("._")
+            key, n = cand or stem, 2
+            while key in used:
+                key = f"{cand or stem}_{n}"
+                n += 1
+            used.add(key)
+            keys.append(key)
+        return dict(zip(file_paths, keys))
+
+    def base_of(self, path):
+        """Dataset key for a file path. Falls back to the plain stem if the map is
+        stale, so a caller can never silently get None as a dict key."""
+        return self._base_by_file.get(path) or os.path.splitext(os.path.basename(path))[0]
+
+    def all_bases(self):
+        return [self.base_of(f) for f in self._all_files]
 
     def refresh_files(self):
         data_path = self.data_edit.text().strip()
@@ -4373,6 +5146,18 @@ class MainWindow(QtWidgets.QMainWindow):
             files = glob.glob(os.path.join(data_path, "**", "*.npy"), recursive=True)
             files.sort()
             self._all_files = files
+
+        # must precede every consumer below — they all key off base_of()
+        self._base_by_file = self._unique_bases(self._all_files, data_path or None)
+        n_disambiguated = sum(
+            1 for f, b in self._base_by_file.items()
+            if b != os.path.splitext(os.path.basename(f))[0]
+        )
+        if n_disambiguated:
+            self.statusBar().showMessage(
+                f"{n_disambiguated} file(s) share a name with another; "
+                "their subfolder was added to keep them separate."
+            )
 
         self.file_combo.blockSignals(True)
         self.file_combo.clear()
@@ -4385,8 +5170,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._current_index = 0 if self._all_files else -1
         if self._all_files:
             self.file_combo.setCurrentIndex(0)
-        bases = [os.path.splitext(os.path.basename(f))[0] for f in self._all_files]
-        self.color_panel.rebuild(bases, self._color_settings_by_base)
+        bases = self.all_bases()
+        # a source picked in a previous folder no longer exists here, and leaving it
+        # set would make _apply_mbm_alignment abort on a base that has no data
+        if self._mbm_source_base is not None and self._mbm_source_base not in bases:
+            self._mbm_source_base = None
+        self.color_panel.rebuild(bases, self._color_settings_by_base, self._mbm_source_base)
         self._ensure_default_mbm_paths()
 
     def _update_output_for_base(self, base: str, arr_efo, n_after: int = None):
@@ -4437,7 +5226,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._current_index = idx
         f = self._all_files[idx]
-        base = os.path.splitext(os.path.basename(f))[0]
+        base = self.base_of(f)
 
         # if already loaded -> display from memory
         if base in self._ctx_by_base:
@@ -4509,14 +5298,15 @@ class MainWindow(QtWidgets.QMainWindow):
             self.run_btn.setEnabled(True)
             return
 
+        f = self._all_files[self._current_index]
         params = dict(
             min_trace_len=int(self.min_trace.value()),
             z_corr=float(self.zcorr.value()),
             scale=float(self.scale.value()),
             save_folder=self.out_edit.text().strip(),
             bin_size=float(self.bin_size.value()),
+            base=self.base_of(f),
         )
-        f = self._all_files[self._current_index]
 
         self.apply_btn.setEnabled(False)
 
@@ -4575,12 +5365,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self._arr_by_base[base] = arr
 
         # ---- EFO histogram ----
+        # hist_edges replaces a bare np.arange(min, max + bin_size, bin_size): that
+        # drops every point when all values are identical, raises on NaN/inf, and
+        # allocates millions of edges for a small bin size on a wide range.
+        hist_notes = []
         self.ax_efo.clear()
+        efo_vals, efo_bins, efo_note = hist_edges(efo_vals, bin_size)
+        if efo_note:
+            hist_notes.append(f"EFO histogram: {efo_note}")
         if len(efo_vals) > 0:
-            bins = np.arange(efo_vals.min(), efo_vals.max() + bin_size, bin_size)
             self.ax_efo.hist(
                 efo_vals,
-                bins=bins,
+                bins=efo_bins,
                 edgecolor=HIST_THEME["hist_edge"],
                 color=HIST_THEME["hist_face"],
             )
@@ -4637,6 +5433,15 @@ class MainWindow(QtWidgets.QMainWindow):
             self.efo_range_lbl.setText("Selected EFO range: —")
 
         # ---- CFR histogram ----
+        # bins is a count here, so the edge-count blowup cannot happen and numpy
+        # widens the range itself when every value is identical — but a non-finite
+        # value still makes it raise ("autodetected range ... is not finite")
+        n_bad_cfr = int(np.count_nonzero(~np.isfinite(cfr_vals)))
+        if n_bad_cfr:
+            cfr_vals = cfr_vals[np.isfinite(cfr_vals)]
+            hist_notes.append(f"CFR histogram: {n_bad_cfr} non-finite value(s) ignored")
+        if hist_notes:
+            self.statusBar().showMessage(" | ".join(hist_notes))
         self.ax_cfr.clear()
         if len(cfr_vals) > 0:
             self.ax_cfr.hist(
@@ -4960,24 +5765,42 @@ class MainWindow(QtWidgets.QMainWindow):
             f"MBM aligning to source={self._mbm_source_base}, have dirs={len(self._mbm_dir_by_base)}, "
             f"have filtered={len(self._filtered_by_base)}"
         )
-        self._mbm_enabled = True
+
+        def abort(msg):
+            """Leave a consistent "not aligned" state.
+
+            _mbm_enabled must never be True alongside an empty _aligned_arr_by_base:
+            every downstream `if mbm_enabled` would take the aligned branch and look
+            for arrays that were never built. Reachable in practice by choosing a
+            source whose file has not been loaded — on_mbm_align_clicked checks that
+            *some* data is loaded, not that the source itself has any.
+            """
+            if self._mbm_enabled:
+                # a previous run succeeded and rewrote _arr_by_base; undo that too
+                self._remove_mbm_alignment()
+            else:
+                self._mbm_enabled = False
+                self._aligned_arr_by_base.clear()
+                self._T_by_base.clear()
+            self.statusBar().showMessage(msg)
 
         src = self._mbm_source_base
         if not src:
-            return
+            return abort("MBM: no source dataset selected")
 
         # align the EFO-filtered arrays (what will be saved)
         src_arr = self._filtered_by_base.get(src)
         if src_arr is None:
             src_arr = self._arr_by_base.get(src)
         if src_arr is None:
-            return
+            return abort(f"MBM: no loaded data for source {src} — run that file first")
 
         mbm_src = self._mbm_dir_by_base.get(src)
         if not mbm_src or not os.path.isdir(mbm_src):
-            self.statusBar().showMessage(f"MBM: source folder missing for {src}")
-            return
+            return abort(f"MBM: source folder missing for {src}")
 
+        # only now is alignment actually going to happen
+        self._mbm_enabled = True
         self._aligned_arr_by_base.clear()
         self._T_by_base.clear()
 
@@ -5112,8 +5935,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.file_combo.setCurrentIndex((self.file_combo.currentIndex() - 1) % len(self._all_files))
 
     def _remove_mbm_alignment(self):
-        for base, arr in self._raw_arr_by_base.items():
-            self._arr_by_base[base] = arr
+        # Alignment is only a coordinate transform layered on top of the EFO/CFR
+        # filtered arrays, so dropping it restores the filtered data — not the
+        # pre-filter raw data, which would put filtered-out points back on screen
+        # while save_all() and BinningWindow still read _filtered_by_base.
+        for base, raw in self._raw_arr_by_base.items():
+            arr = self._filtered_by_base.get(base)
+            self._arr_by_base[base] = raw if arr is None else arr
         self._mbm_enabled = False
         self._aligned_arr_by_base.clear()
         self._T_by_base.clear()

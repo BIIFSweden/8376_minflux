@@ -42,6 +42,8 @@ from pyflux.core import (
 )
 from pyflux.plotting import (
     _clip_to_scale_max,
+    add_scalebar_2d,
+    hist_edges,
     pointcloud_to_image,
     render_gaussians_xy,
     scatter_points_and_color,
@@ -471,3 +473,126 @@ def test_save_to_csv_writes_file(tmp_path):
     df2 = pd.read_csv(out_path)
     assert list(df2.columns) == ["a", "b"]
     assert df2.shape == (2, 2)
+
+# ----------------------------
+# hist_edges
+# ----------------------------
+
+def _counted(vals, bin_size):
+    """Localizations the histogram would actually draw, for the given values."""
+    v, edges, note = hist_edges(vals, bin_size)
+    if edges is None:
+        return 0, 0, note
+    counts, _ = np.histogram(v, bins=edges)
+    return int(counts.sum()), len(v), note
+
+
+def test_hist_edges_matches_plain_arange_on_ordinary_data():
+    vals = np.linspace(0.0, 90000.0, 5000)
+    v, edges, note = hist_edges(vals, 3000.0)
+    expected = np.arange(vals.min(), vals.max() + 3000.0, 3000.0)
+    assert note is None
+    assert np.allclose(edges, expected)
+    assert np.array_equal(v, vals)
+
+
+def test_hist_edges_counts_every_value_when_all_identical():
+    # np.arange(v, v + bin, bin) gives a single edge, i.e. zero bins, and every
+    # value is silently dropped instead of raising
+    counted, n, _ = _counted(np.full(500, 12345.0), 3000.0)
+    assert n == 500
+    assert counted == 500
+
+
+def test_hist_edges_single_value_gets_a_bin():
+    _, edges, _ = hist_edges(np.array([7.0]), 3000.0)
+    assert edges is not None and len(edges) >= 2
+    assert edges[0] < 7.0 < edges[-1]
+
+
+def test_hist_edges_drops_non_finite_and_says_so():
+    v, edges, note = hist_edges(np.array([1.0, np.nan, np.inf, 5000.0]), 3000.0)
+    assert np.array_equal(v, np.array([1.0, 5000.0]))
+    assert edges is not None
+    assert "non-finite" in note
+
+
+def test_hist_edges_all_non_finite_returns_no_edges():
+    v, edges, note = hist_edges(np.full(10, np.nan), 3000.0)
+    assert len(v) == 0
+    assert edges is None
+    assert note
+
+
+def test_hist_edges_empty_input_returns_no_edges():
+    v, edges, note = hist_edges(np.array([]), 3000.0)
+    assert len(v) == 0
+    assert edges is None
+    assert note
+
+
+def test_hist_edges_caps_bin_count_on_a_wide_range():
+    # 0..5e6 with bin_size 1 would be 5,000,001 edges
+    v, edges, note = hist_edges(np.linspace(0.0, 5e6, 20000), 1.0)
+    assert len(edges) <= 2001
+    assert "widened" in note
+
+
+def test_hist_edges_respects_max_bins_argument():
+    _, edges, _ = hist_edges(np.linspace(0.0, 1000.0, 100), 0.1, max_bins=50)
+    assert len(edges) == 51
+
+
+def test_hist_edges_rejects_non_positive_bin_size():
+    _, edges, note = hist_edges(np.array([0.0, 10.0]), 0.0)
+    assert edges is not None and len(edges) >= 2
+    assert "bin size" in note
+
+
+def test_hist_edges_last_edge_covers_the_maximum():
+    vals = np.array([0.0, 1.0, 7.5])
+    _, edges, _ = hist_edges(vals, 3.0)
+    assert edges[-1] >= vals.max()
+    counted, n, _ = _counted(vals, 3.0)
+    assert counted == n
+
+
+# ----------------------------
+# add_scalebar_2d
+# ----------------------------
+
+def _bar_length(fig):
+    shapes = fig.layout.shapes or ()
+    return float(shapes[-1].x1 - shapes[-1].x0) if shapes else None
+
+
+def test_add_scalebar_2d_handles_heatmap_with_unequal_axes():
+    import plotly.graph_objects as go
+
+    # nx != ny: masking the concatenated x against the concatenated y would raise
+    fig = go.Figure(go.Heatmap(z=np.zeros((40, 70)),
+                               x=np.arange(70) * 10.0,
+                               y=np.arange(40) * 10.0))
+    out = add_scalebar_2d(fig, 100.0)
+    assert _bar_length(out) == 100.0
+
+
+def test_add_scalebar_2d_scatter_extent_ignores_paired_non_finite():
+    import plotly.graph_objects as go
+
+    fig = go.Figure([
+        go.Scatter(x=[0.0, 10.0, np.nan, 30.0], y=[0.0, 5.0, 5.0, np.nan], mode="markers"),
+        go.Scatter(x=[100.0, 200.0], y=[50.0, 80.0], mode="markers"),
+    ])
+    shape = (add_scalebar_2d(fig, 25.0).layout.shapes or ())[-1]
+    # only the four points finite in both coordinates define the extent
+    assert shape.x0 == pytest.approx(0.0 + 0.05 * 200.0)
+    assert shape.y0 == pytest.approx(0.0 + 0.05 * 80.0)
+    assert shape.x1 - shape.x0 == pytest.approx(25.0)
+
+
+def test_add_scalebar_2d_returns_unchanged_without_finite_data():
+    import plotly.graph_objects as go
+
+    fig = go.Figure(go.Scatter(x=[np.nan, np.nan], y=[np.nan, np.nan]))
+    assert not (add_scalebar_2d(fig, 100.0).layout.shapes or ())

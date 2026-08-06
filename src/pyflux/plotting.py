@@ -2,6 +2,7 @@ import hashlib
 
 import matplotlib
 import numpy as np
+import plotly.colors as plotly_colors
 import plotly.graph_objects as go
 from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.figure import Figure
@@ -626,20 +627,43 @@ def _plotly_color_to_mpl(color):
     return s
 
 
+def _colorscale_to_mpl_cmap(name: str, colors):
+    """Build a matplotlib colormap from a Plotly colorscale.
+
+    Accepts either a plain colour list or the `[[stop, colour], ...]` form; both
+    `CUSTOM_LUTS` entries and `plotly.colors.get_colorscale` output are handled.
+    """
+    mpl_colors = []
+    for c in colors:
+        if isinstance(c, (list, tuple)) and len(c) == 2:
+            mpl_colors.append((float(c[0]), _plotly_color_to_mpl(c[1])))
+        else:
+            mpl_colors.append(_plotly_color_to_mpl(c))
+    return LinearSegmentedColormap.from_list(f"overlay_{name}", mpl_colors)
+
+
 def _resolve_mpl_cmap(lut: str):
+    """Matplotlib colormap for a `LUT_CHOICES` entry, for the overlay/composite paths.
+
+    `LUT_CHOICES` holds *Plotly* colorscale names, so these are resolved through
+    `plotly.colors.get_colorscale` — not `matplotlib.colormaps`, which is
+    case-sensitive and lacks 15 of them outright (`electric`, `icefire`, `piyg`,
+    `brbg`, `rdbu`, `brwnyl`, `reds`, `rdpu`, `ylgn`, `ylorbr`, `thermal`, `ice`,
+    `algae`, `speed`, `temps`) and so silently rendered all of them as
+    `DEFAULT_LUT_BIN`. Going through Plotly also means the overlay matches the
+    single-channel heatmap, which plotly.js renders from the same definition.
+    """
     if lut not in LUT_CHOICES:
         lut = DEFAULT_LUT_BIN
     if lut.startswith("cu"):
         colors = CUSTOM_LUTS.get(lut)
         if colors:
-            mpl_colors = []
-            for c in colors:
-                if isinstance(c, (list, tuple)) and len(c) == 2:
-                    mpl_colors.append((float(c[0]), _plotly_color_to_mpl(c[1])))
-                else:
-                    mpl_colors.append(_plotly_color_to_mpl(c))
-            return LinearSegmentedColormap.from_list(f"overlay_{lut}", mpl_colors)
-        return matplotlib.colormaps.get_cmap(DEFAULT_LUT_BIN)
+            return _colorscale_to_mpl_cmap(lut, colors)
+        lut = DEFAULT_LUT_BIN
+    try:
+        return _colorscale_to_mpl_cmap(lut, plotly_colors.get_colorscale(lut))
+    except Exception:
+        pass
     try:
         return matplotlib.colormaps.get_cmap(lut)
     except Exception:
@@ -1112,26 +1136,42 @@ def add_scalebar_2d(fig: go.Figure, length_nm: float = 100.0):
     if fig is None or not fig.data:
         return fig
 
-    # collect all x/y from traces
-    xs, ys = [], []
+    # Data extent, accumulated per trace. Concatenating every trace's x and then
+    # every trace's y and masking the two against each other only works while all
+    # traces are scatter-like: for a heatmap, x and y are independent axis
+    # coordinates of length nx and ny, so `isfinite(xs) & isfinite(ys)` would raise
+    # a broadcast ValueError whenever nx != ny.
+    xmin = ymin = np.inf
+    xmax = ymax = -np.inf
+    found = False
     for tr in fig.data:
-        if hasattr(tr, "x") and tr.x is not None:
-            xs.extend(tr.x)
-        if hasattr(tr, "y") and tr.y is not None:
-            ys.extend(tr.y)
+        x = getattr(tr, "x", None)
+        y = getattr(tr, "y", None)
+        if x is None or y is None:
+            continue
+        try:
+            x = np.asarray(x, dtype=float).ravel()
+            y = np.asarray(y, dtype=float).ravel()
+        except (TypeError, ValueError):
+            continue  # categorical / non-numeric axis
+        if x.size == y.size:
+            # scatter-like: x[i], y[i] are one point, so drop it if either is bad
+            m = np.isfinite(x) & np.isfinite(y)
+            x, y = x[m], y[m]
+        else:
+            # heatmap-like: independent axes, filter each on its own
+            x = x[np.isfinite(x)]
+            y = y[np.isfinite(y)]
+        if x.size == 0 or y.size == 0:
+            continue
+        xmin = min(xmin, float(x.min()))
+        xmax = max(xmax, float(x.max()))
+        ymin = min(ymin, float(y.min()))
+        ymax = max(ymax, float(y.max()))
+        found = True
 
-    if not xs or not ys:
+    if not found:
         return fig
-
-    xs = np.asarray(xs, dtype=float)
-    ys = np.asarray(ys, dtype=float)
-    m = np.isfinite(xs) & np.isfinite(ys)
-    xs, ys = xs[m], ys[m]
-    if len(xs) == 0:
-        return fig
-
-    xmin, xmax = float(xs.min()), float(xs.max())
-    ymin, ymax = float(ys.min()), float(ys.max())
 
     dx = xmax - xmin
     dy = ymax - ymin
@@ -1176,6 +1216,56 @@ def add_scalebar_2d(fig: go.Figure, length_nm: float = 100.0):
     )
 
     return fig
+
+
+def hist_edges(vals, bin_size: float, max_bins: int = 2000):
+    """Bin edges for a fixed-bin-width histogram. Returns `(finite_vals, edges, note)`.
+
+    `np.arange(v.min(), v.max() + bin_size, bin_size)` cannot be used directly:
+
+    - identical values give **one** edge, i.e. zero bins, and every value is then
+      silently dropped — an empty plot with no error, not an exception;
+    - a NaN makes `arange` raise `ValueError: arange: cannot compute length`, and
+      an inf raises `ValueError: Maximum allowed size exceeded`;
+    - a small `bin_size` against a wide range allocates millions of edges, which
+      matplotlib then spends minutes rendering (5e6 values / bin_size 1 does not
+      finish in 100 s).
+
+    `edges` is None when there is nothing plottable. `note` is a short message for
+    the caller to surface when the request had to be altered, else None.
+    """
+    v = np.asarray(vals, dtype=float).ravel()
+    n_total = v.size
+    v = v[np.isfinite(v)]
+    n_dropped = n_total - v.size
+    notes = []
+    if n_dropped:
+        notes.append(f"{n_dropped} non-finite value(s) ignored")
+    if v.size == 0:
+        return v, None, "; ".join(notes) or "no finite values"
+
+    bs = float(bin_size)
+    if not np.isfinite(bs) or bs <= 0:
+        bs = 1.0
+        notes.append("bin size must be > 0, using 1")
+
+    lo, hi = float(v.min()), float(v.max())
+    if hi <= lo:
+        # one distinct value: centre a single bin on it so its count is visible
+        lo, hi = lo - bs / 2.0, hi + bs / 2.0
+
+    n = int(np.ceil((hi - lo) / bs))
+    n = max(n, 1)
+    if n > max_bins:
+        bs = (hi - lo) / max_bins
+        n = max_bins
+        notes.append(f"bin size widened to {bs:.4g} to stay under {max_bins} bins")
+
+    edges = lo + bs * np.arange(n + 1, dtype=float)
+    # guard the top edge against float drift so max(v) is never outside the range
+    if edges[-1] < hi:
+        edges[-1] = hi
+    return v, edges, "; ".join(notes) or None
 
 
 def apply_hist_theme(fig: Figure, ax):

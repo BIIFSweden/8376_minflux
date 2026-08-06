@@ -186,7 +186,8 @@ def avg_loc_by_tid(arr):
     if arr is None or len(arr) == 0:
         return np.array([], dtype=int), np.zeros((0, 3), dtype=float), np.array([], dtype=int)
 
-    if "tid" not in arr.dtype.names or "loc" not in arr.dtype.names:
+    names = arr.dtype.names or ()  # None for a plain, non-structured array
+    if "tid" not in names or "loc" not in names:
         return np.array([], dtype=int), np.zeros((0, 3), dtype=float), np.array([], dtype=int)
 
     tids = np.asarray(arr["tid"])

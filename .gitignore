@@ -176,6 +176,7 @@ cython_debug/
 
 # Claude Code
 .claude/
+CLAUDE.md
 
 # pixi environments
 .pixi
