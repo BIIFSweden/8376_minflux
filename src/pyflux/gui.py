@@ -63,8 +63,6 @@ from .plotting import (
     apply_hist_theme,
     apply_plot_theme,
     hist_edges,
-    make_plotly_fig,
-    make_plotly_fig_merged,
     make_plotly_gaussian_from_arr,
     make_plotly_heatmap_from_arr,
     make_plotly_overlay_heatmap_from_two_arrs,
@@ -72,6 +70,7 @@ from .plotting import (
     scatter_points_and_color,
     tid_to_color,
 )
+from .napari_storm_view import NapariStormView, build_render_spec, build_render_specs
 
 
 matplotlib.use("QtAgg")
@@ -331,7 +330,7 @@ def apply_gui_theme(app: QtWidgets.QApplication):
 class ColorSettingsPanel(QtWidgets.QGroupBox):
     """
     Table-based color settings:
-      Columns: File | Mode | LUT/Solid | α | Size
+      Columns: File | Mode | LUT/Solid | α | σ (nm)
       One row per file base.
 
     Emits changed(base, settings_dict).
@@ -340,7 +339,7 @@ class ColorSettingsPanel(QtWidgets.QGroupBox):
       - solid: str
       - lut: str
       - alpha: float
-      - size: int
+      - size: int   -- Gaussian sigma in nm (it was the marker size in px)
     """
     changed = Signal(str, object)  # (base, settings dict)
 
@@ -358,7 +357,7 @@ class ColorSettingsPanel(QtWidgets.QGroupBox):
         outer.setContentsMargins(8, 8, 8, 8)
 
         self.table = QtWidgets.QTableWidget(0, 6, self)
-        self.table.setHorizontalHeaderLabels(["File", "Mode", "LUT / Solid", "α", "Size", "mbm source"])
+        self.table.setHorizontalHeaderLabels(["File", "Mode", "LUT / Solid", "α", "σ (nm)", "mbm source"])
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
@@ -507,6 +506,7 @@ class ColorSettingsPanel(QtWidgets.QGroupBox):
             size_spin = QtWidgets.QSpinBox()
             size_spin.setRange(1, 50)
             size_spin.setValue(size)
+            size_spin.setToolTip("Width (sigma) of the Gaussian drawn for each localization, in nm.")
 
             # --- mbm source ---
             src_chk = QtWidgets.QCheckBox()
@@ -2512,15 +2512,23 @@ class PlotSyncBridge(QtCore.QObject):
 
 
 class MultiColorWindow(QtWidgets.QMainWindow):
-    def __init__(self, on_view_changed, on_crop_requested=None, on_reset_crop_requested=None, parent=None):
+    """Every dataset side by side (grid) or in one canvas (merged), drawn by napari-storm.
+
+    Each grid cell is its own embedded napari viewer and the merged page is one
+    viewer holding a layer per dataset. Panels with Synchronize ticked share
+    pan, zoom and 3-D rotation. Crop keeps what a 2-D panel currently shows.
+    """
+
+    def __init__(self, on_view_changed, on_crop_requested=None, on_reset_crop_requested=None, parent=None,
+                 on_ndisplay_changed=None):
         super().__init__(parent)
         self.setWindowTitle("Multicolor")
         self.resize(1200, 700)
         self._on_view_changed = on_view_changed
         self._on_crop_requested = on_crop_requested
         self._on_reset_crop_requested = on_reset_crop_requested
-        self._last_selection_payload = None
-        self._last_selection_source_id = None
+        self._on_ndisplay_changed = on_ndisplay_changed
+        self._last_active_source_id = None  # the panel the pointer touched last
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -2533,6 +2541,11 @@ class MultiColorWindow(QtWidgets.QMainWindow):
 
         # --- crop buttons overlaid bottom-right ---
         self._crop_btn = QtWidgets.QPushButton("Crop", central)
+        self._crop_btn.setToolTip(
+            "Keep only the localizations inside the visible area of a 2-D panel:\n"
+            "pan and zoom to the region, then press Crop.\n"
+            "In grid mode the panel the pointer touched last is used."
+        )
         self._crop_btn.clicked.connect(self._crop_current_selection)
         self._crop_btn.setFixedHeight(24)
         self._crop_btn.setMaximumWidth(90)
@@ -2544,14 +2557,10 @@ class MultiColorWindow(QtWidgets.QMainWindow):
         self._reset_crop_btn.setMaximumWidth(110)
         self._reset_crop_btn.raise_()
 
-        self._grid_on = True
-        self._axis_titles = {}       # 3-D axis titles, learned from each pushed figure
-        self._grid_chk = QtWidgets.QCheckBox("Grid", central)
-        self._grid_chk.setChecked(True)
-        self._grid_chk.setToolTip(
-            "Show the plot grid.\n"
-            "In 3-D this hides the whole coordinate system (grid, ticks, labels, axes)."
-        )
+        self._grid_on = False
+        self._grid_chk = QtWidgets.QCheckBox("Axes", central)
+        self._grid_chk.setChecked(False)
+        self._grid_chk.setToolTip("Show the coordinate axes in every panel.")
         self._grid_chk.toggled.connect(self._on_grid_toggled)
         self._grid_chk.setFixedHeight(24)
         self._grid_chk.raise_()
@@ -2568,26 +2577,28 @@ class MultiColorWindow(QtWidgets.QMainWindow):
         mv = QtWidgets.QVBoxLayout(self.merged_page)
         mv.setContentsMargins(0, 0, 0, 0)
 
-        self.merged_view = PlotlyView()
+        self.merged_view = NapariStormView(title="Multicolor (merged)")
         self.merged_view.viewChanged.connect(self._on_view_changed)
-        self.merged_view.selectionChanged.connect(self._on_plot_selection)
+        self.merged_view.activated.connect(self._on_view_activated)
+        self.merged_view.ndisplayChanged.connect(self._relay_ndisplay)
         mv.addWidget(self.merged_view, 1)
 
         self.stack.addWidget(self.merged_page)
 
         # state
-        self._views = {}  # base -> PlotlyView
+        self._views = {}  # base -> NapariStormView
         self._mode = "grid"  # or "merged"
 
         # --- per-sample view synchronization (grid mode only) ---
         self._sync_by_base = {}      # base -> bool, survives rebuild()
         self._sync_boxes = {}        # base -> QCheckBox
-        self._last_view_by_base = {}  # base -> last relayout payload, to seed a newly ticked view
-        # base -> (deadline, payload just pushed). A view we pushed a range/camera into
-        # may echo that same relayout straight back; JS's `ignore` flag catches the
-        # common case and this is the backstop that stops an echo becoming a loop.
-        # Matching on the payload as well as the time window matters: suppressing a
-        # base outright would swallow a real gesture made right after it was synced.
+        self._last_view_by_base = {}  # base -> last camera payload, to seed a newly ticked view
+        # base -> (deadline, payload just pushed). A view we pushed a camera into
+        # may echo that same change straight back; the view's own guard catches
+        # the common case and this is the backstop that stops an echo becoming a
+        # loop. Matching on the payload as well as the time window matters:
+        # suppressing a base outright would swallow a real gesture made right
+        # after it was synced.
         self._sync_suppress = {}
 
     def set_mode(self, mode: str):
@@ -2599,6 +2610,20 @@ class MultiColorWindow(QtWidgets.QMainWindow):
         return self._mode
 
     def rebuild(self, base_names):
+        base_names = list(base_names)
+
+        # A napari viewer is expensive to build and its camera is worth keeping
+        # across a refresh, so panels of samples this folder still has are
+        # reused; only the ones that went away are torn down.
+        keep = {b: v for b, v in self._views.items() if b in base_names}
+        for base, view in list(self._views.items()):
+            if base not in keep:
+                view.shutdown()
+                view.setParent(None)
+                view.deleteLater()
+        for view in keep.values():
+            view.setParent(None)  # out of the group boxes about to be deleted
+
         # clear grid
         while self.grid.count():
             item = self.grid.takeAt(0)
@@ -2606,7 +2631,7 @@ class MultiColorWindow(QtWidgets.QMainWindow):
             if w is not None:
                 w.deleteLater()
 
-        self._views.clear()
+        self._views = {}
         self._sync_boxes.clear()
         # keep the ticks the user set, but only for samples this folder still has
         self._sync_by_base = {b: v for b, v in self._sync_by_base.items() if b in base_names}
@@ -2636,11 +2661,14 @@ class MultiColorWindow(QtWidgets.QMainWindow):
             header.addStretch(1)
             vbox.addLayout(header)
 
-            view = PlotlyView()
-            view.viewChanged.connect(self._on_grid_view_changed)
-            view.selectionChanged.connect(self._on_plot_selection)
-            # set before the page exists: update_fig re-asserts it into the new page
+            view = keep.get(base)
+            if view is None:
+                view = NapariStormView(title=f"Multicolor: {base}")
+                view.viewChanged.connect(self._on_grid_view_changed)
+                view.activated.connect(self._on_view_activated)
+                view.ndisplayChanged.connect(self._relay_ndisplay)
             view.set_live_sync(self._sync_by_base.get(base, False))
+            view.set_grid_visible(self._grid_on)
             vbox.addWidget(view, 1)
 
             self._views[base] = view
@@ -2652,72 +2680,33 @@ class MultiColorWindow(QtWidgets.QMainWindow):
                 c = 0
                 r += 1
 
-    # ---------------- grid visibility ----------------
-
-    def _apply_grid_to_fig(self, fig, is3d: bool, grid_on: bool):
-        """Bake the Grid setting into a figure before it is pushed.
-
-        Applied at the two places figures reach a view, so a redraw (filter, crop,
-        colour change, mode switch) cannot quietly bring the grid back. When the
-        grid is on the figure is left untouched rather than forced to `True`, so
-        "reinstate" restores exactly what `apply_plot_theme` produced.
-        """
-        if fig is None or not hasattr(fig, "update_layout"):
-            return fig
-        if is3d:
-            # Read off the *untouched* figure, which always carries the themed
-            # titles whichever way the checkbox is set — the live page cannot be
-            # asked for them once they have been blanked below, and hard-coding
-            # "X"/"Y"/"Z" here would silently drift from plotting.py.
-            try:
-                sc = fig.layout.scene
-                seen = {a: getattr(sc, a).title.text for a in ("xaxis", "yaxis", "zaxis")}
-                if all(seen.values()):
-                    self._axis_titles = seen
-            except Exception:
-                pass
-        if grid_on:
-            return fig
-        if is3d:
-            # component by component rather than `visible`, and matching
-            # PlotlyView.set_grid_visible exactly — see the note there on why
-            # hiding a scene axis outright is a one-way door for the titles
-            off = dict(showgrid=False, zeroline=False, showticklabels=False,
-                       showline=False, ticks="", title=dict(text=""))
-            fig.update_layout(scene=dict(xaxis=off, yaxis=off, zaxis=off))
-        else:
-            fig.update_xaxes(showgrid=False, zeroline=False)
-            fig.update_yaxes(showgrid=False, zeroline=False)
-        return fig
+    # ---------------- axes visibility ----------------
 
     def _on_grid_toggled(self, checked: bool):
         self._grid_on = bool(checked)
-        # relayout the live pages for instant feedback instead of re-rendering every
-        # figure; the figure-side bake above keeps it stuck on the next redraw
         for view in list(self._views.values()) + [self.merged_view]:
             if view is not None:
                 try:
-                    view.set_grid_visible(self._grid_on, self._axis_titles)
+                    view.set_grid_visible(self._grid_on)
                 except Exception:
                     pass
 
-    def update_one(self, base, fig, reset_view=False, is3d=False, scalebar_nm=100.0):
+    def update_one(self, base, spec, reset_view=False, is3d=False, scalebar_nm=100.0):
+        """Draw *spec* (a RenderSpec, or None for nothing) in the panel of *base*."""
         view = self._views.get(base)
         if view is None:
             return
-        self._apply_grid_to_fig(fig, is3d, self._grid_on)
         if reset_view:
-            # the remembered range/camera no longer describes what is on screen, and
+            # the remembered camera no longer describes what is on screen, and
             # after a 2D/3D switch it is the wrong kind of payload entirely
             self._last_view_by_base.pop(base, None)
             self._sync_suppress.pop(base, None)
-        if (not is3d) and fig is not None:
-            add_scalebar_2d(fig, length_nm=float(scalebar_nm))
-        view.update_fig(fig, reset_view=reset_view, is3d=is3d, scalebar_nm=scalebar_nm)
+        view.set_scalebar_nm(scalebar_nm)
+        view.show_datasets({base: spec}, is3d=is3d, reset_view=reset_view)
 
-    def update_all(self, figs_by_base, reset_view=False, is3d=False, scalebar_nm=100.0):
-        for base, fig in figs_by_base.items():
-            self.update_one(base, fig, reset_view=reset_view, is3d=is3d, scalebar_nm=scalebar_nm)
+    def update_all(self, specs_by_base, reset_view=False, is3d=False, scalebar_nm=100.0):
+        for base, spec in specs_by_base.items():
+            self.update_one(base, spec, reset_view=reset_view, is3d=is3d, scalebar_nm=scalebar_nm)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -2833,47 +2822,43 @@ class MultiColorWindow(QtWidgets.QMainWindow):
         if self._on_view_changed is not None:
             self._on_view_changed(source_id, payload)
 
-    def _on_plot_selection(self, _source_id, payload):
-        if not isinstance(payload, dict):
-            return
-        if payload.get("mode") != "2d":
-            return
-        xr = payload.get("xRange")
-        yr = payload.get("yRange")
-        if not (isinstance(xr, (list, tuple)) and isinstance(yr, (list, tuple)) and len(xr) == 2 and len(yr) == 2):
-            return
-        self._last_selection_payload = payload
-        self._last_selection_source_id = _source_id
+    def _on_view_activated(self, source_id):
+        self._last_active_source_id = source_id
+
+    def _relay_ndisplay(self, ndisplay):
+        if self._on_ndisplay_changed is not None:
+            self._on_ndisplay_changed(int(ndisplay))
 
     def _crop_current_selection(self):
+        """Crop to the visible area of the merged view, or of the panel touched last."""
         if self._on_crop_requested is None:
             return
-        p = self._last_selection_payload
-        if not isinstance(p, dict):
-            QtWidgets.QMessageBox.information(self, "Crop", "Use Box select on a multicolor plot first.")
+        if self._mode == "merged":
+            view, base = self.merged_view, None
+        else:
+            base = self._source_id_to_base(self._last_active_source_id)
+            if base is None and self._views:
+                base = next(iter(self._views))
+            view = self._views.get(base)
+        rect = view.visible_rect_2d() if view is not None else None
+        if rect is None:
+            QtWidgets.QMessageBox.information(
+                self, "Crop",
+                "Crop keeps what a 2-D panel is showing: switch 3D off, pan and zoom "
+                "to the region, then press Crop.",
+            )
             return
-        xr = p.get("xRange")
-        yr = p.get("yRange")
-        if not (isinstance(xr, (list, tuple)) and isinstance(yr, (list, tuple)) and len(xr) == 2 and len(yr) == 2):
-            QtWidgets.QMessageBox.information(self, "Crop", "Box selection range is unavailable.")
-            return
-        try:
-            payload = {
-                "mode": "2d",
-                "xRange": [float(min(xr[0], xr[1])), float(max(xr[0], xr[1]))],
-                "yRange": [float(min(yr[0], yr[1])), float(max(yr[0], yr[1]))],
-            }
-        except Exception:
-            QtWidgets.QMessageBox.information(self, "Crop", "Invalid box selection values.")
-            return
-        if self._mode != "merged":
-            src_id = getattr(self, "_last_selection_source_id", None)
-            base = self._source_id_to_base(src_id) if src_id else None
-            if base is not None:
-                payload["base"] = base
-                if self._sync_by_base.get(base, False):
-                    # a synchronized sample crops its whole group, not just itself
-                    payload["bases"] = self.synced_bases()
+        xmin, xmax, ymin, ymax = rect
+        payload = {
+            "mode": "2d",
+            "xRange": [float(xmin), float(xmax)],
+            "yRange": [float(ymin), float(ymax)],
+        }
+        if base is not None:
+            payload["base"] = base
+            if self._sync_by_base.get(base, False):
+                # a synchronized sample crops its whole group, not just itself
+                payload["bases"] = self.synced_bases()
         self._on_crop_requested(payload)
 
     def _reset_crop(self):
@@ -2884,9 +2869,10 @@ class MultiColorWindow(QtWidgets.QMainWindow):
     def grid_sync_enabled(self) -> bool:
         return False
 
-    def update_merged(self, fig, reset_view=False, is3d=False, scalebar_nm=100.0):
-        self._apply_grid_to_fig(fig, is3d, self._grid_on)
-        self.merged_view.update_fig(fig, reset_view=reset_view, is3d=is3d, scalebar_nm=scalebar_nm)
+    def update_merged(self, specs_by_base, reset_view=False, is3d=False, scalebar_nm=100.0):
+        """Draw every dataset in *specs_by_base* in the one merged viewer."""
+        self.merged_view.set_scalebar_nm(scalebar_nm)
+        self.merged_view.show_datasets(specs_by_base, is3d=is3d, reset_view=reset_view)
 
     def shutdown(self):
         try:
@@ -4045,7 +4031,6 @@ class MainWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.setWindowTitle("pyflux")
         self.resize(1500, 950)
-        self._plotly_tmp = None
         # state
         self._all_files = []
         self._current_index = 0
@@ -4103,8 +4088,6 @@ class MainWindow(QtWidgets.QMainWindow):
         left.addLayout(grid)
 
         self._closing = False
-        self._plotly_loaded = False
-        self._pending_fig = None
 
         # base -> dict(mode="solid"/"end-to-end", solid="cyan"/..., lut="Turbo"/...)
         self._color_settings_by_base = {}
@@ -4374,27 +4357,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._aligned_arr_by_base = {}  # base -> aligned array (same filtering), computed when enabled
         self._T_by_base = {}  # base -> 4x4 transform to source
 
-        # plotly panel
-        plot_box = QtWidgets.QGroupBox("Scatter plot")
+        # rendering panel: napari-storm draws the current dataset as Gaussians
+        plot_box = QtWidgets.QGroupBox("Rendering (napari-storm)")
         bottom.addWidget(plot_box, 1)
         pv = QtWidgets.QVBoxLayout(plot_box)
-        self.plot_view = PlotlyView()
+        self.plot_view = NapariStormView(title="pyflux")
         self.plot_view.viewChanged.connect(self.on_any_plot_view_changed)
+        self.plot_view.ndisplayChanged.connect(self._on_view_ndisplay_changed)
         pv.addWidget(self.plot_view)
         # status
         self.statusBar().showMessage("Ready.")
-
-    # --- Dead code: references self.web which MainWindow never creates ---
-    # --- (leftover from before the PlotlyView extraction) ---
-    # def _plotly_bootstrap_html(self):
-    #         return """<!doctype html> ..."""
-    #
-    # def ensure_plotly_page(self):
-    #     if self._plotly_loaded:
-    #         return
-    #     self._plotly_loaded = True
-    #     self._plotly_ready = False
-    #     self.web.setHtml(self._plotly_bootstrap_html(), QUrl("about:blank"))
 
     def open_binning_window(self):
             if self._binning_win is None:
@@ -4417,13 +4389,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._dbscan_win.show()
             self._dbscan_win.raise_()
             self._dbscan_win.activateWindow()
-
-    # def _on_plotly_load_finished(self, ok: bool):
-    #     self._plotly_ready = bool(ok)
-    #     if ok and self._pending_fig is not None:
-    #         fig = self._pending_fig
-    #         self._pending_fig = None
-    #         self.update_plotly_fig(fig)
 
     def reset_session(self):
         """Reset all analysis state so a new folder starts from scratch.
@@ -4503,10 +4468,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # clear main plot
         try:
-            fig = go.Figure()
-            fig.update_layout(annotations=[dict(text="No data", x=0.5, y=0.5, showarrow=False)])
-            apply_plot_theme(fig, is3d=False)
-            self.plot_view.update_fig(fig, reset_view=True, is3d=False)
+            self.plot_view.clear()
         except Exception:
             pass
 
@@ -4750,6 +4712,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._on_multicolor_crop_requested,
                 self._on_multicolor_reset_crop_requested,
                 self,
+                on_ndisplay_changed=self._on_view_ndisplay_changed,
             )
 
         bases = self.all_bases()
@@ -4762,9 +4725,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._multicolor_win.raise_()
         self._multicolor_win.activateWindow()
 
-        # IMPORTANT: defer initial drawing so QWebEngineViews can finish bootstrapping
+        # first draw once the window has its size, so reset_view frames the data
         QtCore.QTimer.singleShot(0, lambda: self._refresh_multicolor_contents(reset_view=True))
-        QtCore.QTimer.singleShot(120, lambda: self._refresh_multicolor_contents(reset_view=False))
 
     def on_merged_toggled(self):
         if self._multicolor_win is None or not self._multicolor_win.isVisible():
@@ -4785,35 +4747,25 @@ class MainWindow(QtWidgets.QMainWindow):
         is3d = self.is3d.isChecked()
         avg = self.avg_tid.isChecked()
         sb = float(getattr(self, "_scalebar_nm", 100.0))
+
+        # whatever is in _arr_by_base (trace-filtered or EFO-filtered), cropped
+        # if a crop is active, in the order of _all_files
+        arr_by_base = {}
+        for f in self._all_files:
+            base = self.base_of(f)
+            arr = self._get_multicolor_arr_for_base(base)
+            if arr is not None:
+                arr_by_base[base] = arr
+
         if self._multicolor_win.mode() == "merged":
-            # Build merged from whatever is in _arr_by_base (trace-filtered or EFO-filtered)
-            # preserve insertion order from _all_files:
-            arr_by_base = {}
-            for f in self._all_files:
-                base = self.base_of(f)
-                arr = self._get_multicolor_arr_for_base(base)
-                if arr is not None:
-                    arr_by_base[base] = arr
-
-            fig = make_plotly_fig_merged(
-                arr_by_base,
-                avg_tid=avg,
-                is3d=is3d,
-                color_settings_by_base=self._color_settings_by_base,
-                scalebar_nm=getattr(self, "_scalebar_nm", 100.0)
+            # one depth scale for all channels, so the same z is the same colour
+            specs = build_render_specs(
+                arr_by_base, avg, is3d, self._color_settings_by_base, shared_depth_range=True
             )
-            self._multicolor_win.update_merged(fig, reset_view=reset_view, is3d=is3d, scalebar_nm=sb)
+            self._multicolor_win.update_merged(specs, reset_view=reset_view, is3d=is3d, scalebar_nm=sb)
         else:
-            figs = {}
-            for f in self._all_files:
-                base = self.base_of(f)
-                cs = self._color_settings_by_base.get(base, {"mode": DEFAULT_MODE, "solid": DEFAULT_SOLID, "lut": DEFAULT_LUT, "alpha": DEFAULT_ALPHA, "size": DEFAULT_SIZE_2D})
-                arr = self._get_multicolor_arr_for_base(base)
-                if arr is None:
-                    continue
-                figs[base] = make_plotly_fig(arr, avg, is3d, color_settings=cs, scalebar_nm=getattr(self, "_scalebar_nm", 100.0))
-
-            self._multicolor_win.update_all(figs, reset_view=reset_view, is3d=is3d, scalebar_nm=sb)
+            specs = build_render_specs(arr_by_base, avg, is3d, self._color_settings_by_base)
+            self._multicolor_win.update_all(specs, reset_view=reset_view, is3d=is3d, scalebar_nm=sb)
 
     def _get_arr_for_base(self, base: str):
         arr = self._arr_by_base.get(base)
@@ -4943,16 +4895,10 @@ class MainWindow(QtWidgets.QMainWindow):
         arr = self._get_multicolor_arr_for_base(base)
         if arr is None:
             return
-        cs = self._color_settings_by_base.get(base, {"mode": DEFAULT_MODE, "solid": DEFAULT_SOLID, "lut": DEFAULT_LUT, "alpha": DEFAULT_ALPHA, "size": DEFAULT_SIZE_2D})
-        fig = make_plotly_fig(
-            arr,
-            self.avg_tid.isChecked(),
-            self.is3d.isChecked(),
-            color_settings=cs,
-            scalebar_nm=getattr(self, "_scalebar_nm", 100.0),
-        )
+        cs = self._color_settings_by_base.get(base)
+        spec = build_render_spec(arr, self.avg_tid.isChecked(), self.is3d.isChecked(), cs, name=base)
         self._multicolor_win.update_one(
-            base, fig,
+            base, spec,
             reset_view=reset_view,
             is3d=self.is3d.isChecked(),
             scalebar_nm=getattr(self, "_scalebar_nm", 100.0),
@@ -4991,15 +4937,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
         return ordered_all
 
-    def update_plotly_fig(self, fig, reset_view=False):
-        if (not self.is3d.isChecked()) and fig is not None:
-            add_scalebar_2d(fig, length_nm=float(getattr(self, "_scalebar_nm", 100.0)))
-        self.plot_view.update_fig(
-            fig,
-            reset_view=reset_view,
-            is3d=self.is3d.isChecked(),
-            scalebar_nm=getattr(self, "_scalebar_nm", 100.0),
-        )
+    def _on_view_ndisplay_changed(self, ndisplay):
+        """napari's own 2D/3D button was pressed in one of the viewers: follow it.
+
+        The 3D box is the single authority for how every viewer draws, so it
+        is set here and its handler redraws everything, which brings the other
+        viewers to the same mode too.
+        """
+        want = int(ndisplay) == 3
+        if self.is3d.isChecked() != want:
+            self.is3d.setChecked(want)
 
     # ---------------- UI actions ----------------
     def browse_folder(self):
@@ -5084,17 +5031,6 @@ class MainWindow(QtWidgets.QMainWindow):
         """Clean up worker reference when it finishes."""
         if self._current_worker is worker:
             self._current_worker = None
-
-    # def show_plotly(self, html: str):
-    #     if self._plotly_tmp is None:
-    #         fd, path = tempfile.mkstemp(suffix=".html")
-    #         os.close(fd)
-    #         self._plotly_tmp = path
-    #
-    #     with open(self._plotly_tmp, "w", encoding="utf-8") as f:
-    #         f.write(html)
-    #
-    #     self.web.load(QUrl.fromLocalFile(self._plotly_tmp))
 
     @staticmethod
     def _unique_bases(file_paths, root=None):
@@ -5567,25 +5503,11 @@ class MainWindow(QtWidgets.QMainWindow):
         # keep state consistent
         self._plot_arr = arr_to_plot
 
-        cs = self._color_settings_by_base.get(
-            base,
-            {
-                "mode": DEFAULT_MODE,
-                "solid": DEFAULT_SOLID,
-                "lut": DEFAULT_LUT,
-                "alpha": DEFAULT_ALPHA,
-                "size": DEFAULT_SIZE_2D,
-            },
-        )
-
-        fig = make_plotly_fig(
-            arr_to_plot,
-            self.avg_tid.isChecked(),
-            self.is3d.isChecked(),
-            color_settings=cs,
-            scalebar_nm=getattr(self, "_scalebar_nm", 100.0),
-        )
-        self.update_plotly_fig(fig, reset_view=reset_view)
+        cs = self._color_settings_by_base.get(base)
+        is3d = self.is3d.isChecked()
+        spec = build_render_spec(arr_to_plot, self.avg_tid.isChecked(), is3d, cs, name=base)
+        self.plot_view.set_scalebar_nm(getattr(self, "_scalebar_nm", 100.0))
+        self.plot_view.show_datasets({base: spec}, is3d=is3d, reset_view=reset_view)
 
     def apply_preview(self):
         if self._current_ctx is None:

@@ -12,7 +12,36 @@ A desktop GUI for loading, filtering, visualizing, aligning, clustering, and exp
 - Run DBSCAN clustering on track-averaged localizations
 - Export filtered data and summary statistics to CSV
 
-Built with PySide6, Plotly, Pandas, SciPy, and Zarr.
+Built with PySide6, napari-storm, Plotly, Pandas, SciPy, and Zarr.
+
+## Rendering
+
+Localizations are drawn by [napari-storm](https://github.com/napari-storm/napari-storm):
+every localization is a Gaussian summed on the GPU, in a napari canvas embedded
+in the pyflux window (no separate napari window opens). This replaced the Plotly
+scatter plots in the main window and the multicolor viewer; the binning and
+DBSCAN windows still use Plotly.
+
+- **σ (nm)** in the colour settings table is the Gaussian width per localization
+  (it used to be the marker size in pixels).
+- Colour modes are unchanged: *solid*, *depth* (z), *tid* and *end-to-end*.
+  In the merged multicolor view, depth uses one z scale for all channels.
+- **Crop** in the multicolor viewer keeps what a 2-D panel is showing: pan and
+  zoom to the region, then press Crop. In grid mode the panel the pointer touched
+  last is used; a synchronized panel crops its whole group.
+- The **3D** box switches every viewer; napari's own 2D/3D button does the same.
+- The scale bar and the axes overlay are napari's; the *Axes* box in the
+  multicolor viewer hides the axes.
+
+## Running from source
+
+```
+pip install -r requirements.txt
+python src/pyflux/main.py
+```
+
+`pytest -q` runs the tests; `tests/test_napari_storm_view.py` covers the
+napari-storm path, including one test that opens a viewer and needs a display.
 
 ## Installation
 

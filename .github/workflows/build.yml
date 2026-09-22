@@ -39,6 +39,10 @@ jobs:
             --name "pyflux" `
             --icon "assets/appicon.ico" `
             --collect-all PySide6 `
+            --collect-all napari `
+            --collect-all napari_storm `
+            --collect-all vispy `
+            --collect-all OpenGL `
             --hidden-import PySide6.QtWebEngineCore `
             --hidden-import PySide6.QtWebEngineWidgets `
             --hidden-import PySide6.QtWebChannel `
@@ -97,6 +101,10 @@ jobs:
               --icon "assets/appicon.icns" \
               --osx-bundle-identifier com.yourname.pyflux \
               --collect-all PySide6 \
+              --collect-all napari \
+              --collect-all napari_storm \
+              --collect-all vispy \
+              --collect-all OpenGL \
               --hidden-import PySide6.QtWebEngineCore \
               --hidden-import PySide6.QtWebEngineWidgets \
               --hidden-import PySide6.QtWebChannel \
@@ -148,6 +156,10 @@ jobs:
             --icon "assets/appicon.icns" \
             --osx-bundle-identifier com.yourname.pyflux \
             --collect-all PySide6 \
+            --collect-all napari \
+            --collect-all napari_storm \
+            --collect-all vispy \
+            --collect-all OpenGL \
             --hidden-import PySide6.QtWebEngineCore \
             --hidden-import PySide6.QtWebEngineWidgets \
             --hidden-import PySide6.QtWebChannel \

@@ -1,13 +1,18 @@
+import os
 import sys
 from pathlib import Path
 
-from PySide6 import QtGui, QtWidgets
-from PySide6.QtWebEngineCore import QWebEngineProfile
+# napari reaches Qt through qtpy, which must pick the binding pyflux uses.
+# Set before any Qt import; an explicit QT_API in the environment still wins.
+os.environ.setdefault("QT_API", "pyside6")
+
+from PySide6 import QtGui, QtWidgets  # noqa: E402
+from PySide6.QtWebEngineCore import QWebEngineProfile  # noqa: E402
 
 if __package__ in (None, ""):
     sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from pyflux.gui import MainWindow, apply_gui_theme, handle_download_requested
+from pyflux.gui import MainWindow, apply_gui_theme, handle_download_requested  # noqa: E402
 
 
 def main():
