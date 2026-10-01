@@ -1,9 +1,13 @@
 """Localization rendering through napari-storm.
 
 pyflux used to draw its scatter plots with Plotly inside a QtWebEngineView.
-This module replaces that with napari-storm: every localization is drawn as a
-Gaussian on a napari canvas that lives *inside* the pyflux window -- no
-separate napari window, no browser engine, no JavaScript bridge.
+This module replaces that with napari-storm, on a napari canvas that lives
+*inside* the pyflux window -- no separate napari window, no browser engine, no
+JavaScript bridge.  Localizations are drawn as points by default: opaque
+discs, depth-tested so a nearer one hides a farther one, which is napari-storm's
+disc footprint.  Gaussians -- summed, a super-resolution image -- are the
+alternative.  An installed napari-storm without disc support (2.1.0 and
+earlier) draws Gaussians either way; see :func:`points_supported`.
 
 Two halves, deliberately separated:
 
@@ -60,6 +64,25 @@ CONTRAST_LIMITS = (0.0, 1.0)
 #: anywhere in [0, 1).
 TID_COLORMAP = "hsv"
 
+#: Smallest on-screen point diameter, in screen pixels: Plotly's default marker
+#: size in pyflux, so a zoomed-out overview looks as the scatter plot did.
+#: Zoomed in, points grow with their size in nanometres.
+POINT_MIN_PX = 5.0
+
+
+def points_supported():
+    """True when the installed napari-storm can draw points (its disc footprint).
+
+    Checked by capability rather than version: the footprint arrived after
+    napari-storm 2.1.0, and a development install reports whatever version its
+    checkout carries.
+    """
+    try:
+        from napari_storm.core import FOOTPRINT_DISC, LayerAppearance  # noqa: F401
+    except ImportError:
+        return False
+    return "footprint" in getattr(LayerAppearance, "__dataclass_fields__", {})
+
 
 @dataclass(frozen=True)
 class ColormapSpec:
@@ -78,6 +101,8 @@ class RenderSpec:
     opacity: float
     contrast_limits: tuple = CONTRAST_LIMITS
     zdim_present: bool = False
+    #: Draw points (opaque discs) rather than Gaussians.
+    points: bool = True
 
     @property
     def n_localizations(self):
@@ -196,7 +221,9 @@ def scatter_xyz(arr, avg_tid):
     return xyz, vals, tids
 
 
-def build_render_spec(arr, avg_tid, is3d, color_settings=None, *, name="pyflux", depth_range=None):
+def build_render_spec(
+    arr, avg_tid, is3d, color_settings=None, *, name="pyflux", depth_range=None, points=True
+):
     """What napari-storm should draw for one pyflux dataset.
 
     Args:
@@ -206,12 +233,16 @@ def build_render_spec(arr, avg_tid, is3d, color_settings=None, *, name="pyflux",
         is3d: give the localizations their z.  Off, everything is drawn on one
             plane, which is what the 2-D scatter plot showed.
         color_settings: one row of the colour-settings table -- ``mode``,
-            ``solid``, ``lut``, ``alpha`` and ``size``.  ``size`` is the
-            Gaussian sigma in nanometres; it was the marker size in pixels.
+            ``solid``, ``lut``, ``alpha`` and ``size``.  ``size`` is in
+            nanometres: a point's radius, or a Gaussian's sigma -- the same
+            number, since napari-storm draws a point as the Gaussian's
+            one-sigma outline.  ``alpha`` applies to Gaussians; points are
+            opaque.
         name: layer name in the viewer.
         depth_range: ``(zmin, zmax)`` to colour depth against, so several
             datasets shown together share one scale.  None uses this
             dataset's own range.
+        points: draw points (the default) rather than Gaussians.
 
     Returns None when there is nothing to draw.
     """
@@ -268,6 +299,7 @@ def build_render_spec(arr, avg_tid, is3d, color_settings=None, *, name="pyflux",
         opacity=alpha,
         contrast_limits=CONTRAST_LIMITS,
         zdim_present=zdim_present,
+        points=bool(points),
     )
 
 
@@ -287,7 +319,9 @@ def depth_range_of(arr_by_base, avg_tid):
     return (low, high)
 
 
-def build_render_specs(arr_by_base, avg_tid, is3d, color_settings_by_base, *, shared_depth_range=False):
+def build_render_specs(
+    arr_by_base, avg_tid, is3d, color_settings_by_base, *, shared_depth_range=False, points=True
+):
     """One :class:`RenderSpec` per base, in the given order.
 
     With *shared_depth_range* every depth-coloured dataset is scaled against
@@ -308,7 +342,7 @@ def build_render_specs(arr_by_base, avg_tid, is3d, color_settings_by_base, *, sh
     for base, arr in arr_by_base.items():
         cs = (color_settings_by_base or {}).get(base)
         specs[base] = build_render_spec(
-            arr, avg_tid, is3d, cs, name=base, depth_range=depth_range
+            arr, avg_tid, is3d, cs, name=base, depth_range=depth_range, points=points
         )
     return specs
 
@@ -372,6 +406,8 @@ def _make_view_class():
             lay.addWidget(self._qt_viewer)
 
             self.renderer = select_renderer(self.viewer)
+            #: Whether points can be drawn; without, every dataset is Gaussians.
+            self.points_supported = points_supported()
 
             self.viewer.scale_bar.visible = True
             self.viewer.scale_bar.length = 100.0
@@ -428,15 +464,18 @@ def _make_view_class():
                     self._ids[base] = dataset_id
                     self.renderer.open(dataset_id, replace(spec.request, colormap=colormap))
                 self._refresh_extent(dataset_id)
-                self.renderer.set_appearance(
-                    dataset_id,
-                    LayerAppearance(
-                        colormap=colormap,
-                        opacity=float(spec.opacity),
-                        contrast_limits=tuple(spec.contrast_limits),
-                        visible=True,
-                    ),
+                appearance = dict(
+                    colormap=colormap,
+                    opacity=float(spec.opacity),
+                    contrast_limits=tuple(spec.contrast_limits),
+                    visible=True,
                 )
+                if self.points_supported:
+                    from napari_storm.core import FOOTPRINT_DISC, FOOTPRINT_GAUSSIAN
+
+                    appearance["footprint"] = FOOTPRINT_DISC if spec.points else FOOTPRINT_GAUSSIAN
+                    appearance["min_disc_px"] = POINT_MIN_PX
+                self.renderer.set_appearance(dataset_id, LayerAppearance(**appearance))
 
             for base in [b for b in self._ids if b not in specs]:
                 self._close_base(base)

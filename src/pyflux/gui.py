@@ -72,7 +72,7 @@ from .plotting import (
     scatter_points_and_color,
     tid_to_color,
 )
-from .napari_storm_view import NapariStormView, build_render_spec, build_render_specs
+from .napari_storm_view import NapariStormView, build_render_spec, build_render_specs, points_supported
 
 
 matplotlib.use("QtAgg")
@@ -332,7 +332,7 @@ def apply_gui_theme(app: QtWidgets.QApplication):
 class ColorSettingsPanel(QtWidgets.QGroupBox):
     """
     Table-based color settings:
-      Columns: File | Mode | LUT/Solid | α | σ (nm)
+      Columns: File | Mode | LUT/Solid | α | Size (nm)
       One row per file base.
 
     Emits changed(base, settings_dict).
@@ -341,7 +341,8 @@ class ColorSettingsPanel(QtWidgets.QGroupBox):
       - solid: str
       - lut: str
       - alpha: float
-      - size: int   -- Gaussian sigma in nm (it was the marker size in px)
+      - size: int   -- point radius, or Gaussian sigma, in nm (it was the
+                       marker size in px)
     """
     changed = Signal(str, object)  # (base, settings dict)
 
@@ -359,7 +360,8 @@ class ColorSettingsPanel(QtWidgets.QGroupBox):
         outer.setContentsMargins(8, 8, 8, 8)
 
         self.table = QtWidgets.QTableWidget(0, 6, self)
-        self.table.setHorizontalHeaderLabels(["File", "Mode", "LUT / Solid", "α", "σ (nm)", "mbm source"])
+        self.table.setHorizontalHeaderLabels(["File", "Mode", "LUT / Solid", "α", "Size (nm)", "mbm source"])
+        self._alpha_enabled = True  # α only means something for Gaussians
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
@@ -432,6 +434,12 @@ class ColorSettingsPanel(QtWidgets.QGroupBox):
 
         self.changed.emit(base, payload)
 
+    def set_alpha_enabled(self, enabled: bool):
+        """Grey α out while it has no effect: points are drawn opaque."""
+        self._alpha_enabled = bool(enabled)
+        for widgets in self._widgets_by_base.values():
+            widgets["alpha"].setEnabled(self._alpha_enabled)
+
     def _fill_palette_for_mode(self, base: str, mode: str, *, solid_default: str, lut_default: str):
         w = self._widgets_by_base[base]
         palette = w["palette"]
@@ -503,12 +511,20 @@ class ColorSettingsPanel(QtWidgets.QGroupBox):
             alpha_spin.setDecimals(2)
             alpha_spin.setSingleStep(0.05)
             alpha_spin.setValue(alpha)
+            alpha_spin.setEnabled(self._alpha_enabled)
+            alpha_spin.setToolTip(
+                "Opacity of Gaussians. Points are opaque: overlapping points hide\n"
+                "each other by depth instead of blending."
+            )
 
             # --- Size spin ---
             size_spin = QtWidgets.QSpinBox()
             size_spin.setRange(1, 50)
             size_spin.setValue(size)
-            size_spin.setToolTip("Width (sigma) of the Gaussian drawn for each localization, in nm.")
+            size_spin.setToolTip(
+                "Point radius, or Gaussian width (sigma), in nm.\n"
+                "Points are never drawn smaller than 5 screen pixels."
+            )
 
             # --- mbm source ---
             src_chk = QtWidgets.QCheckBox()
@@ -4172,6 +4188,26 @@ class MainWindow(QtWidgets.QMainWindow):
 
         right_controls.addLayout(row)
 
+        # Points are the default; Gaussians are optional.  A napari-storm too
+        # old to draw points (2.1.0 and earlier) locks the box on.
+        self.gaussian_chk = QtWidgets.QCheckBox("Gaussian rendering")
+        if points_supported():
+            self.gaussian_chk.setToolTip(
+                "Draw each localization as a Gaussian of width Size (nm), summed\n"
+                "with its neighbours like a super-resolution image.\n"
+                "Off: opaque points that hide each other by depth."
+            )
+        else:
+            self.gaussian_chk.setChecked(True)
+            self.gaussian_chk.setEnabled(False)
+            self.gaussian_chk.setToolTip(
+                "Points need napari-storm with disc support (newer than 2.1.0);\n"
+                "this installation draws Gaussians."
+            )
+        self.gaussian_chk.stateChanged.connect(lambda _: self._on_render_style_changed())
+        right_controls.addWidget(self.gaussian_chk)
+        self.color_panel.set_alpha_enabled(not self._render_points())
+
         # --- Binning + DBSCAN buttons (above multicolor section) ---
         VIEWER_W = 150
         BTN_H = 34
@@ -4706,6 +4742,14 @@ class MainWindow(QtWidgets.QMainWindow):
             if self._current_ctx is not None:
                 self.on_need_efo(self._current_ctx)
 
+    def _render_points(self):
+        """Points, unless Gaussians are ticked -- or points cannot be drawn here."""
+        return not self.gaussian_chk.isChecked()
+
+    def _on_render_style_changed(self):
+        self.color_panel.set_alpha_enabled(not self._render_points())
+        self._refresh_all_plots_same_data()
+
     def _refresh_all_plots_same_data(self):
         self.redraw_scatter(reset_view=False)
         self._refresh_multicolor_contents(reset_view=False)
@@ -4767,11 +4811,14 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._multicolor_win.mode() == "merged":
             # one depth scale for all channels, so the same z is the same colour
             specs = build_render_specs(
-                arr_by_base, avg, is3d, self._color_settings_by_base, shared_depth_range=True
+                arr_by_base, avg, is3d, self._color_settings_by_base,
+                shared_depth_range=True, points=self._render_points(),
             )
             self._multicolor_win.update_merged(specs, reset_view=reset_view, is3d=is3d, scalebar_nm=sb)
         else:
-            specs = build_render_specs(arr_by_base, avg, is3d, self._color_settings_by_base)
+            specs = build_render_specs(
+                arr_by_base, avg, is3d, self._color_settings_by_base, points=self._render_points()
+            )
             self._multicolor_win.update_all(specs, reset_view=reset_view, is3d=is3d, scalebar_nm=sb)
 
     def _get_arr_for_base(self, base: str):
@@ -4903,7 +4950,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if arr is None:
             return
         cs = self._color_settings_by_base.get(base)
-        spec = build_render_spec(arr, self.avg_tid.isChecked(), self.is3d.isChecked(), cs, name=base)
+        spec = build_render_spec(
+            arr, self.avg_tid.isChecked(), self.is3d.isChecked(), cs, name=base,
+            points=self._render_points(),
+        )
         self._multicolor_win.update_one(
             base, spec,
             reset_view=reset_view,
@@ -5512,7 +5562,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         cs = self._color_settings_by_base.get(base)
         is3d = self.is3d.isChecked()
-        spec = build_render_spec(arr_to_plot, self.avg_tid.isChecked(), is3d, cs, name=base)
+        spec = build_render_spec(
+            arr_to_plot, self.avg_tid.isChecked(), is3d, cs, name=base, points=self._render_points()
+        )
         self.plot_view.set_scalebar_nm(getattr(self, "_scalebar_nm", 100.0))
         self.plot_view.show_datasets({base: spec}, is3d=is3d, reset_view=reset_view)
 

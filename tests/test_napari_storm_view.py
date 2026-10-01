@@ -15,10 +15,12 @@ sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
 from pyflux.napari_storm_view import (  # noqa: E402
     CONTRAST_LIMITS,
     FLAT_Z_EXTENT_NM,
+    POINT_MIN_PX,
     build_render_spec,
     build_render_specs,
     depth_range_of,
     lut_colormap,
+    points_supported,
     solid_colormap,
     tid_color_values,
 )
@@ -202,6 +204,35 @@ def test_missing_settings_fall_back_to_defaults():
 
 
 # ----------------------------
+# points or Gaussians
+# ----------------------------
+
+def test_points_are_the_default():
+    spec = build_render_spec(_minflux(), False, True, _cs())
+    assert spec.points is True
+
+
+def test_gaussians_are_asked_for_explicitly():
+    spec = build_render_spec(_minflux(), False, True, _cs(), points=False)
+    assert spec.points is False
+    # the size is the same number either way: radius or sigma, in nm
+    assert spec.request.size == build_render_spec(_minflux(), False, True, _cs()).request.size
+
+
+def test_the_render_style_reaches_every_spec():
+    arrs = {"a": _minflux(seed=1), "b": _minflux(seed=2)}
+    for points in (True, False):
+        specs = build_render_specs(arrs, False, True, {}, points=points, shared_depth_range=True)
+        assert {spec.points for spec in specs.values()} == {points}
+
+
+def test_an_old_napari_storm_cannot_draw_points(monkeypatch):
+    napari_storm_core = pytest.importorskip("napari_storm.core")
+    monkeypatch.delattr(napari_storm_core, "FOOTPRINT_DISC", raising=False)
+    assert points_supported() is False
+
+
+# ----------------------------
 # the widget
 # ----------------------------
 
@@ -254,3 +285,94 @@ def test_view_draws_updates_and_closes_datasets():
         view.shutdown()
         for _ in range(5):
             app.processEvents()
+
+
+def _view_with(specs, is3d=False):
+    from PySide6 import QtWidgets
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    from pyflux.napari_storm_view import NapariStormView
+
+    view = NapariStormView()
+    view.show_datasets(specs, is3d=is3d, reset_view=True)
+    for _ in range(5):
+        app.processEvents()
+    return view
+
+
+def test_the_view_draws_points_by_default_and_gaussians_on_request():
+    pytest.importorskip("napari")
+    if not points_supported():
+        pytest.skip("the installed napari-storm cannot draw points")
+    a = _minflux(seed=1)
+    view = _view_with({"a": build_render_spec(a, False, False, _cs(), name="a")})
+    try:
+        dataset_id = view._ids["a"]
+        appearance = view.renderer.appearance(dataset_id)
+        assert appearance.footprint == "disc"
+        assert appearance.min_disc_px == POINT_MIN_PX
+
+        view.show_datasets(
+            {"a": build_render_spec(a, False, False, _cs(), name="a", points=False)},
+            is3d=False,
+        )
+        assert view.renderer.appearance(dataset_id).footprint == "gaussian"
+    finally:
+        view.shutdown()
+
+
+def test_without_point_support_the_view_draws_gaussians(monkeypatch):
+    pytest.importorskip("napari")
+    import pyflux.napari_storm_view as nsv
+
+    monkeypatch.setattr(nsv, "points_supported", lambda: False)
+    view = _view_with({"a": build_render_spec(_minflux(), False, False, _cs(), name="a")})
+    try:
+        assert view.points_supported is False
+        appearance = view.renderer.appearance(view._ids["a"])
+        assert getattr(appearance, "footprint", "gaussian") in (None, "gaussian")
+    finally:
+        view.shutdown()
+
+
+def _main_window():
+    from PySide6 import QtWidgets
+
+    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    from pyflux.gui import MainWindow
+
+    return MainWindow()
+
+
+def test_the_main_window_draws_points_unless_gaussians_are_ticked():
+    pytest.importorskip("napari")
+    if not points_supported():
+        pytest.skip("the installed napari-storm cannot draw points")
+    win = _main_window()
+    try:
+        assert not win.gaussian_chk.isChecked()
+        assert win.gaussian_chk.isEnabled()
+        assert win._render_points()
+        assert win.color_panel._alpha_enabled is False  # α does nothing for points
+
+        win.gaussian_chk.setChecked(True)
+        assert not win._render_points()
+        assert win.color_panel._alpha_enabled is True
+    finally:
+        win.plot_view.shutdown()
+        win.deleteLater()
+
+
+def test_the_main_window_falls_back_to_gaussians(monkeypatch):
+    pytest.importorskip("napari")
+    import pyflux.gui as gui
+
+    monkeypatch.setattr(gui, "points_supported", lambda: False)
+    win = _main_window()
+    try:
+        assert win.gaussian_chk.isChecked()
+        assert not win.gaussian_chk.isEnabled()
+        assert not win._render_points()
+    finally:
+        win.plot_view.shutdown()
+        win.deleteLater()
