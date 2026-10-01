@@ -273,11 +273,14 @@ def np_to_df(np_data):
     vals = ["x", "y", "z"]
 
     for column in column_to_split:
-        if column in df.columns and len(df) > 0:
-            n = len(df[column].iloc[0])
-            cols = [f"{column}_{vals[i]}" if i < len(vals) else f"{column}_{i}" for i in range(n)]
-            split_data = pd.DataFrame(df[column].tolist(), columns=cols)
-            df = pd.concat([df.drop(column, axis=1), split_data], axis=1)
+        # Split only what is a vector in this file: `dcr` is two values per row
+        # in the Imspector >= 24.10 layout and one in the legacy layout.
+        if column not in df.columns or len(df) == 0 or not np_data.dtype.fields[column][0].shape:
+            continue
+        n = len(df[column].iloc[0])
+        cols = [f"{column}_{vals[i]}" if i < len(vals) else f"{column}_{i}" for i in range(n)]
+        split_data = pd.DataFrame(df[column].tolist(), columns=cols)
+        df = pd.concat([df.drop(column, axis=1), split_data], axis=1)
     return df
 
 
@@ -307,3 +310,197 @@ def preview_localization_precision(arr):
                 stds.append(float(np.std(pts, ddof=1)))
         meds.append(float(np.median(stds)) if stds else float("nan"))
     return tuple(meds)
+
+
+# ----------------------------------------------------------------------
+# MINFLUX .npy layouts
+# ----------------------------------------------------------------------
+#
+# Imspector has written two .npy layouts.
+#
+# * Imspector >= 24.10 writes one row per *iteration*: `itr` is an integer
+#   column and `loc`, `efo`, `cfr`, ... sit beside it.  pyflux's pipeline is
+#   written against this layout.
+# * Older versions write one row per *localization*, with the iterations nested
+#   under `itr` as a structured sub-array of length K -- 5 for a 2-D sequence,
+#   10 for 3-D, 1 for an aggregated acquisition.  The same layout is what
+#   pyMINFLUX reads with its v1 reader and saves back out (adding `fluo`).
+#
+# A legacy file is flattened into the first layout, one row per (valid
+# localization, iteration), so the rest of pyflux reads both without knowing
+# which it got.  Every valid localization contributes exactly one row per
+# iteration, in file order, so selecting one iteration and pairing it with
+# another by (tid, occurrence) -- which is how the CFR of the final
+# localizations is looked up -- matches rows of the same localization.
+#
+# Iterations a later localization of a trace did not re-measure are NaN in the
+# legacy file (their `cfr` reads -0.0); they are carried over as they are, the
+# same values pyMINFLUX would read.
+
+
+class MinfluxLayoutError(ValueError):
+    """The file is not a MINFLUX export pyflux can read."""
+
+
+#: Output columns, in the order Imspector >= 24.10 writes them.  Columns only
+#: one layout has are left out: `fnl`, `bot`, `eot` and `thi` do not exist in
+#: the legacy layout, and `act`, `dos`, `sky`, `tic`, `ext`, `gvx`/`gvy`,
+#: `eox`/`eoy`, `dmz` and `lcx`/`lcy`/`lcz` do not exist in the new one.
+#: `fluo` is pyMINFLUX's fluorophore assignment, kept when present.
+_FLAT_COLUMNS = (
+    "vld", "sta", "tim", "tid", "gri", "sqi", "itr", "loc", "lnc",
+    "eco", "ecc", "efo", "efc", "fbg", "cfr", "dcr", "fluo",
+)
+#: Columns that hold one value per localization and are repeated per iteration.
+_PER_LOCALIZATION = frozenset({"vld", "tim", "tid", "gri", "sqi", "fluo"})
+#: Columns that hold one value per iteration.
+_PER_ITERATION = frozenset({"sta", "loc", "lnc", "eco", "ecc", "efo", "efc", "fbg", "cfr", "dcr"})
+
+_LEGACY_REQUIRED = ("vld", "tim", "tid")
+_LEGACY_REQUIRED_PER_ITERATION = ("loc", "efo", "cfr")
+
+
+def is_legacy_minflux(dtype):
+    """True when *dtype* is the legacy layout: iterations nested under `itr`."""
+    names = getattr(dtype, "names", None) or ()
+    if "itr" not in names:
+        return False
+    return dtype.fields["itr"][0].base.names is not None
+
+
+def _legacy_shape(dtype):
+    """``(K, iteration dtype)`` of a legacy layout, or a MinfluxLayoutError."""
+    names = dtype.names or ()
+    iteration = dtype.fields["itr"][0]
+    iteration_names = iteration.base.names or ()
+    missing = [f for f in _LEGACY_REQUIRED if f not in names]
+    missing += [f"itr.{f}" for f in _LEGACY_REQUIRED_PER_ITERATION if f not in iteration_names]
+    if missing:
+        raise MinfluxLayoutError(f"legacy layout missing field(s): {', '.join(missing)}")
+    n_iterations = int(np.prod(iteration.shape)) if iteration.shape else 1
+    if n_iterations < 1:
+        raise MinfluxLayoutError("legacy layout with no iterations")
+    return n_iterations, iteration.base
+
+
+def legacy_flat_dtype(dtype):
+    """The flat dtype a legacy *dtype* is converted into."""
+    _n, iteration = _legacy_shape(dtype)
+    names = dtype.names
+    fields = []
+    for name in _FLAT_COLUMNS:
+        if name == "itr":
+            fields.append(("itr", "<i4"))
+        elif name in _PER_LOCALIZATION and name in names:
+            fields.append((name, dtype.fields[name][0]))
+        elif name in _PER_ITERATION and name in iteration.names:
+            fields.append((name, iteration.fields[name][0]))
+    return np.dtype(fields)
+
+
+def flatten_legacy_minflux(records, *, valid_only=True, chunk=100_000, check_cancel=None):
+    """Convert a legacy-layout MINFLUX array to one row per iteration.
+
+    Args:
+        records: the legacy structured array.  A memory map works and is the
+            point of *chunk*: only *chunk* localizations are ever copied out of
+            it at once, so a multi-gigabyte export is converted without being
+            loaded whole.
+        valid_only: drop localizations with ``vld == False``.  pyflux discards
+            them first thing, and in 3-D acquisitions they are most of the file.
+        chunk: localizations converted per step.
+        check_cancel: called between steps; raise from it to abort.
+
+    Returns the flat array, rows ordered by localization, then iteration.
+    """
+    dtype = records.dtype
+    if not is_legacy_minflux(dtype):
+        raise MinfluxLayoutError("not the legacy layout: `itr` is not a nested array")
+    n_iterations, _iteration = _legacy_shape(dtype)
+    out_dtype = legacy_flat_dtype(dtype)
+    per_localization = [n for n in out_dtype.names if n in _PER_LOCALIZATION]
+    per_iteration = [n for n in out_dtype.names if n in _PER_ITERATION]
+    chunk = max(1, int(chunk))
+    n_records = len(records)
+
+    def _cancel():
+        if check_cancel is not None:
+            check_cancel()
+
+    # Count first, so the output is allocated once at its final size.
+    if valid_only:
+        n_kept = 0
+        for start in range(0, n_records, chunk):
+            _cancel()
+            n_kept += int(np.count_nonzero(records["vld"][start:start + chunk]))
+    else:
+        n_kept = n_records
+
+    out = np.empty(n_kept * n_iterations, dtype=out_dtype)
+    iteration_index = np.arange(n_iterations, dtype=np.int32)
+    row = 0
+    for start in range(0, n_records, chunk):
+        _cancel()
+        block = records[start:start + chunk]
+        if valid_only:
+            keep = np.asarray(block["vld"], dtype=bool)
+            if not keep.any():
+                continue
+            block = block[keep]
+        else:
+            block = np.asarray(block)
+        m = len(block)
+        if m == 0:
+            continue
+        rows = out[row:row + m * n_iterations]
+        nested = np.asarray(block["itr"]).reshape(m, n_iterations)
+        for name in per_localization:
+            rows[name] = np.repeat(np.asarray(block[name]), n_iterations, axis=0)
+        rows["itr"] = np.tile(iteration_index, m)
+        for name in per_iteration:
+            values = np.asarray(nested[name])
+            rows[name] = values.reshape((m * n_iterations,) + values.shape[2:])
+        row += m * n_iterations
+    return out
+
+
+def load_minflux_npy(path, *, chunk=100_000, check_cancel=None):
+    """Load a MINFLUX .npy export in either Imspector layout.
+
+    Returns ``(records, info)``.  *records* is always the flat layout -- one row
+    per iteration -- that pyflux processes.  *info* holds ``layout`` ("flat" or
+    "legacy"); for a legacy file also ``n_localizations`` and ``n_valid``, and
+    ``total_tim``, the acquisition span over every localization, valid or not,
+    which the converted array (valid localizations only) cannot give.
+
+    The file is memory-mapped and copied in *chunk*-row steps, with
+    *check_cancel* called between them: a plain ``np.load`` of a large file is
+    one uninterruptible call.
+    """
+    try:
+        mm = np.load(path, allow_pickle=False, mmap_mode="r")
+    except Exception:
+        # not memory-mappable (unusual layout, or a container) -- one shot
+        mm = np.load(path, allow_pickle=False)
+
+    if is_legacy_minflux(mm.dtype):
+        n = len(mm)
+        tim = mm["tim"]
+        info = {
+            "layout": "legacy",
+            "n_localizations": int(n),
+            "total_tim": float(tim[-1] - tim[0]) if n else 0.0,
+        }
+        flat = flatten_legacy_minflux(mm, valid_only=True, chunk=chunk, check_cancel=check_cancel)
+        info["n_valid"] = int(len(flat) // max(1, _legacy_shape(mm.dtype)[0]))
+        return flat, info
+
+    info = {"layout": "flat"}
+    if mm.ndim == 0 or len(mm) <= chunk:
+        return np.asarray(mm).copy(), info
+    out = np.empty(mm.shape, dtype=mm.dtype)
+    for i in range(0, len(mm), chunk):
+        if check_cancel is not None:
+            check_cancel()
+        out[i:i + chunk] = mm[i:i + chunk]
+    return out, info

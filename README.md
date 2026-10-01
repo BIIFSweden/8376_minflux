@@ -4,6 +4,9 @@ A desktop GUI for loading, filtering, visualizing, aligning, clustering, and exp
 
 ![Demo GIF](./assets/vid.gif)
 
+- Read MINFLUX .npy exports in both Imspector layouts: one row per iteration
+  (Imspector 24.10 and later) and the legacy layout with the iterations nested
+  under `itr` (older Imspector versions, and files saved by pyMINFLUX)
 - Filter localizations by trace length, EFO, and CFR
 - View data in interactive 2D/3D scatter plots
 - Compare datasets in a multicolor viewer

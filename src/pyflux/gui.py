@@ -24,10 +24,12 @@ from matplotlib.figure import Figure
 from matplotlib.widgets import SpanSelector
 
 from .core import (
+    MinfluxLayoutError,
     apply_T,
     apply_transform_to_arr,
     compute_mbm_transform,
     dbscan_numpy,
+    load_minflux_npy,
     np_to_df,
     preview_localization_precision,
     save_to_csv,
@@ -3887,27 +3889,18 @@ class FileWorker(QtCore.QThread):
             self.done_one.emit(None)
 
     def _load_interruptible(self, file, chunk=100_000):
-        """`np.load` split into cancellable pieces.
+        """`np.load` split into cancellable pieces, in either MINFLUX layout.
 
         A plain `np.load` of a large file is one uninterruptible C call with no
         `_check_cancel()` inside it, so `MainWindow.closeEvent`'s cancel + wait
         times out and Qt destroys a still-running QThread — a hard crash on quit.
         Memory-mapping and copying row blocks gives cancellation somewhere to fire.
+
+        Returns ``(records, info)``; a legacy-layout file (iterations nested
+        under `itr`) comes back converted to the flat layout. See
+        `core.load_minflux_npy`.
         """
-        try:
-            mm = np.load(file, allow_pickle=False, mmap_mode="r")
-        except Exception:
-            # not memory-mappable (unusual layout, or a container) — one shot
-            return np.load(file, allow_pickle=False).copy()
-
-        if mm.ndim == 0 or len(mm) <= chunk:
-            return np.asarray(mm).copy()
-
-        out = np.empty(mm.shape, dtype=mm.dtype)
-        for i in range(0, len(mm), chunk):
-            self._check_cancel()
-            out[i:i + chunk] = mm[i:i + chunk]
-        return out
+        return load_minflux_npy(file, chunk=chunk, check_cancel=self._check_cancel)
 
     def _process_one_file(self):
         p = self.params
@@ -3917,10 +3910,20 @@ class FileWorker(QtCore.QThread):
         base = p.get("base") or os.path.splitext(os.path.basename(file))[0]
         self.status.emit(f"Loading: {base}")
 
-        MFX_Data = self._load_interruptible(file)
+        try:
+            MFX_Data, load_info = self._load_interruptible(file)
+        except MinfluxLayoutError as e:
+            self.status.emit(f"Skipping {base}: not MINFLUX data — {e}.")
+            return None
         if self.isInterruptionRequested():
             return None
         self._check_cancel()
+        legacy = load_info.get("layout") == "legacy"
+        if legacy:
+            self.status.emit(
+                f"Loading: {base} (legacy layout, {load_info['n_valid']} valid of "
+                f"{load_info['n_localizations']} localizations)"
+            )
 
         # Validate before touching any field. `dtype.names` is None for a plain
         # (non-structured) array, so testing membership against it directly would
@@ -3932,7 +3935,9 @@ class FileWorker(QtCore.QThread):
             self.status.emit(f"Skipping {base}: not MINFLUX data — {what}.")
             return None
         if len(MFX_Data) == 0:
-            self.status.emit(f"Skipping {base}: file contains no localizations.")
+            # a converted legacy file holds valid localizations only
+            what = "no valid localizations" if legacy and load_info["n_localizations"] else "file contains no localizations"
+            self.status.emit(f"Skipping {base}: {what}.")
             return None
         # loc is indexed as [:, -1] and [:, 1] below
         loc_shape = MFX_Data["loc"].shape
@@ -3940,7 +3945,9 @@ class FileWorker(QtCore.QThread):
             self.status.emit(f"Skipping {base}: 'loc' has shape {loc_shape}, expected (N, 2) or (N, 3).")
             return None
 
-        total_tim = MFX_Data["tim"][-1] - MFX_Data["tim"][0]
+        # A converted legacy file has lost its invalid localizations, and with them
+        # possibly the first and last time stamps; the loader kept the full span.
+        total_tim = load_info.get("total_tim", MFX_Data["tim"][-1] - MFX_Data["tim"][0])
         total_loc = len(MFX_Data)
 
         MFX_Data = MFX_Data[MFX_Data["vld"] == True]
