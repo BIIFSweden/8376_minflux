@@ -18,9 +18,11 @@ from pyflux.napari_storm_view import (  # noqa: E402
     POINT_MIN_PX,
     build_render_spec,
     build_render_specs,
+    default_style,
     depth_range_of,
     lut_colormap,
     points_supported,
+    rendering_styles,
     solid_colormap,
     tid_color_values,
 )
@@ -204,31 +206,45 @@ def test_missing_settings_fall_back_to_defaults():
 
 
 # ----------------------------
-# points or Gaussians
+# rendering styles
 # ----------------------------
 
 def test_points_are_the_default():
     spec = build_render_spec(_minflux(), False, True, _cs())
-    assert spec.points is True
+    assert spec.footprint == "disc"
 
 
-def test_gaussians_are_asked_for_explicitly():
-    spec = build_render_spec(_minflux(), False, True, _cs(), points=False)
-    assert spec.points is False
+def test_any_style_can_be_asked_for():
+    gaussian = build_render_spec(_minflux(), False, True, _cs(), footprint="gaussian")
+    assert gaussian.footprint == "gaussian"
     # the size is the same number either way: radius or sigma, in nm
-    assert spec.request.size == build_render_spec(_minflux(), False, True, _cs()).request.size
+    assert gaussian.request.size == build_render_spec(_minflux(), False, True, _cs()).request.size
+    assert build_render_spec(_minflux(), False, True, _cs(), footprint="ring").footprint == "ring"
 
 
 def test_the_render_style_reaches_every_spec():
     arrs = {"a": _minflux(seed=1), "b": _minflux(seed=2)}
-    for points in (True, False):
-        specs = build_render_specs(arrs, False, True, {}, points=points, shared_depth_range=True)
-        assert {spec.points for spec in specs.values()} == {points}
+    for footprint in ("disc", "gaussian", "sphere"):
+        specs = build_render_specs(arrs, False, True, {}, footprint=footprint, shared_depth_range=True)
+        assert {spec.footprint for spec in specs.values()} == {footprint}
 
 
-def test_an_old_napari_storm_cannot_draw_points(monkeypatch):
+def test_the_styles_are_napari_storms_palette():
     napari_storm_core = pytest.importorskip("napari_storm.core")
-    monkeypatch.delattr(napari_storm_core, "FOOTPRINT_DISC", raising=False)
+    if not hasattr(napari_storm_core, "PALETTE"):
+        pytest.skip("the installed napari-storm has no palette")
+    styles = rendering_styles()
+    assert [s.name for s in styles] == [f.name for f in napari_storm_core.PALETTE]
+    assert styles[0].name == "gaussian" and not styles[0].opaque
+    assert {s.name for s in styles if s.opaque} >= {"disc", "ring", "sphere"}
+    assert default_style() == "disc"
+
+
+def test_a_napari_storm_without_the_palette_draws_gaussians(monkeypatch):
+    napari_storm_core = pytest.importorskip("napari_storm.core")
+    monkeypatch.delattr(napari_storm_core, "PALETTE", raising=False)
+    assert [s.name for s in rendering_styles()] == ["gaussian"]
+    assert default_style() == "gaussian"
     assert points_supported() is False
 
 
@@ -300,7 +316,7 @@ def _view_with(specs, is3d=False):
     return view
 
 
-def test_the_view_draws_points_by_default_and_gaussians_on_request():
+def test_the_view_draws_points_by_default_and_any_style_on_request():
     pytest.importorskip("napari")
     if not points_supported():
         pytest.skip("the installed napari-storm cannot draw points")
@@ -310,13 +326,14 @@ def test_the_view_draws_points_by_default_and_gaussians_on_request():
         dataset_id = view._ids["a"]
         appearance = view.renderer.appearance(dataset_id)
         assert appearance.footprint == "disc"
-        assert appearance.min_disc_px == POINT_MIN_PX
+        assert appearance.min_size_px == POINT_MIN_PX
 
-        view.show_datasets(
-            {"a": build_render_spec(a, False, False, _cs(), name="a", points=False)},
-            is3d=False,
-        )
-        assert view.renderer.appearance(dataset_id).footprint == "gaussian"
+        for footprint in ("gaussian", "ring", "glow"):
+            view.show_datasets(
+                {"a": build_render_spec(a, False, False, _cs(), name="a", footprint=footprint)},
+                is3d=False,
+            )
+            assert view.renderer.appearance(dataset_id).footprint == footprint
     finally:
         view.shutdown()
 
@@ -325,7 +342,9 @@ def test_without_point_support_the_view_draws_gaussians(monkeypatch):
     pytest.importorskip("napari")
     import pyflux.napari_storm_view as nsv
 
-    monkeypatch.setattr(nsv, "points_supported", lambda: False)
+    monkeypatch.setattr(
+        nsv, "rendering_styles", lambda: (nsv.RenderStyle("gaussian", "Gaussian", False),)
+    )
     view = _view_with({"a": build_render_spec(_minflux(), False, False, _cs(), name="a")})
     try:
         assert view.points_supported is False
@@ -344,20 +363,24 @@ def _main_window():
     return MainWindow()
 
 
-def test_the_main_window_draws_points_unless_gaussians_are_ticked():
+def test_the_main_window_offers_the_palette_with_points_first():
     pytest.importorskip("napari")
     if not points_supported():
         pytest.skip("the installed napari-storm cannot draw points")
     win = _main_window()
     try:
-        assert not win.gaussian_chk.isChecked()
-        assert win.gaussian_chk.isEnabled()
-        assert win._render_points()
-        assert win.color_panel._alpha_enabled is False  # α does nothing for points
+        combo = win.render_style
+        offered = [combo.itemData(i) for i in range(combo.count()) if combo.itemData(i)]
+        assert offered == [s.name for s in rendering_styles()]
+        assert combo.isEnabled()
+        assert win._render_footprint() == "disc"
+        assert win.color_panel._alpha_enabled is False  # α does nothing for markers
 
-        win.gaussian_chk.setChecked(True)
-        assert not win._render_points()
-        assert win.color_panel._alpha_enabled is True
+        combo.setCurrentIndex(combo.findData("glow"))
+        assert win._render_footprint() == "glow"
+        assert win.color_panel._alpha_enabled is True  # an additive style
+        combo.setCurrentIndex(combo.findData("sphere"))
+        assert win.color_panel._alpha_enabled is False
     finally:
         win.plot_view.shutdown()
         win.deleteLater()
@@ -367,12 +390,15 @@ def test_the_main_window_falls_back_to_gaussians(monkeypatch):
     pytest.importorskip("napari")
     import pyflux.gui as gui
 
-    monkeypatch.setattr(gui, "points_supported", lambda: False)
+    import pyflux.napari_storm_view as nsv
+
+    only_gaussian = (nsv.RenderStyle("gaussian", "Gaussian", False),)
+    monkeypatch.setattr(gui, "rendering_styles", lambda: only_gaussian)
+    monkeypatch.setattr(nsv, "rendering_styles", lambda: only_gaussian)
     win = _main_window()
     try:
-        assert win.gaussian_chk.isChecked()
-        assert not win.gaussian_chk.isEnabled()
-        assert not win._render_points()
+        assert not win.render_style.isEnabled()
+        assert win._render_footprint() == "gaussian"
     finally:
         win.plot_view.shutdown()
         win.deleteLater()

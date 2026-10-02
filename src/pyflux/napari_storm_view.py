@@ -3,11 +3,12 @@
 pyflux used to draw its scatter plots with Plotly inside a QtWebEngineView.
 This module replaces that with napari-storm, on a napari canvas that lives
 *inside* the pyflux window -- no separate napari window, no browser engine, no
-JavaScript bridge.  Localizations are drawn as points by default: opaque
-discs, depth-tested so a nearer one hides a farther one, which is napari-storm's
-disc footprint.  Gaussians -- summed, a super-resolution image -- are the
-alternative.  An installed napari-storm without disc support (2.1.0 and
-earlier) draws Gaussians either way; see :func:`points_supported`.
+JavaScript bridge.  What each localization is drawn as is a rendering style
+from napari-storm's footprint palette: points by default -- opaque discs,
+depth-tested so a nearer one hides a farther one -- or the scientific Gaussian,
+summed like a super-resolution image, or any other alternative visualisation
+napari-storm offers.  A napari-storm without the palette (2.1.0 and earlier)
+draws Gaussians only; see :func:`rendering_styles`.
 
 Two halves, deliberately separated:
 
@@ -70,18 +71,49 @@ TID_COLORMAP = "hsv"
 POINT_MIN_PX = 5.0
 
 
-def points_supported():
-    """True when the installed napari-storm can draw points (its disc footprint).
+#: What pyflux draws by default: points, napari-storm's "disc" footprint.
+DEFAULT_STYLE = "disc"
 
-    Checked by capability rather than version: the footprint arrived after
-    napari-storm 2.1.0, and a development install reports whatever version its
-    checkout carries.
+#: The scientific Gaussian, which every napari-storm can draw.
+GAUSSIAN_STYLE = "gaussian"
+
+
+@dataclass(frozen=True)
+class RenderStyle:
+    """One entry of napari-storm's palette, as pyflux offers it."""
+
+    name: str
+    label: str
+    opaque: bool
+    description: str = ""
+
+
+def rendering_styles():
+    """What the installed napari-storm can draw, in its own order.
+
+    napari-storm's footprint palette when it has one: the scientific Gaussian,
+    then the alternative visualisations.  A napari-storm that predates the
+    palette can draw Gaussians only.  Checked by capability rather than version,
+    because a development install reports whatever version its checkout carries.
     """
     try:
-        from napari_storm.core import FOOTPRINT_DISC, LayerAppearance  # noqa: F401
+        from napari_storm.core import PALETTE
     except ImportError:
-        return False
-    return "footprint" in getattr(LayerAppearance, "__dataclass_fields__", {})
+        return (RenderStyle(GAUSSIAN_STYLE, "Gaussian", opaque=False),)
+    return tuple(
+        RenderStyle(f.name, f.label, f.blend == "opaque", f.description) for f in PALETTE
+    )
+
+
+def default_style():
+    """Points when napari-storm can draw them, the Gaussian otherwise."""
+    names = {style.name for style in rendering_styles()}
+    return DEFAULT_STYLE if DEFAULT_STYLE in names else GAUSSIAN_STYLE
+
+
+def points_supported():
+    """True when the installed napari-storm can draw points."""
+    return default_style() == DEFAULT_STYLE
 
 
 @dataclass(frozen=True)
@@ -101,8 +133,8 @@ class RenderSpec:
     opacity: float
     contrast_limits: tuple = CONTRAST_LIMITS
     zdim_present: bool = False
-    #: Draw points (opaque discs) rather than Gaussians.
-    points: bool = True
+    #: The rendering style, a name from napari-storm's palette.
+    footprint: str = DEFAULT_STYLE
 
     @property
     def n_localizations(self):
@@ -222,7 +254,8 @@ def scatter_xyz(arr, avg_tid):
 
 
 def build_render_spec(
-    arr, avg_tid, is3d, color_settings=None, *, name="pyflux", depth_range=None, points=True
+    arr, avg_tid, is3d, color_settings=None, *, name="pyflux", depth_range=None,
+    footprint=DEFAULT_STYLE,
 ):
     """What napari-storm should draw for one pyflux dataset.
 
@@ -234,15 +267,16 @@ def build_render_spec(
             plane, which is what the 2-D scatter plot showed.
         color_settings: one row of the colour-settings table -- ``mode``,
             ``solid``, ``lut``, ``alpha`` and ``size``.  ``size`` is in
-            nanometres: a point's radius, or a Gaussian's sigma -- the same
-            number, since napari-storm draws a point as the Gaussian's
-            one-sigma outline.  ``alpha`` applies to Gaussians; points are
-            opaque.
+            nanometres: a marker's radius, or a Gaussian's sigma -- the same
+            number, since napari-storm draws a marker at the Gaussian's
+            one-sigma outline.  ``alpha`` applies to the additive styles;
+            markers are opaque.
         name: layer name in the viewer.
         depth_range: ``(zmin, zmax)`` to colour depth against, so several
             datasets shown together share one scale.  None uses this
             dataset's own range.
-        points: draw points (the default) rather than Gaussians.
+        footprint: the rendering style, a name from napari-storm's palette
+            (see :func:`rendering_styles`); points by default.
 
     Returns None when there is nothing to draw.
     """
@@ -299,7 +333,7 @@ def build_render_spec(
         opacity=alpha,
         contrast_limits=CONTRAST_LIMITS,
         zdim_present=zdim_present,
-        points=bool(points),
+        footprint=str(footprint),
     )
 
 
@@ -320,7 +354,8 @@ def depth_range_of(arr_by_base, avg_tid):
 
 
 def build_render_specs(
-    arr_by_base, avg_tid, is3d, color_settings_by_base, *, shared_depth_range=False, points=True
+    arr_by_base, avg_tid, is3d, color_settings_by_base, *, shared_depth_range=False,
+    footprint=DEFAULT_STYLE,
 ):
     """One :class:`RenderSpec` per base, in the given order.
 
@@ -342,7 +377,7 @@ def build_render_specs(
     for base, arr in arr_by_base.items():
         cs = (color_settings_by_base or {}).get(base)
         specs[base] = build_render_spec(
-            arr, avg_tid, is3d, cs, name=base, depth_range=depth_range, points=points
+            arr, avg_tid, is3d, cs, name=base, depth_range=depth_range, footprint=footprint
         )
     return specs
 
@@ -406,8 +441,10 @@ def _make_view_class():
             lay.addWidget(self._qt_viewer)
 
             self.renderer = select_renderer(self.viewer)
-            #: Whether points can be drawn; without, every dataset is Gaussians.
-            self.points_supported = points_supported()
+            #: The styles the installed napari-storm can draw.  Without its
+            #: palette that is the Gaussian alone, and every dataset is drawn so.
+            self.styles = {style.name for style in rendering_styles()}
+            self.points_supported = DEFAULT_STYLE in self.styles
 
             self.viewer.scale_bar.visible = True
             self.viewer.scale_bar.length = 100.0
@@ -470,11 +507,10 @@ def _make_view_class():
                     contrast_limits=tuple(spec.contrast_limits),
                     visible=True,
                 )
-                if self.points_supported:
-                    from napari_storm.core import FOOTPRINT_DISC, FOOTPRINT_GAUSSIAN
-
-                    appearance["footprint"] = FOOTPRINT_DISC if spec.points else FOOTPRINT_GAUSSIAN
-                    appearance["min_disc_px"] = POINT_MIN_PX
+                if len(self.styles) > 1:
+                    footprint = spec.footprint if spec.footprint in self.styles else GAUSSIAN_STYLE
+                    appearance["footprint"] = footprint
+                    appearance["min_size_px"] = POINT_MIN_PX
                 self.renderer.set_appearance(dataset_id, LayerAppearance(**appearance))
 
             for base in [b for b in self._ids if b not in specs]:

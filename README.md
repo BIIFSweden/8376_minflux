@@ -28,13 +28,18 @@ multicolor viewer; the binning and DBSCAN windows still use Plotly.
   hide each other by depth, so overlaps and 3-D views come out right whatever
   order the points are drawn in. Points are never smaller than 5 screen pixels,
   so a zoomed-out overview stays visible.
-- **Gaussian rendering** (the box under *3D*) draws each localization as a
-  Gaussian instead, summed with its neighbours like a super-resolution image.
-- **Size (nm)** in the colour settings table is the point radius, or the
+- **Render as** (under *3D*) lists napari-storm's rendering styles.
+  *Gaussian (scientific)* draws each localization as a Gaussian summed with its
+  neighbours, like a super-resolution image. The alternative visualisations are
+  points, outlined points, rings, spheres, crosses, squares and diamonds, which
+  are opaque and hide each other by depth, and napari-particles' sprites, which
+  glow and add up.
+- **Size (nm)** in the colour settings table is a marker's radius, or the
   Gaussian width (σ), in nanometres. It used to be the marker size in pixels.
-- **α** applies to Gaussians only and is greyed out for points, which are opaque.
-- Points need a napari-storm with disc support, newer than 2.1.0. With 2.1.0
-  pyflux draws Gaussians and the *Gaussian rendering* box stays ticked.
+- **α** applies to the Gaussian and the sprites, and is greyed out for the
+  opaque markers.
+- The styles come from napari-storm's footprint palette, newer than 2.1.0.
+  With 2.1.0 pyflux draws Gaussians and the *Render as* menu is locked.
 - Colour modes are unchanged: *solid*, *depth* (z), *tid* and *end-to-end*.
   In the merged multicolor view, depth uses one z scale for all channels.
 - **Crop** in the multicolor viewer keeps what a 2-D panel is showing: pan and

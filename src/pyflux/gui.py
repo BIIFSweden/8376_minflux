@@ -72,7 +72,13 @@ from .plotting import (
     scatter_points_and_color,
     tid_to_color,
 )
-from .napari_storm_view import NapariStormView, build_render_spec, build_render_specs, points_supported
+from .napari_storm_view import (
+    NapariStormView,
+    build_render_spec,
+    build_render_specs,
+    default_style,
+    rendering_styles,
+)
 
 
 matplotlib.use("QtAgg")
@@ -4188,25 +4194,38 @@ class MainWindow(QtWidgets.QMainWindow):
 
         right_controls.addLayout(row)
 
-        # Points are the default; Gaussians are optional.  A napari-storm too
-        # old to draw points (2.1.0 and earlier) locks the box on.
-        self.gaussian_chk = QtWidgets.QCheckBox("Gaussian rendering")
-        if points_supported():
-            self.gaussian_chk.setToolTip(
-                "Draw each localization as a Gaussian of width Size (nm), summed\n"
-                "with its neighbours like a super-resolution image.\n"
-                "Off: opaque points that hide each other by depth."
+        # What every localization is drawn as: napari-storm's rendering styles,
+        # points by default.  A napari-storm without its palette (2.1.0 and
+        # earlier) draws Gaussians only, and the menu is locked.
+        style_row = QtWidgets.QHBoxLayout()
+        style_row.setContentsMargins(0, 0, 0, 0)
+        style_row.addWidget(QtWidgets.QLabel("Render as"), 0)
+        self.render_style = QtWidgets.QComboBox()
+        self._styles = {style.name: style for style in rendering_styles()}
+        for style in self._styles.values():
+            self.render_style.addItem(style.label, style.name)
+            self.render_style.setItemData(
+                self.render_style.count() - 1, style.description, Qt.ToolTipRole
+            )
+            if style.name == "gaussian" and len(self._styles) > 1:
+                self.render_style.insertSeparator(self.render_style.count())
+        self.render_style.setCurrentIndex(self.render_style.findData(default_style()))
+        if len(self._styles) > 1:
+            self.render_style.setToolTip(
+                "What every localization is drawn as. Gaussian (scientific) sums\n"
+                "them like a super-resolution image; the rest are napari-storm's\n"
+                "alternative visualisations."
             )
         else:
-            self.gaussian_chk.setChecked(True)
-            self.gaussian_chk.setEnabled(False)
-            self.gaussian_chk.setToolTip(
-                "Points need napari-storm with disc support (newer than 2.1.0);\n"
-                "this installation draws Gaussians."
+            self.render_style.setEnabled(False)
+            self.render_style.setToolTip(
+                "Other styles need napari-storm with its footprint palette\n"
+                "(newer than 2.1.0); this installation draws Gaussians."
             )
-        self.gaussian_chk.stateChanged.connect(lambda _: self._on_render_style_changed())
-        right_controls.addWidget(self.gaussian_chk)
-        self.color_panel.set_alpha_enabled(not self._render_points())
+        self.render_style.currentIndexChanged.connect(lambda _: self._on_render_style_changed())
+        style_row.addWidget(self.render_style, 1)
+        right_controls.addLayout(style_row)
+        self.color_panel.set_alpha_enabled(not self._render_style_opaque())
 
         # --- Binning + DBSCAN buttons (above multicolor section) ---
         VIEWER_W = 150
@@ -4742,12 +4761,17 @@ class MainWindow(QtWidgets.QMainWindow):
             if self._current_ctx is not None:
                 self.on_need_efo(self._current_ctx)
 
-    def _render_points(self):
-        """Points, unless Gaussians are ticked -- or points cannot be drawn here."""
-        return not self.gaussian_chk.isChecked()
+    def _render_footprint(self):
+        """The chosen rendering style, a name from napari-storm's palette."""
+        return self.render_style.currentData() or "gaussian"
+
+    def _render_style_opaque(self):
+        style = self._styles.get(self._render_footprint())
+        return bool(style is not None and style.opaque)
 
     def _on_render_style_changed(self):
-        self.color_panel.set_alpha_enabled(not self._render_points())
+        # α means something for the additive styles only; markers are opaque
+        self.color_panel.set_alpha_enabled(not self._render_style_opaque())
         self._refresh_all_plots_same_data()
 
     def _refresh_all_plots_same_data(self):
@@ -4812,12 +4836,13 @@ class MainWindow(QtWidgets.QMainWindow):
             # one depth scale for all channels, so the same z is the same colour
             specs = build_render_specs(
                 arr_by_base, avg, is3d, self._color_settings_by_base,
-                shared_depth_range=True, points=self._render_points(),
+                shared_depth_range=True, footprint=self._render_footprint(),
             )
             self._multicolor_win.update_merged(specs, reset_view=reset_view, is3d=is3d, scalebar_nm=sb)
         else:
             specs = build_render_specs(
-                arr_by_base, avg, is3d, self._color_settings_by_base, points=self._render_points()
+                arr_by_base, avg, is3d, self._color_settings_by_base,
+                footprint=self._render_footprint(),
             )
             self._multicolor_win.update_all(specs, reset_view=reset_view, is3d=is3d, scalebar_nm=sb)
 
@@ -4952,7 +4977,7 @@ class MainWindow(QtWidgets.QMainWindow):
         cs = self._color_settings_by_base.get(base)
         spec = build_render_spec(
             arr, self.avg_tid.isChecked(), self.is3d.isChecked(), cs, name=base,
-            points=self._render_points(),
+            footprint=self._render_footprint(),
         )
         self._multicolor_win.update_one(
             base, spec,
@@ -5563,7 +5588,8 @@ class MainWindow(QtWidgets.QMainWindow):
         cs = self._color_settings_by_base.get(base)
         is3d = self.is3d.isChecked()
         spec = build_render_spec(
-            arr_to_plot, self.avg_tid.isChecked(), is3d, cs, name=base, points=self._render_points()
+            arr_to_plot, self.avg_tid.isChecked(), is3d, cs, name=base,
+            footprint=self._render_footprint(),
         )
         self.plot_view.set_scalebar_nm(getattr(self, "_scalebar_nm", 100.0))
         self.plot_view.show_datasets({base: spec}, is3d=is3d, reset_view=reset_view)
