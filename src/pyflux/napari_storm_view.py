@@ -32,7 +32,7 @@ sees napari's.
 
 import hashlib
 import warnings
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 
 import numpy as np
 
@@ -57,8 +57,10 @@ from .plotting import (
 #: as an exact zero.
 FLAT_Z_EXTENT_NM = 1.0
 
-#: Every dataset is drawn with the same contrast window, so a per-localization
-#: value in [0, 1] is the colormap position, not an intensity to be rescaled.
+#: Every dataset is drawn with the same contrast window.  In the depth, trace
+#: and end-to-end modes a per-localization value in [0, 1] is the colormap
+#: position, not an intensity to be rescaled; in solid mode every value is 1,
+#: and the window applies to the summed image (see `RenderSpec.summed_contrast`).
 CONTRAST_LIMITS = (0.0, 1.0)
 
 #: Colormap for ``tid`` mode: one hue per trace, cyclic so the hash can land
@@ -116,6 +118,21 @@ def points_supported():
     return default_style() == DEFAULT_STYLE
 
 
+def summed_contrast_supported():
+    """True when the installed napari-storm can be told what its values mean.
+
+    napari-storm windows an additive style's summed image by default, treating
+    each localization's value as a weight.  One that predates that windowed
+    each localization on its own, which is what pyflux's colour modes assume,
+    so there is nothing to tell it.  Checked by capability, as for the palette.
+    """
+    try:
+        from napari_storm.core import LayerAppearance
+    except ImportError:
+        return False
+    return "summed_contrast" in {f.name for f in fields(LayerAppearance)}
+
+
 @dataclass(frozen=True)
 class ColormapSpec:
     """A colormap as data, so the planning half needs no napari import."""
@@ -135,6 +152,12 @@ class RenderSpec:
     zdim_present: bool = False
     #: The rendering style, a name from napari-storm's palette.
     footprint: str = DEFAULT_STYLE
+    #: Whether the values are weights to sum (solid colour, every value 1) or
+    #: colormap positions (depth, trace, end-to-end).  napari-storm windows the
+    #: summed image of an additive style by default, which turns a position
+    #: into a weight: colour would follow density, and the localizations at
+    #: the bottom of the colormap would all but vanish.
+    summed_contrast: bool = True
 
     @property
     def n_localizations(self):
@@ -334,6 +357,7 @@ def build_render_spec(
         contrast_limits=CONTRAST_LIMITS,
         zdim_present=zdim_present,
         footprint=str(footprint),
+        summed_contrast=(mode == MODE_SOLID),
     )
 
 
@@ -445,6 +469,7 @@ def _make_view_class():
             #: palette that is the Gaussian alone, and every dataset is drawn so.
             self.styles = {style.name for style in rendering_styles()}
             self.points_supported = DEFAULT_STYLE in self.styles
+            self._summed_contrast_supported = summed_contrast_supported()
 
             self.viewer.scale_bar.visible = True
             self.viewer.scale_bar.length = 100.0
@@ -511,6 +536,8 @@ def _make_view_class():
                     footprint = spec.footprint if spec.footprint in self.styles else GAUSSIAN_STYLE
                     appearance["footprint"] = footprint
                     appearance["min_size_px"] = POINT_MIN_PX
+                if self._summed_contrast_supported:
+                    appearance["summed_contrast"] = bool(spec.summed_contrast)
                 self.renderer.set_appearance(dataset_id, LayerAppearance(**appearance))
 
             for base in [b for b in self._ids if b not in specs]:

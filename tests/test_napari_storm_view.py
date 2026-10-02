@@ -24,9 +24,17 @@ from pyflux.napari_storm_view import (  # noqa: E402
     points_supported,
     rendering_styles,
     solid_colormap,
+    summed_contrast_supported,
     tid_color_values,
 )
-from pyflux.plotting import LUT_CHOICES, SOLID_COLOR_CHOICES  # noqa: E402
+from pyflux.plotting import (  # noqa: E402
+    LUT_CHOICES,
+    MODE_DEPTH,
+    MODE_E2E,
+    MODE_SOLID,
+    MODE_TID,
+    SOLID_COLOR_CHOICES,
+)
 
 
 def _minflux(n=120, ntid=12, seed=0, zspan=400.0):
@@ -198,6 +206,16 @@ def test_end_to_end_mode_normalises_the_trace_displacement():
         assert np.ptp(v[a["tid"] == tid]) == 0.0
 
 
+def test_only_solid_colour_sums_its_values():
+    """Solid values are all 1, weights to add up; the other modes' values are
+    colormap positions, which summing would turn into a density."""
+    a = _minflux()
+    assert build_render_spec(a, False, True, _cs(mode=MODE_SOLID)).summed_contrast
+    for mode in (MODE_DEPTH, MODE_TID, MODE_E2E):
+        spec = build_render_spec(a, False, True, _cs(mode=mode))
+        assert spec.summed_contrast is False, mode
+
+
 def test_missing_settings_fall_back_to_defaults():
     a = _minflux()
     spec = build_render_spec(a, False, True, None)
@@ -334,6 +352,25 @@ def test_the_view_draws_points_by_default_and_any_style_on_request():
                 is3d=False,
             )
             assert view.renderer.appearance(dataset_id).footprint == footprint
+    finally:
+        view.shutdown()
+
+
+def test_colour_modes_keep_napari_storms_per_localization_window():
+    pytest.importorskip("napari")
+    if not summed_contrast_supported():
+        pytest.skip("the installed napari-storm always windows per localization")
+    a = _minflux(seed=1)
+    specs = {
+        "solid": build_render_spec(a, False, False, _cs(), name="solid", footprint="gaussian"),
+        "depth": build_render_spec(
+            a, False, False, _cs(mode="depth"), name="depth", footprint="gaussian"
+        ),
+    }
+    view = _view_with(specs)
+    try:
+        assert view.renderer.contrast_is_summed(view._ids["solid"])
+        assert not view.renderer.contrast_is_summed(view._ids["depth"])
     finally:
         view.shutdown()
 
