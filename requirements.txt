@@ -71,9 +71,9 @@ napari==0.7.1
 napari-console==0.1.4
 napari-plugin-engine==0.2.1
 # Points, the default rendering, and the other styles under 'Render as' come
-# from napari-storm's footprint palette, which came after 2.1.0; with 2.1.0
-# pyflux falls back to Gaussians.
-napari-storm==2.1.0
+# from napari-storm's footprint palette (3.0); 3.1 draws every Gaussian at its
+# requested width. With an older napari-storm pyflux falls back to Gaussians.
+napari-storm==3.1.0
 napari-svg==0.2.1
 narwhals==2.7.0
 nbformat==5.10.4
