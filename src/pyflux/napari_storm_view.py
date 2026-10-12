@@ -10,6 +10,10 @@ summed like a super-resolution image, or any other alternative visualisation
 napari-storm offers.  A napari-storm without the palette (2.1.0 and earlier)
 draws Gaussians only; see :func:`rendering_styles`.
 
+napari-storm is optional.  :func:`napari_storm_available` says whether it
+(and napari) can be imported; without them pyflux draws its Plotly scatter
+plots as before, and nothing in this module beyond that check is used.
+
 Two halves, deliberately separated:
 
 * :func:`build_render_spec` turns a pyflux MINFLUX array plus one row of the
@@ -40,16 +44,21 @@ from .plotting import (
     DEFAULT_ALPHA,
     DEFAULT_LUT,
     DEFAULT_MODE,
+    DEFAULT_PROPERTY,
     DEFAULT_SIZE_2D,
     DEFAULT_SOLID,
     LUT_CHOICES,
     MODE_DEPTH,
     MODE_E2E,
+    MODE_PROPERTY,
     MODE_SOLID,
     MODE_TID,
     SOLID_COLOR_MAP,
     _resolve_mpl_cmap,
+    property_limits,
+    property_values,
     scatter_points_and_color,
+    shared_property_ranges,
 )
 
 #: Below this much z extent (nm) a dataset is drawn flat, whatever the 3D box
@@ -133,6 +142,46 @@ def summed_contrast_supported():
     return "summed_contrast" in {f.name for f in fields(LayerAppearance)}
 
 
+def napari_storm_available():
+    """True when napari-storm and napari can be imported.
+
+    Decides which renderer pyflux builds.  ``PYFLUX_RENDERER=plotly`` in the
+    environment forces the Plotly path even when they are installed, which
+    is how the fallback is exercised on a machine that has them.
+    """
+    import os
+
+    if os.environ.get("PYFLUX_RENDERER", "").strip().lower() == "plotly":
+        return False
+    try:
+        import napari  # noqa: F401
+        import napari_storm.core  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def color_coded_supported():
+    """True when the installed napari-storm blends colour-coded localizations.
+
+    From napari-storm 3.2 a colour-coded additive layer blends overlapping
+    localizations to the mean of their colours and windows the summed weight
+    alone, so the contrast window sets brightness while the property sets
+    colour.  Earlier versions window each localization on its own; pyflux
+    then keeps the window at ``(0, 1)`` for the colour modes.
+    """
+    try:
+        from napari_storm.core import LayerAppearance
+    except ImportError:
+        return False
+    return "color_coded" in {f.name for f in fields(LayerAppearance)}
+
+
+#: The contrast window pyflux starts with for a summed image: the full
+#: colour at one localization, as the per-localization window gave.
+DEFAULT_CONTRAST = (0.0, 1.0)
+
+
 @dataclass(frozen=True)
 class ColormapSpec:
     """A colormap as data, so the planning half needs no napari import."""
@@ -158,6 +207,10 @@ class RenderSpec:
     #: into a weight: colour would follow density, and the localizations at
     #: the bottom of the colormap would all but vanish.
     summed_contrast: bool = True
+    #: Whether the values are colormap positions.  With a napari-storm that
+    #: blends colour-coded localizations (see :func:`color_coded_supported`)
+    #: the window then applies to the summed weight, as in solid mode.
+    color_coded: bool = False
 
     @property
     def n_localizations(self):
@@ -249,6 +302,8 @@ def _settings_with_defaults(color_settings):
     cs.setdefault("lut", DEFAULT_LUT)
     cs.setdefault("alpha", DEFAULT_ALPHA)
     cs.setdefault("size", DEFAULT_SIZE_2D)
+    cs.setdefault("property", DEFAULT_PROPERTY)
+    cs.setdefault("limits", None)
     return cs
 
 
@@ -278,7 +333,7 @@ def scatter_xyz(arr, avg_tid):
 
 def build_render_spec(
     arr, avg_tid, is3d, color_settings=None, *, name="pyflux", depth_range=None,
-    footprint=DEFAULT_STYLE,
+    footprint=DEFAULT_STYLE, property_range=None, contrast=DEFAULT_CONTRAST,
 ):
     """What napari-storm should draw for one pyflux dataset.
 
@@ -300,6 +355,15 @@ def build_render_spec(
             dataset's own range.
         footprint: the rendering style, a name from napari-storm's palette
             (see :func:`rendering_styles`); points by default.
+        property_range: ``(low, high)`` to colour the property mode against,
+            shared across datasets like *depth_range*.  None uses the
+            dataset's own: the typed-in ``limits`` of the settings row, or
+            the 1st to 99th percentile of the values.
+        contrast: ``(low, high)`` window on the summed image of an additive
+            style, in units of summed weight -- the number of localizations
+            overlapping on screen, for fixed-size Gaussians.  Opaque styles
+            ignore it, and so do the colour modes on a napari-storm that
+            does not blend colour-coded localizations.
 
     Returns None when there is nothing to draw.
     """
@@ -342,6 +406,9 @@ def build_render_spec(
     elif mode == MODE_TID:
         colormap = lut_colormap(TID_COLORMAP)
         values = tid_color_values(tids)
+    elif mode == MODE_PROPERTY:
+        colormap = lut_colormap(cs["lut"])
+        values = _property_positions(arr, avg_tid, cs, property_range, finite_rows=len(x))
     else:  # MODE_E2E
         colormap = lut_colormap(cs["lut"])
         values = _normalized(end_to_end)
@@ -350,15 +417,42 @@ def build_render_spec(
 
     alpha = float(cs["alpha"])
     alpha = max(0.0, min(1.0, alpha))
+    color_coded = mode != MODE_SOLID
+    blends = color_coded_supported()
     return RenderSpec(
         request=request,
         colormap=colormap,
         opacity=alpha,
-        contrast_limits=CONTRAST_LIMITS,
+        contrast_limits=tuple(contrast) if (not color_coded or blends) else CONTRAST_LIMITS,
         zdim_present=zdim_present,
         footprint=str(footprint),
-        summed_contrast=(mode == MODE_SOLID),
+        summed_contrast=(not color_coded) or blends,
+        color_coded=color_coded,
     )
+
+
+def _property_positions(arr, avg_tid, cs, property_range, *, finite_rows):
+    """Colormap positions for the property mode, one per drawn point.
+
+    Rows :func:`scatter_xyz` dropped as non-finite are dropped here too, so
+    the positions line up with the coordinates; a point without the value
+    sits at the bottom of the colormap.
+    """
+    values = property_values(arr, cs["property"], avg_tid)
+    if values is None:
+        return np.zeros(finite_rows, dtype=np.float32)
+    values = np.asarray(values, dtype=np.float64)
+    xyz, end_to_end, _tids = scatter_points_and_color(arr, avg_tid)
+    xyz = np.asarray(xyz, dtype=np.float64)
+    if xyz.shape[1] < 3:
+        xyz = np.column_stack([xyz, np.zeros(len(xyz))])
+    e2e = np.asarray(end_to_end, dtype=np.float64) if end_to_end is not None else np.zeros(len(xyz))
+    finite = np.isfinite(xyz).all(axis=1) & np.isfinite(e2e)
+    values = values[finite]
+    limits = property_range if property_range is not None else property_limits(values, cs.get("limits"))
+    if limits is None:
+        return np.zeros(len(values), dtype=np.float32)
+    return _normalized(values, limits[0], limits[1])
 
 
 def depth_range_of(arr_by_base, avg_tid):
@@ -379,16 +473,19 @@ def depth_range_of(arr_by_base, avg_tid):
 
 def build_render_specs(
     arr_by_base, avg_tid, is3d, color_settings_by_base, *, shared_depth_range=False,
-    footprint=DEFAULT_STYLE,
+    footprint=DEFAULT_STYLE, contrast=DEFAULT_CONTRAST,
 ):
     """One :class:`RenderSpec` per base, in the given order.
 
     With *shared_depth_range* every depth-coloured dataset is scaled against
-    the z range of all of them, which is what the merged multicolor view needs
-    so that the same depth is the same colour in every channel.  Bases with
-    nothing to draw map to None, so the caller can close them.
+    the z range of all of them, and every property-coloured dataset against
+    the range of that property over all of them, which is what the merged
+    multicolor view needs so that the same depth, or the same EFO, is the
+    same colour in every channel.  Bases with nothing to draw map to None, so
+    the caller can close them.
     """
     depth_range = None
+    property_ranges = {}
     if shared_depth_range:
         depth_bases = {
             b: a
@@ -396,12 +493,18 @@ def build_render_specs(
             if _settings_with_defaults((color_settings_by_base or {}).get(b)).get("mode") == MODE_DEPTH
         }
         depth_range = depth_range_of(depth_bases, avg_tid) if depth_bases else None
+        property_ranges = shared_property_ranges(arr_by_base, avg_tid, color_settings_by_base)
 
     specs = {}
     for base, arr in arr_by_base.items():
         cs = (color_settings_by_base or {}).get(base)
+        settings = _settings_with_defaults(cs)
+        property_range = None
+        if settings["mode"] == MODE_PROPERTY:
+            property_range = property_ranges.get(settings["property"])
         specs[base] = build_render_spec(
-            arr, avg_tid, is3d, cs, name=base, depth_range=depth_range, footprint=footprint
+            arr, avg_tid, is3d, cs, name=base, depth_range=depth_range, footprint=footprint,
+            property_range=property_range, contrast=contrast,
         )
     return specs
 
@@ -470,6 +573,7 @@ def _make_view_class():
             self.styles = {style.name for style in rendering_styles()}
             self.points_supported = DEFAULT_STYLE in self.styles
             self._summed_contrast_supported = summed_contrast_supported()
+            self._color_coded_supported = color_coded_supported()
 
             self.viewer.scale_bar.visible = True
             self.viewer.scale_bar.length = 100.0
@@ -538,6 +642,8 @@ def _make_view_class():
                     appearance["min_size_px"] = POINT_MIN_PX
                 if self._summed_contrast_supported:
                     appearance["summed_contrast"] = bool(spec.summed_contrast)
+                if self._color_coded_supported:
+                    appearance["color_coded"] = bool(spec.color_coded)
                 self.renderer.set_appearance(dataset_id, LayerAppearance(**appearance))
 
             for base in [b for b in self._ids if b not in specs]:
@@ -547,6 +653,22 @@ def _make_view_class():
             self._set_ndisplay(3 if is3d else 2)
             if reset_view:
                 self.reset_view()
+
+        def set_contrast(self, contrast, specs):
+            """Re-window the open datasets to *contrast* without redrawing them.
+
+            *specs* (base -> RenderSpec) says which datasets take the window
+            at all: those whose values are summed (see
+            :attr:`RenderSpec.summed_contrast`).
+            """
+            from napari_storm.core import LayerAppearance
+
+            for base, spec in specs.items():
+                dataset_id = self._ids.get(base)
+                if spec is None or dataset_id is None or not self.renderer.is_open(dataset_id):
+                    continue
+                limits = tuple(contrast) if spec.summed_contrast else CONTRAST_LIMITS
+                self.renderer.set_appearance(dataset_id, LayerAppearance(contrast_limits=limits))
 
         def clear(self):
             """Close every dataset; the canvas goes empty."""

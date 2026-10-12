@@ -51,6 +51,150 @@ def scatter_points_and_color(arr, avg_tid: bool):
     return loc_mean, vals, tids_plot
 
 
+def _trace_groups(arr):
+    """``(order, starts, counts)`` of *arr* grouped by trace, sorted by `tid`.
+
+    The grouping :func:`scatter_points_and_color` uses for `avg_tid`, so a
+    per-trace value computed here lands on the same row as the trace's
+    centroid.
+    """
+    tids_all = arr["tid"]
+    order = np.argsort(tids_all, kind="stable")
+    tids = tids_all[order]
+    starts = np.r_[0, np.flatnonzero(tids[1:] != tids[:-1]) + 1]
+    counts = np.diff(np.r_[starts, len(tids)])
+    return order, starts, counts
+
+
+def property_columns(arr):
+    """The columns of *arr* a localization can be coloured by, in file order.
+
+    Every numeric scalar column, plus the components of vector columns
+    (``lnc_x``, ``dcr_x``, ...).  Booleans and ``loc`` are left out: the flag
+    columns carry nothing to colour by, and the position is what is drawn.
+    """
+    names = []
+    dtype = getattr(arr, "dtype", None)
+    if dtype is None or not dtype.names:
+        return names
+    axes = ("x", "y", "z")
+    for name in dtype.names:
+        field = dtype.fields[name][0]
+        if name == "loc" or field.base.kind not in "iuf":
+            continue
+        if not field.shape:
+            names.append(name)
+            continue
+        n = int(np.prod(field.shape))
+        names.extend(f"{name}_{axes[i]}" if i < len(axes) else f"{name}_{i}" for i in range(n))
+    return names
+
+
+def property_column(arr, name):
+    """The values of property *name*, one per row of *arr*, as float.
+
+    *name* is a column, or a vector column's component as
+    :func:`property_columns` lists it.  None when *arr* has no such column.
+    """
+    dtype = getattr(arr, "dtype", None)
+    if dtype is None or not dtype.names:
+        return None
+    if name in dtype.names and not dtype.fields[name][0].shape:
+        return np.asarray(arr[name], dtype=float)
+    base, _, suffix = name.rpartition("_")
+    if base in dtype.names and dtype.fields[base][0].shape:
+        axes = {"x": 0, "y": 1, "z": 2}
+        index = axes.get(suffix)
+        if index is None:
+            try:
+                index = int(suffix)
+            except ValueError:
+                return None
+        values = np.asarray(arr[base], dtype=float).reshape(len(arr), -1)
+        if index < values.shape[1]:
+            return values[:, index]
+    return None
+
+
+def property_values(arr, name, avg_tid):
+    """Property *name* per drawn point, aligned with :func:`scatter_points_and_color`.
+
+    Per localization, or per trace (the mean over the trace's localizations,
+    ignoring NaN) when *avg_tid*.  None when *arr* lacks the column.
+    """
+    values = property_column(arr, name)
+    if values is None or len(values) == 0:
+        return values
+    if not avg_tid:
+        return values
+    order, starts, counts = _trace_groups(arr)
+    sorted_values = values[order]
+    finite = np.isfinite(sorted_values)
+    sums = np.add.reduceat(np.where(finite, sorted_values, 0.0), starts)
+    n = np.add.reduceat(finite.astype(float), starts)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        means = sums / n
+    means[n == 0] = np.nan
+    return means
+
+
+#: Percentiles the automatic colour range of a property spans.  A property
+#: such as EFO has a long tail; stretching the colormap over it leaves most
+#: localizations in one colour.
+PROPERTY_AUTO_PERCENTILES = (1.0, 99.0)
+
+
+def property_limits(values, limits=None):
+    """``(low, high)`` to colour *values* against.
+
+    *limits* of ``(low, high)`` is used as given (either may be None to keep
+    that end automatic); otherwise the range spans the 1st to 99th percentile
+    of the finite values.  None when nothing is finite.
+    """
+    values = np.asarray(values, dtype=float).ravel() if values is not None else np.array([])
+    finite = values[np.isfinite(values)]
+    low = high = None
+    if limits is not None:
+        low, high = limits
+    if (low is None or high is None) and len(finite) == 0:
+        return None
+    if low is None:
+        low = float(np.percentile(finite, PROPERTY_AUTO_PERCENTILES[0]))
+    if high is None:
+        high = float(np.percentile(finite, PROPERTY_AUTO_PERCENTILES[1]))
+    return float(low), float(high)
+
+
+def parse_limits(text):
+    """``(low, high)`` from a limits entry such as ``"0.2, 0.8"``.
+
+    Empty, ``"auto"`` or anything unparsable means automatic (None).  One end
+    may be left automatic: ``", 0.8"`` or ``"0.2,"``.
+    """
+    if text is None:
+        return None
+    text = str(text).strip().lower()
+    if not text or text == "auto":
+        return None
+    parts = [t.strip() for t in text.replace(";", ",").split(",")]
+    if len(parts) != 2:
+        return None
+    ends = []
+    for part in parts:
+        if not part or part == "auto":
+            ends.append(None)
+            continue
+        try:
+            ends.append(float(part))
+        except ValueError:
+            return None
+    if ends == [None, None]:
+        return None
+    if ends[0] is not None and ends[1] is not None and not ends[1] > ends[0]:
+        return None
+    return tuple(ends)
+
+
 def tid_to_color(tid, alpha=1.0):
     """
     Deterministic pseudo-random color per tid.
@@ -199,6 +343,39 @@ def make_plotly_fig(arr, avg_tid: bool, is3d: bool, color_settings: dict = None,
     return fig
 
 
+def shared_property_ranges(arr_by_base, avg_tid, color_settings_by_base):
+    """One ``(low, high)`` per property coloured by, over every dataset using it.
+
+    Datasets in property mode that colour by the same column share a range,
+    so the same value is the same colour in each of them.  Typed-in limits
+    win: the first dataset to fix an end fixes it for all; the automatic ends
+    span the percentiles of all the values together.
+    """
+    values_by_property = {}
+    fixed_by_property = {}
+    for base, arr in arr_by_base.items():
+        cs = (color_settings_by_base or {}).get(base) or {}
+        if cs.get("mode", DEFAULT_MODE) != MODE_PROPERTY:
+            continue
+        prop = cs.get("property", DEFAULT_PROPERTY)
+        values = property_values(arr, prop, avg_tid)
+        if values is not None:
+            values_by_property.setdefault(prop, []).append(np.asarray(values, dtype=float).ravel())
+        limits = cs.get("limits")
+        if limits is not None:
+            fixed = fixed_by_property.setdefault(prop, [None, None])
+            for i in (0, 1):
+                if fixed[i] is None and limits[i] is not None:
+                    fixed[i] = float(limits[i])
+    ranges = {}
+    for prop, chunks in values_by_property.items():
+        fixed = fixed_by_property.get(prop)
+        limits = property_limits(np.concatenate(chunks), None if fixed is None else tuple(fixed))
+        if limits is not None:
+            ranges[prop] = limits
+    return ranges
+
+
 def make_plotly_fig_merged(arr_by_base: dict, avg_tid: bool, is3d: bool, color_settings_by_base: dict, scalebar_nm=100):
     """
     Build one Plotly figure containing traces for every base in arr_by_base.
@@ -242,6 +419,8 @@ def make_plotly_fig_merged(arr_by_base: dict, avg_tid: bool, is3d: bool, color_s
                 "lut": cs.get("lut", DEFAULT_LUT),
                 "alpha": cs.get("alpha", DEFAULT_ALPHA),
                 "size": cs.get("size", DEFAULT_SIZE_2D),
+                "property": cs.get("property", DEFAULT_PROPERTY),
+                "limits": cs.get("limits"),
             }
 
         entries.append((base, arr, cs))
@@ -267,6 +446,12 @@ def make_plotly_fig_merged(arr_by_base: dict, avg_tid: bool, is3d: bool, color_s
         global_depth_min = zmin if global_depth_min is None else min(global_depth_min, zmin)
         global_depth_max = zmax if global_depth_max is None else max(global_depth_max, zmax)
 
+    # Likewise one range per property, so the same EFO is the same colour in
+    # every dataset coloured by EFO.
+    property_ranges = shared_property_ranges(
+        {base: arr for base, arr, _cs in entries}, avg_tid, {base: cs for base, _arr, cs in entries}
+    )
+
     colorbar_drawn = False
     for base, arr, cs in entries:
         cs_local = dict(cs)
@@ -274,8 +459,12 @@ def make_plotly_fig_merged(arr_by_base: dict, avg_tid: bool, is3d: bool, color_s
         if mode == MODE_DEPTH and global_depth_min is not None and global_depth_max is not None:
             cs_local["cmin"] = global_depth_min
             cs_local["cmax"] = global_depth_max
+        if mode == MODE_PROPERTY:
+            shared = property_ranges.get(cs_local.get("property", DEFAULT_PROPERTY))
+            if shared is not None:
+                cs_local["cmin"], cs_local["cmax"] = shared
 
-        needs_colorbar = mode in {MODE_DEPTH, MODE_E2E}
+        needs_colorbar = mode in LUT_VALUE_MODES
         show_colorbar = needs_colorbar and (not colorbar_drawn)
 
         tr = make_trace_for_arr(
@@ -1014,6 +1203,38 @@ def make_trace_for_arr(arr, avg_tid: bool, is3d: bool, color_settings: dict, nam
             color=color_list,
         )
 
+    elif mode == MODE_PROPERTY:
+        lut = cs.get("lut", DEFAULT_LUT)
+        if lut not in LUT_CHOICES:
+            lut = DEFAULT_LUT
+        if lut.startswith("cu"):
+            lut = CUSTOM_LUTS.get(lut, DEFAULT_LUT)
+
+        prop = cs.get("property", DEFAULT_PROPERTY)
+        pvals = property_values(arr, prop, avg_tid)
+        if pvals is None:
+            pvals = np.zeros(len(finite), dtype=float)
+        pvals = np.asarray(pvals, dtype=float)[finite]
+        limits = property_limits(pvals, cs.get("limits"))
+        if cs.get("cmin") is not None and cs.get("cmax") is not None:
+            limits = (float(cs["cmin"]), float(cs["cmax"]))
+        if limits is None:
+            limits = (0.0, 1.0)
+        # a localization without the value sits at the bottom of the scale,
+        # as it does in the napari-storm rendering
+        pvals = np.where(np.isfinite(pvals), pvals, limits[0])
+        marker = dict(
+            size=size,
+            opacity=alpha,
+            color=pvals.tolist(),
+            colorscale=lut,
+            showscale=bool(show_colorbar),
+            cmin=float(limits[0]),
+            cmax=float(limits[1]),
+        )
+        if show_colorbar:
+            marker["colorbar"] = dict(title=str(prop), x=1.0, xanchor="left", len=0.9, thickness=16)
+
     else:  # "end-to-end"
         lut = cs.get("lut", DEFAULT_LUT)
         if lut not in LUT_CHOICES:
@@ -1318,8 +1539,24 @@ MODE_SOLID = "solid"
 MODE_DEPTH = "depth"
 MODE_TID = "tid"
 MODE_E2E = "end-to-end"
+#: Colour by any numeric column of the file -- EFO, CFR, photon counts,
+#: time, ... -- chosen per dataset (``property`` in the settings), against a
+#: range that is automatic or typed in (``limits``).
+MODE_PROPERTY = "property"
 
-MODE_CHOICES = [MODE_SOLID, MODE_DEPTH, MODE_TID, MODE_E2E]
+MODE_CHOICES = [MODE_SOLID, MODE_DEPTH, MODE_TID, MODE_E2E, MODE_PROPERTY]
+
+#: Modes whose colour is a numeric value on a LUT, so a merged view shares
+#: one range across datasets and draws one colorbar.
+LUT_VALUE_MODES = (MODE_DEPTH, MODE_E2E, MODE_PROPERTY)
+
+#: What the property mode colours by until the user picks a column, and the
+#: columns offered before a dataset is loaded (a flat MINFLUX export's, less
+#: the flags).  Once a dataset is in, its own columns replace them.
+DEFAULT_PROPERTY = "efo"
+DEFAULT_PROPERTY_CHOICES = [
+    "efo", "cfr", "eco", "ecc", "efc", "fbg", "dcr_x", "tim", "tid", "itr", "sta",
+]
 
 SOLID_COLOR_MAP = {
     "cyan": "#00FFFF",
