@@ -252,3 +252,48 @@ def test_the_file_worker_reads_a_legacy_file(tmp_path, qapp):
     # here -- for each localization, not from its trace's first one
     np.testing.assert_allclose(arr["cfr"], expected["itr"]["cfr"][:, -2])
     assert any("legacy layout" in s for s in statuses)
+
+
+# ----------------------------
+# which iteration carries the CFR
+# ----------------------------
+
+def test_the_cfr_iteration_is_the_last_whose_values_vary():
+    from pyflux.gui import last_valid_cfr_iteration
+
+    itr = np.tile(np.arange(4), 5)
+    cfr = np.zeros(20)
+    cfr[itr == 2] = [0.1, 0.5, 0.3, 0.9, 0.2]  # measured at the second-to-last
+    cfr[itr == 3] = -0.0  # the final iteration carries a constant
+    assert last_valid_cfr_iteration(itr, cfr, default=3) == 2
+    assert last_valid_cfr_iteration(itr, np.zeros(20), default=3) == 3
+
+
+def test_nan_entries_do_not_disqualify_the_cfr_iteration():
+    from pyflux.gui import last_valid_cfr_iteration
+
+    itr = np.tile(np.arange(4), 5)
+    cfr = np.zeros(20)
+    cfr[itr == 2] = [0.1, np.nan, 0.3, np.nan, 0.2]
+    # np.std of the column would be NaN, which used to throw the iteration out
+    assert last_valid_cfr_iteration(itr, cfr, default=3) == 2
+
+
+def test_the_file_worker_takes_the_cfr_from_the_measured_iteration_despite_nan(tmp_path, qapp):
+    pytest.importorskip("pytestqt")
+    from pyflux.gui import FileWorker
+
+    a = _legacy(trace_lengths=(3, 4, 5), invalid=())
+    a["itr"]["cfr"][2, -2] = np.nan  # one localization skipped the CFR iteration
+    path = tmp_path / "legacy_nan_cfr.npy"
+    np.save(path, a)
+
+    worker = FileWorker(str(path), dict(min_trace_len=1, z_corr=1.0, scale=1e9,
+                                        save_folder=str(tmp_path), bin_size=3000.0, base="x"))
+    seen = []
+    worker.need_efo.connect(seen.append)
+    assert worker._process_one_file() is not None
+    arr = seen[0]["arr"]
+    expected = np.delete(a["itr"]["cfr"][:, -2], 2)
+    np.testing.assert_allclose(arr["cfr"], expected)
+    assert len(arr) == len(a) - 1

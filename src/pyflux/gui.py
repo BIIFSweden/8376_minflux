@@ -3866,6 +3866,24 @@ function installRelayoutHandler() {{
 
 
 # -------------------- worker --------------------
+def last_valid_cfr_iteration(itr, cfr, default):
+    """The last iteration at which the CFR was measured: the last whose values vary.
+
+    *itr* and *cfr* are the columns of a flat (one row per iteration) MINFLUX
+    array.  Iterations without a measurement carry a constant (0, -0.0) or NaN;
+    NaN is ignored, so an iteration measured for most localizations and skipped
+    for some still counts.  *default* when no iteration varies.
+    """
+    itr = np.asarray(itr)
+    cfr = np.asarray(cfr, dtype=float)
+    for it in np.sort(np.unique(itr))[::-1]:
+        values = cfr[itr == it]
+        values = values[np.isfinite(values)]
+        if len(values) > 1 and np.std(values) > 0.0:
+            return int(it)
+    return int(default)
+
+
 class FileWorker(QtCore.QThread):
     need_efo = Signal(object)  # ctx dict -> GUI should show histogram + scatter and let user choose
     status = Signal(str)
@@ -3998,10 +4016,13 @@ class FileWorker(QtCore.QThread):
             self.status.emit(f"Skipping {base}: no data after trace filtering.")
             return None
 
-        # last valid CFR iteration = last itr with std(cfr) > 0
-        iters = np.sort(np.unique(MFX_Data["itr"]))
-        valid_cfr_iters = [it for it in iters if np.std(MFX_Data["cfr"][MFX_Data["itr"] == it]) > 0.0]
-        last_cfr_itr = int(valid_cfr_iters[-1]) if len(valid_cfr_iters) else last_itr
+        # The CFR is measured at one iteration of the sequence, not at the last:
+        # a 3-D sequence measures it at the second-to-last, and the final
+        # iteration's `cfr` is a constant (0 or -0.0). Take the last iteration
+        # whose CFR varies, whatever the sequence. NaN is ignored: a legacy
+        # file writes NaN for iterations a re-localization skipped, and a NaN
+        # standard deviation would have thrown that iteration out with them.
+        last_cfr_itr = last_valid_cfr_iteration(MFX_Data["itr"], MFX_Data["cfr"], default=last_itr)
 
         max_itr = np.max(MFX_Data_vld_fnl_filt["itr"])
         efo_vals = MFX_Data_vld_fnl_filt["efo"][MFX_Data_vld_fnl_filt["itr"] == max_itr]
