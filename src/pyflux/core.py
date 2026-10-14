@@ -63,9 +63,138 @@ def icp(source, target, max_iterations=50, tolerance=0.5e-9):
     return src, T_total
 
 
+# ----------------------------------------------------------------------
+# Finding the MBM bead data of a measurement
+# ----------------------------------------------------------------------
+#
+# Imspector stores the MBM (bead) tracks of a measurement as a Zarr group
+# `grd/mbm` inside the measurement's folder, with a `points` array of the
+# bead positions.  Where that folder sits relative to the exported .npy
+# varies: the .npy may be inside the measurement folder, or next to it in the
+# folder the user picked, with the measurement folder named after the file.
+# pyflux used to look only at <folder of the .npy>/grd/mbm, so the second
+# layout failed with nothing to say how to fix it.
+
+
+class MbmDataError(ValueError):
+    """The MBM bead data of a measurement is missing or unreadable."""
+
+
+#: How deep below the .npy's folder to look for a `grd/mbm` group.
+MBM_SEARCH_DEPTH = 3
+
+
+def is_mbm_group(path):
+    """True when *path* is an MBM group: a folder holding a `points` array."""
+    return bool(path) and os.path.isdir(os.path.join(path, "points"))
+
+
+def resolve_mbm_dir(path):
+    """The MBM group *path* points at, or None.
+
+    *path* may be the group itself, the `grd` folder above it, or the
+    measurement folder above that -- whichever a user finds easiest to pick.
+    """
+    if not path:
+        return None
+    path = os.path.normpath(os.path.expanduser(str(path)))
+    for candidate in (path, os.path.join(path, "mbm"), os.path.join(path, "grd", "mbm")):
+        if is_mbm_group(candidate):
+            return candidate
+    return None
+
+
+def _mbm_groups_below(folder, depth):
+    """Every `grd/mbm` group at most *depth* folders below *folder*."""
+    found = []
+    folder = os.path.normpath(folder)
+    base_depth = folder.count(os.sep)
+    for root, dirs, _files in os.walk(folder):
+        if os.path.basename(root) == "grd" and is_mbm_group(os.path.join(root, "mbm")):
+            found.append(os.path.join(root, "mbm"))
+        if root.count(os.sep) - base_depth >= depth:
+            dirs[:] = []
+            continue
+        # never descend into a Zarr store's arrays: they hold no grd folder
+        dirs[:] = sorted(d for d in dirs if d not in ("mbm", "mfx", "points") and not d.startswith("."))
+    return found
+
+
+def _names(folder_name, stem):
+    """True when *folder_name* is named after the file *stem*: the stem itself,
+    or the stem followed by a separator (``cell3_raw``, ``cell3.zarr``, not
+    ``cell30``)."""
+    if folder_name == stem:
+        return True
+    return folder_name.startswith(stem) and not folder_name[len(stem)].isalnum()
+
+
+def find_mbm_dir(npy_path, data_root=None):
+    """The MBM group of the measurement exported as *npy_path*, or None.
+
+    Looked for, in order:
+
+    1. inside a measurement folder named after the file, next to it
+       (``<stem>/grd/mbm`` or ``<stem>.zarr/grd/mbm``);
+    2. ``grd/mbm`` next to the file -- the .npy is inside its measurement
+       folder;
+    3. any ``grd/mbm`` a few folders below the file's folder: the one in a
+       folder named after the file, or the only one there is when no other
+       .npy sits beside the file;
+    4. ``grd/mbm`` in the folders above the file, up to *data_root*.
+
+    None when nothing is found or the choice is ambiguous, so a wrong
+    channel's beads are never picked silently.
+    """
+    folder = os.path.dirname(os.path.abspath(npy_path))
+    stem = os.path.splitext(os.path.basename(npy_path))[0]
+
+    for candidate in (
+        os.path.join(folder, stem, "grd", "mbm"),
+        os.path.join(folder, stem + ".zarr", "grd", "mbm"),
+        os.path.join(folder, "grd", "mbm"),
+    ):
+        if is_mbm_group(candidate):
+            return candidate
+
+    below = _mbm_groups_below(folder, MBM_SEARCH_DEPTH + 2)
+    named = [g for g in below if _names(os.path.relpath(g, folder).split(os.sep)[0], stem)]
+    if len(named) == 1:
+        return named[0]
+    # The only group below is this file's only when no other export sits
+    # beside it: with two files and one group the group may well be the
+    # other file's, and aligning to the wrong channel's beads is worse than
+    # asking.
+    siblings = [
+        f for f in os.listdir(folder)
+        if f.lower().endswith(".npy") and os.path.splitext(f)[0] != stem
+    ]
+    if len(below) == 1 and not siblings:
+        return below[0]
+
+    if data_root:
+        root = os.path.normpath(os.path.abspath(data_root))
+        up = folder
+        while up.startswith(root) and up != root:
+            up = os.path.dirname(up)
+            candidate = os.path.join(up, "grd", "mbm")
+            if is_mbm_group(candidate):
+                return candidate
+    return None
+
+
 def load_mbm_points(grd_mbm_path):
-    g = zarr.open_group(grd_mbm_path, mode="r")
-    points = g["points"][:]
+    resolved = resolve_mbm_dir(grd_mbm_path)
+    if resolved is None:
+        raise MbmDataError(
+            f"no MBM bead data in {grd_mbm_path}: expected a grd/mbm folder "
+            "holding a 'points' array"
+        )
+    try:
+        g = zarr.open_group(resolved, mode="r")
+        points = g["points"][:]
+    except Exception as e:
+        raise MbmDataError(f"cannot read the MBM bead data in {resolved}: {e}") from e
     # DEBUGGING: Flip y to match MINFLUX data convention.
     points["xyz"][:, 1] *= -1.0
     return points
@@ -229,6 +358,9 @@ def _preprocess_xyz_points(points, *, z_corr=1.0, scale=1.0):
 def compute_mbm_transform(mbm_ref_dir, mbm_mov_dir, k=4, scale=1.0, z_corr=1.0, return_diagnostics: bool = False):
     pts_ref = load_mbm_points(mbm_ref_dir)
     pts_mov = load_mbm_points(mbm_mov_dir)
+    if not len(pts_ref) or not len(pts_mov):
+        empty = mbm_ref_dir if not len(pts_ref) else mbm_mov_dir
+        raise MbmDataError(f"the MBM bead data in {empty} holds no bead positions")
 
     beads_ref = bead_initial_positions(pts_ref, k=k)
     beads_mov = bead_initial_positions(pts_mov, k=k)

@@ -28,6 +28,8 @@ from .core import (
     apply_T,
     apply_transform_to_arr,
     compute_mbm_transform,
+    find_mbm_dir,
+    resolve_mbm_dir,
     dbscan_numpy,
     load_minflux_npy,
     np_to_df,
@@ -813,11 +815,12 @@ class ParametersDialog(QtWidgets.QDialog):
             scalebar_nm=float(self.scalebar_nm.value()),
         )
 
-    def set_mbm_rows(self, file_paths, current=None, bases=None):
+    def set_mbm_rows(self, file_paths, current=None, bases=None, data_root=None):
         """One row per file. `current` maps base -> already-chosen MBM folder; a base
-        missing from it (or mapped to "") falls back to the <dir of .npy>/grd/mbm
-        default. Without it a custom path would be overwritten by the default every
-        time the dialog is opened, since mbm_map() is written back on OK.
+        missing from it (or mapped to "") falls back to the MBM folder found for the
+        file (`core.find_mbm_dir`), or stays empty when none is found. Without it a
+        custom path would be overwritten by the default every time the dialog is
+        opened, since mbm_map() is written back on OK.
 
         `bases` are the dataset keys parallel to `file_paths` (MainWindow.all_bases());
         deriving them here from the basename would reintroduce the collision between
@@ -826,12 +829,17 @@ class ParametersDialog(QtWidgets.QDialog):
         self.mbm_table.setRowCount(0)
         for r, fp in enumerate(file_paths):
             base = bases[r] if bases else os.path.splitext(os.path.basename(fp))[0]
-            default_mbm = os.path.join(os.path.dirname(fp), "grd", "mbm")
+            default_mbm = find_mbm_dir(fp, data_root) or ""
 
             self.mbm_table.insertRow(r)
             self.mbm_table.setItem(r, 0, QtWidgets.QTableWidgetItem(base))
 
             le = QtWidgets.QLineEdit(current.get(base) or default_mbm)
+            le.setPlaceholderText("not found: Browse to the measurement folder")
+            le.setToolTip(
+                "The measurement's MBM bead data (its grd/mbm folder).\n"
+                "Picking the measurement folder itself is enough."
+            )
             self.mbm_table.setCellWidget(r, 1, le)
 
             btn = QtWidgets.QPushButton("Browse mbm…")
@@ -841,9 +849,12 @@ class ParametersDialog(QtWidgets.QDialog):
     def _browse_mbm(self, row):
         le = self.mbm_table.cellWidget(row, 1)
         start = le.text().strip() if le else ""
-        p = QtWidgets.QFileDialog.getExistingDirectory(self, "Select MBM folder", start)
+        p = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Select the measurement folder (or its grd/mbm folder)", start
+        )
         if p and le:
-            le.setText(p)
+            # a measurement or grd folder is taken to the MBM group inside it
+            le.setText(resolve_mbm_dir(p) or p)
 
     def mbm_map(self):
         out = {}
@@ -4957,33 +4968,12 @@ class MainWindow(QtWidgets.QMainWindow):
         # ensure default MBM paths even if Parameters was never confirmed with OK
         self._ensure_default_mbm_paths()
 
-        # validate source path exists
+        # every dataset to be aligned, the source first, needs its MBM bead data
         src = self._mbm_source_base
-        src_path = self._mbm_dir_by_base.get(src, "")
-        if not src_path or not os.path.isdir(src_path):
-            QtWidgets.QMessageBox.critical(
-                self,
-                "MBM alignment",
-                f"MBM path does not exist for source:\n\n{src}\n{src_path}\n\n"
-                "Open Parameters to set MBM folders, or ensure /grd/mbm exists."
-            )
-            return
-
-        # validate that every non-source dataset we might align has a valid path;
-        # we can either error-out immediately, or skip missing ones. You asked to prompt error.
-        missing = []
-        for base in self._filtered_by_base.keys() or self._raw_arr_by_base.keys():
-            if base == src:
-                continue
-            p = self._mbm_dir_by_base.get(base, "")
-            if not p or not os.path.isdir(p):
-                missing.append((base, p))
-
+        bases = [src] + [b for b in (self._filtered_by_base.keys() or self._raw_arr_by_base.keys()) if b != src]
+        missing = [(b, self._mbm_dir_by_base.get(b, "")) for b in bases if self._mbm_dir_for(b) is None]
         if missing:
-            msg = "MBM path does not exist for:\n\n" + "\n".join([f"{b}: {p}" for b, p in missing[:12]])
-            if len(missing) > 12:
-                msg += f"\n... and {len(missing) - 12} more"
-            QtWidgets.QMessageBox.critical(self, "MBM alignment", msg)
+            self._report_missing_mbm(missing, src)
             return
 
         # require data loaded
@@ -4996,17 +4986,53 @@ class MainWindow(QtWidgets.QMainWindow):
     def _ensure_default_mbm_paths(self):
         """
         Ensure self._mbm_dir_by_base has an entry for each base.
-        Default: <folder containing the .npy>/grd/mbm
+
+        Default: the MBM folder `core.find_mbm_dir` finds for the file -- inside
+        the measurement folder, wherever that sits relative to the .npy -- or ""
+        when there is none, which `on_mbm_align_clicked` then reports.
         """
         if not hasattr(self, "_mbm_dir_by_base") or self._mbm_dir_by_base is None:
             self._mbm_dir_by_base = {}
 
-        # build base -> file_path map from _all_files
+        data_root = self.data_edit.text().strip() or None
         for fp in self._all_files:
             base = self.base_of(fp)
             if base in self._mbm_dir_by_base and self._mbm_dir_by_base[base]:
                 continue
-            self._mbm_dir_by_base[base] = os.path.join(os.path.dirname(fp), "grd", "mbm")
+            self._mbm_dir_by_base[base] = find_mbm_dir(fp, data_root) or ""
+
+    def _mbm_dir_for(self, base):
+        """The MBM group set for *base*, resolved; None when it has none.
+
+        The path set in Parameters may be the group itself, its grd folder or
+        the measurement folder (see `core.resolve_mbm_dir`).
+        """
+        return resolve_mbm_dir(self._mbm_dir_by_base.get(base, ""))
+
+    def _report_missing_mbm(self, missing, src):
+        """Say which datasets have no MBM bead data, and where to set it."""
+        lines = []
+        for base, path in missing[:12]:
+            role = " (alignment source)" if base == src else ""
+            where = f"no MBM data in {path}" if path else "no MBM folder found near the file"
+            lines.append(f"\u2022 {base}{role}: {where}")
+        if len(missing) > 12:
+            lines.append(f"\u2026 and {len(missing) - 12} more")
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Warning)
+        box.setWindowTitle("MBM alignment")
+        box.setText("The MBM bead data could not be found. Please update the path in Parameters.")
+        box.setInformativeText(
+            "\n".join(lines)
+            + "\n\nThe MBM data is the grd/mbm folder Imspector writes inside each "
+            "measurement's folder. In Parameters, under \u2018MBM folders (per file)\u2019, "
+            "browse to the measurement folder of each file listed above."
+        )
+        open_btn = box.addButton("Open Parameters\u2026", QtWidgets.QMessageBox.AcceptRole)
+        box.addButton(QtWidgets.QMessageBox.Cancel)
+        box.exec()
+        if box.clickedButton() is open_btn:
+            self.open_parameters_dialog()
 
     def on_mbm_reset_clicked(self):
         self._remove_mbm_alignment()
@@ -5084,7 +5110,8 @@ class MainWindow(QtWidgets.QMainWindow):
             scalebar_nm=getattr(self, "_scalebar_nm", 100.0),
         )
 
-        dlg.set_mbm_rows(self._all_files, self._mbm_dir_by_base, self.all_bases())  # <-- required
+        dlg.set_mbm_rows(self._all_files, self._mbm_dir_by_base, self.all_bases(),
+                         data_root=self.data_edit.text().strip() or None)  # <-- required
         if dlg.exec() == QtWidgets.QDialog.Accepted:
             # update, not replace: the table only holds rows for _all_files, so a
             # wholesale assignment would drop every path when no folder is loaded
@@ -6279,9 +6306,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if src_arr is None:
             return abort(f"MBM: no loaded data for source {src} — run that file first")
 
-        mbm_src = self._mbm_dir_by_base.get(src)
-        if not mbm_src or not os.path.isdir(mbm_src):
-            return abort(f"MBM: source folder missing for {src}")
+        mbm_src = self._mbm_dir_for(src)
+        if mbm_src is None:
+            return abort(f"MBM: no MBM bead data for the source {src}; set its folder in Parameters")
 
         # only now is alignment actually going to happen
         self._mbm_enabled = True
@@ -6291,6 +6318,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # source stays unchanged
         self._aligned_arr_by_base[src] = src_arr
         self._T_by_base[src] = np.eye(4)
+        failures = []  # (base, reason) of the datasets left unaligned
 
         for base, arr in self._filtered_by_base.items():
             if base == src:
@@ -6299,9 +6327,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._aligned_arr_by_base[base] = arr
                 continue
 
-            mbm_mov = self._mbm_dir_by_base.get(base)
-            if not mbm_mov or not os.path.isdir(mbm_mov):
+            mbm_mov = self._mbm_dir_for(base)
+            if mbm_mov is None:
                 # keep unaligned if no mbm folder
+                failures.append((base, "no MBM bead data; set its folder in Parameters"))
                 self._aligned_arr_by_base[base] = arr
                 continue
 
@@ -6318,12 +6347,25 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._aligned_arr_by_base[base] = apply_transform_to_arr(arr, T)
                 self._save_mbm_alignment_bead_plots(src, base, diagnostics, T)
             except Exception as e:
-                self.statusBar().showMessage(f"MBM align failed for {base}: {e}")
+                failures.append((base, str(e)))
                 self._aligned_arr_by_base[base] = arr
 
         # drive plotting from aligned (aligned if present else original)
         for base, arr in self._filtered_by_base.items():
             self._arr_by_base[base] = self._aligned_arr_by_base.get(base, arr)
+
+        if failures:
+            # a status-bar line used to be all there was, easily missed: the
+            # dataset was simply drawn unaligned
+            summary = "; ".join(f"{b}: {why}" for b, why in failures)
+            self.statusBar().showMessage(f"MBM align: left unaligned \u2014 {summary}")
+            QtWidgets.QMessageBox.warning(
+                self,
+                "MBM alignment",
+                "These datasets could not be aligned and are shown unaligned:\n\n"
+                + "\n".join(f"\u2022 {b}: {why}" for b, why in failures[:12])
+                + "\n\nCheck their MBM folders in Parameters.",
+            )
 
         self.redraw_scatter(reset_view=False)
         self._refresh_multicolor_contents(reset_view=False)

@@ -75,6 +75,18 @@ carrying a constant instead. An iteration is recognised as measured when its
 CFR values vary; NaN entries (iterations a re-localization skipped, in the
 legacy layout) are ignored in that test.
 
+## MBM alignment
+
+*Align* registers every dataset onto the one ticked as *mbm source*, using
+the MBM bead tracks Imspector writes as a `grd/mbm` folder inside each
+measurement's folder. pyflux looks for that folder next to each .npy file,
+inside a folder named after the file (`<name>/grd/mbm`, `<name>.zarr/grd/mbm`),
+a few folders further down, and in the folders above the file up to the data
+folder. It never takes a folder that may belong to another file. When the
+bead data of a file cannot be found, *Align* lists the files and offers to
+open *Parameters*, where *MBM folders (per file)* takes the measurement
+folder (or its `grd/mbm` folder) for each.
+
 ## Running from source
 
 ```
