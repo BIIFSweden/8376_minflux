@@ -322,6 +322,18 @@ def test_np_to_df_splits_vector_columns():
     assert df.loc[0, "dcr_z"] == 9.0
 
 
+def test_np_to_df_keeps_a_scalar_dcr_as_one_column():
+    # the legacy MINFLUX layout records one DCR value, the newer one two
+    dtype = np.dtype([("tid", np.int32), ("loc", np.float64, (3,)), ("dcr", np.float64)])
+    arr = np.array([(7, [1.0, 2.0, 3.0], 0.25)], dtype=dtype)
+
+    df = np_to_df(arr)
+
+    assert "dcr" in df.columns
+    assert df.loc[0, "dcr"] == 0.25
+    assert df.loc[0, "loc_z"] == 3.0
+
+
 # ----------------------------
 # preview_localization_precision
 # ----------------------------

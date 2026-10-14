@@ -20,7 +20,7 @@ jobs:
         uses: astral-sh/setup-uv@v3
         with:
           enable-cache: true
-          cache-dependency-glob: "requirements.txt"
+          cache-dependency-glob: "requirements*.txt"
 
       - name: Setup Python 3.12 (x64)
         run: uv python install 3.12
@@ -29,7 +29,7 @@ jobs:
         shell: bash
         run: |
           uv venv --python 3.12 .venv
-          uv pip install --python .venv/Scripts/python.exe -r requirements.txt pyinstaller
+          uv pip install --python .venv/Scripts/python.exe -r requirements.txt -r requirements-napari-storm.txt pyinstaller
 
       - name: Build (Windows)
         shell: powershell
@@ -39,6 +39,10 @@ jobs:
             --name "pyflux" `
             --icon "assets/appicon.ico" `
             --collect-all PySide6 `
+            --collect-all napari `
+            --collect-all napari_storm `
+            --collect-all vispy `
+            --collect-all OpenGL `
             --hidden-import PySide6.QtWebEngineCore `
             --hidden-import PySide6.QtWebEngineWidgets `
             --hidden-import PySide6.QtWebChannel `
@@ -65,7 +69,7 @@ jobs:
           uses: astral-sh/setup-uv@v3
           with:
             enable-cache: true
-            cache-dependency-glob: "requirements.txt"
+            cache-dependency-glob: "requirements*.txt"
 
         - name: Install x86_64 CPython 3.12 via uv
           shell: bash
@@ -80,7 +84,7 @@ jobs:
 
             # uv resolves wheels against the *target* interpreter, so this pulls x86_64 wheels.
             uv pip install --python .venv-x86_64/bin/python \
-              -r requirements.txt pyinstaller
+              -r requirements.txt -r requirements-napari-storm.txt pyinstaller
 
             # Sanity check — should print 'x86_64'
             .venv-x86_64/bin/python -c "import platform; print('python arch:', platform.machine())"
@@ -97,6 +101,10 @@ jobs:
               --icon "assets/appicon.icns" \
               --osx-bundle-identifier com.yourname.pyflux \
               --collect-all PySide6 \
+              --collect-all napari \
+              --collect-all napari_storm \
+              --collect-all vispy \
+              --collect-all OpenGL \
               --hidden-import PySide6.QtWebEngineCore \
               --hidden-import PySide6.QtWebEngineWidgets \
               --hidden-import PySide6.QtWebChannel \
@@ -126,7 +134,7 @@ jobs:
         uses: astral-sh/setup-uv@v3
         with:
           enable-cache: true
-          cache-dependency-glob: "requirements.txt"
+          cache-dependency-glob: "requirements*.txt"
 
       - name: Setup Python 3.12
         run: uv python install 3.12
@@ -135,7 +143,7 @@ jobs:
         shell: bash
         run: |
           uv venv --python 3.12 .venv
-          uv pip install --python .venv/bin/python -r requirements.txt pyinstaller
+          uv pip install --python .venv/bin/python -r requirements.txt -r requirements-napari-storm.txt pyinstaller
           .venv/bin/python -c "import platform; print('python arch:', platform.machine())"
 
       - name: Build (arm64)
@@ -148,6 +156,10 @@ jobs:
             --icon "assets/appicon.icns" \
             --osx-bundle-identifier com.yourname.pyflux \
             --collect-all PySide6 \
+            --collect-all napari \
+            --collect-all napari_storm \
+            --collect-all vispy \
+            --collect-all OpenGL \
             --hidden-import PySide6.QtWebEngineCore \
             --hidden-import PySide6.QtWebEngineWidgets \
             --hidden-import PySide6.QtWebChannel \

@@ -24,54 +24,108 @@ from matplotlib.figure import Figure
 from matplotlib.widgets import SpanSelector
 
 from .core import (
+    MinfluxLayoutError,
     apply_T,
     apply_transform_to_arr,
     compute_mbm_transform,
+    find_mbm_dir,
+    resolve_mbm_dir,
     dbscan_numpy,
+    load_minflux_npy,
     np_to_df,
     preview_localization_precision,
     save_to_csv,
 )
 from .plotting import (
+    add_scalebar_2d,
+    apply_hist_theme,
+    apply_plot_theme,
     CUSTOM_LUTS,
     DEFAULT_ALPHA,
     DEFAULT_LUT,
     DEFAULT_LUT_BIN,
     DEFAULT_MODE,
+    DEFAULT_PROPERTY,
+    DEFAULT_PROPERTY_CHOICES,
     DEFAULT_SIZE_2D,
     DEFAULT_SOLID,
+    hist_edges,
     HIST_THEME,
     LUT_CHOICES,
-    MODE_CHOICES,
-    MODE_DEPTH,
-    MODE_E2E,
-    MODE_SOLID,
-    MODE_TID,
-    PLOTLY_HTML_BG,
-    SCALEBAR_COLOR,
-    SCALEBAR_LENGTH_NM,
-    SCALEBAR_LINE_WIDTH,
-    SCALEBAR_MARGIN_FRACTION,
-    SOLID_COLOR_CHOICES,
-    SOLID_COLOR_MAP,
-    _clip_hist_for_overlay,
-    _clip_to_scale_max,
-    _xy_from_arr,
-    _lut_rgb_image,
-    _resolve_overlay_colorscale,
-    add_scalebar_2d,
-    apply_hist_theme,
-    apply_plot_theme,
-    hist_edges,
+    LUT_VALUE_MODES,
     make_plotly_fig,
     make_plotly_fig_merged,
     make_plotly_gaussian_from_arr,
     make_plotly_heatmap_from_arr,
     make_plotly_overlay_heatmap_from_two_arrs,
+    MODE_CHOICES,
+    MODE_DEPTH,
+    MODE_E2E,
+    MODE_PROPERTY,
+    MODE_SOLID,
+    MODE_TID,
+    parse_limits,
+    PLOTLY_HTML_BG,
+    property_columns,
     render_gaussians_xy,
+    SCALEBAR_COLOR,
+    SCALEBAR_LENGTH_NM,
+    SCALEBAR_LINE_WIDTH,
+    SCALEBAR_MARGIN_FRACTION,
     scatter_points_and_color,
+    SOLID_COLOR_CHOICES,
+    SOLID_COLOR_MAP,
     tid_to_color,
+    _clip_hist_for_overlay,
+    _clip_to_scale_max,
+    _lut_rgb_image,
+    _resolve_overlay_colorscale,
+    _xy_from_arr,
 )
+from .napari_storm_view import (
+    DEFAULT_CONTRAST,
+    NapariStormView,
+    build_render_spec,
+    build_render_specs,
+    color_coded_supported,
+    default_style,
+    napari_storm_available,
+    rendering_styles,
+)
+
+#: The two renderers pyflux can draw with.  napari-storm is optional: when
+#: it (and napari) can be imported the localizations are drawn on an embedded
+#: napari canvas; otherwise in Plotly scatter plots, as pyflux always did.
+#: Decided once, when the main window is built; see
+#: `napari_storm_view.napari_storm_available`.
+BACKEND_NAPARI_STORM = "napari-storm"
+BACKEND_PLOTLY = "plotly"
+
+
+def rendering_backend():
+    """Which renderer this process draws with."""
+    return BACKEND_NAPARI_STORM if napari_storm_available() else BACKEND_PLOTLY
+
+
+#: The contrast slider: its upper window limit runs from CONTRAST_MIN to
+#: CONTRAST_MAX overlapping localizations on a log scale, so one slider spans
+#: a single localization and a thousand with the same feel at either end.
+CONTRAST_MIN = 0.05
+CONTRAST_MAX = 1000.0
+CONTRAST_SLIDER_STEPS = 1000
+
+
+def contrast_from_slider(position):
+    """The upper window limit at slider *position* (0..CONTRAST_SLIDER_STEPS)."""
+    t = max(0.0, min(1.0, float(position) / CONTRAST_SLIDER_STEPS))
+    return float(CONTRAST_MIN * (CONTRAST_MAX / CONTRAST_MIN) ** t)
+
+
+def contrast_slider_position(upper):
+    """The slider position for an upper window limit (the inverse)."""
+    upper = max(CONTRAST_MIN, min(CONTRAST_MAX, float(upper)))
+    t = np.log(upper / CONTRAST_MIN) / np.log(CONTRAST_MAX / CONTRAST_MIN)
+    return int(round(t * CONTRAST_SLIDER_STEPS))
 
 
 matplotlib.use("QtAgg")
@@ -331,25 +385,31 @@ def apply_gui_theme(app: QtWidgets.QApplication):
 class ColorSettingsPanel(QtWidgets.QGroupBox):
     """
     Table-based color settings:
-      Columns: File | Mode | LUT/Solid | α | Size
+      Columns: File | Mode | LUT/Solid | Property | Limits | α | Size (nm)
       One row per file base.
 
     Emits changed(base, settings_dict).
     settings_dict keys:
-      - mode: str  ("solid"|"depth"|"tid"|"end-to-end")
+      - mode: str  ("solid"|"depth"|"tid"|"end-to-end"|"property")
       - solid: str
       - lut: str
+      - property: str  -- the column coloured by in "property" mode
+      - limits: (low, high) or None  -- the colour range of that column;
+                None is automatic (1st to 99th percentile)
       - alpha: float
-      - size: int
+      - size: int   -- point radius, or Gaussian sigma, in nm (it was the
+                       marker size in px)
     """
     changed = Signal(str, object)  # (base, settings dict)
 
     COL_FILE = 0
     COL_MODE = 1
     COL_PALETTE = 2
-    COL_ALPHA = 3
-    COL_SIZE = 4
-    COL_MBM_SOURCE = 5
+    COL_PROPERTY = 3
+    COL_LIMITS = 4
+    COL_ALPHA = 5
+    COL_SIZE = 6
+    COL_MBM_SOURCE = 7
 
     def __init__(self, title="Color settings", parent=None):
         super().__init__(title, parent)
@@ -357,8 +417,11 @@ class ColorSettingsPanel(QtWidgets.QGroupBox):
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(8, 8, 8, 8)
 
-        self.table = QtWidgets.QTableWidget(0, 6, self)
-        self.table.setHorizontalHeaderLabels(["File", "Mode", "LUT / Solid", "α", "Size", "mbm source"])
+        self.table = QtWidgets.QTableWidget(0, 8, self)
+        self.table.setHorizontalHeaderLabels(
+            ["File", "Mode", "LUT / Solid", "Property", "Limits", "α", "Size nm", "mbm source"]
+        )
+        self._alpha_enabled = True  # α only means something for Gaussians
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
@@ -368,13 +431,21 @@ class ColorSettingsPanel(QtWidgets.QGroupBox):
         hdr = self.table.horizontalHeader()
         hdr.setStretchLastSection(False)
 
-        hdr.setSectionResizeMode(self.COL_FILE, QtWidgets.QHeaderView.Interactive)
-        self.table.setColumnWidth(self.COL_FILE, 260)
-
-        hdr.setSectionResizeMode(self.COL_MODE, QtWidgets.QHeaderView.Stretch)
-        hdr.setSectionResizeMode(self.COL_PALETTE, QtWidgets.QHeaderView.Stretch)
-        hdr.setSectionResizeMode(self.COL_ALPHA, QtWidgets.QHeaderView.Stretch)
-        hdr.setSectionResizeMode(self.COL_SIZE, QtWidgets.QHeaderView.Stretch)
+        # Eight columns have to share the panel: the file name gets what is
+        # left after the controls have what they need to be read.
+        hdr.setSectionResizeMode(self.COL_FILE, QtWidgets.QHeaderView.Stretch)
+        hdr.setMinimumSectionSize(48)
+        for col, width in (
+            (self.COL_MODE, 92),
+            (self.COL_PALETTE, 86),
+            (self.COL_PROPERTY, 78),
+            (self.COL_LIMITS, 84),
+            (self.COL_ALPHA, 58),
+            (self.COL_SIZE, 58),
+            (self.COL_MBM_SOURCE, 78),
+        ):
+            hdr.setSectionResizeMode(col, QtWidgets.QHeaderView.Interactive)
+            self.table.setColumnWidth(col, width)
 
         # make it scroll when many rows
         self.table.setMinimumHeight(170)
@@ -384,7 +455,9 @@ class ColorSettingsPanel(QtWidgets.QGroupBox):
 
         # base -> dict of widgets
         self._row_by_base = {}  # base -> row index
-        self._widgets_by_base = {}  # base -> dict(mode=..., palette=..., alpha=..., size=...)
+        self._widgets_by_base = {}  # base -> dict(mode=..., palette=..., property=..., limits=..., alpha=..., size=...)
+        # base -> the columns its file has, once it is loaded
+        self._properties_by_base = {}
 
     def _emit_row(self, base: str):
         w = self._widgets_by_base.get(base)
@@ -394,42 +467,59 @@ class ColorSettingsPanel(QtWidgets.QGroupBox):
         mode = w["mode"].currentText()
         alpha = float(w["alpha"].value())
         size = int(w["size"].value())
+        prop = w["property"].currentText() or DEFAULT_PROPERTY
+        limits = parse_limits(w["limits"].text())
 
         # palette meaning depends on mode
-        if mode == "solid":
+        if mode == MODE_SOLID:
             payload = {
-                "mode": "solid",
+                "mode": MODE_SOLID,
                 "solid": w["palette"].currentText(),
                 "lut": DEFAULT_LUT,
-                "alpha": alpha,
-                "size": size,
             }
-        elif mode == "tid":
+        elif mode == MODE_TID:
             payload = {
-                "mode": "tid",
+                "mode": MODE_TID,
                 "solid": DEFAULT_SOLID,
                 "lut": DEFAULT_LUT,
-                "alpha": alpha,
-                "size": size,
             }
-        elif mode == "depth":
+        else:  # depth, end-to-end, property: a LUT over a value
             payload = {
-                "mode": "depth",
+                "mode": mode,
                 "solid": DEFAULT_SOLID,
                 "lut": w["palette"].currentText(),
-                "alpha": alpha,
-                "size": size,
             }
-        else:  # "end-to-end"
-            payload = {
-                "mode": "end-to-end",
-                "solid": DEFAULT_SOLID,
-                "lut": w["palette"].currentText(),
-                "alpha": alpha,
-                "size": size,
-            }
+        payload.update(property=prop, limits=limits, alpha=alpha, size=size)
 
         self.changed.emit(base, payload)
+
+    def set_properties(self, base: str, names):
+        """Offer the columns of *base*'s file, now that it is loaded.
+
+        The row is built before the file is read, from a stock list of MINFLUX
+        columns; the file's own columns replace it here, keeping the chosen one
+        when the file has it.
+        """
+        names = [str(n) for n in (names or [])]
+        self._properties_by_base[base] = names
+        w = self._widgets_by_base.get(base)
+        if not w or not names:
+            return
+        combo = w["property"]
+        current = combo.currentText()
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItems(names)
+        combo.setCurrentText(current if current in names else (DEFAULT_PROPERTY if DEFAULT_PROPERTY in names else names[0]))
+        combo.blockSignals(False)
+        if combo.currentText() != current and w["mode"].currentText() == MODE_PROPERTY:
+            self._emit_row(base)
+
+    def set_alpha_enabled(self, enabled: bool):
+        """Grey α out while it has no effect: points are drawn opaque."""
+        self._alpha_enabled = bool(enabled)
+        for widgets in self._widgets_by_base.values():
+            widgets["alpha"].setEnabled(self._alpha_enabled)
 
     def _fill_palette_for_mode(self, base: str, mode: str, *, solid_default: str, lut_default: str):
         w = self._widgets_by_base[base]
@@ -447,12 +537,15 @@ class ColorSettingsPanel(QtWidgets.QGroupBox):
             palette.setEnabled(False)
             palette.addItem("—")
 
-        else:  # "depth" or "end-to-end"
+        else:  # "depth", "end-to-end" or "property"
             palette.setEnabled(True)
             palette.addItems(LUT_CHOICES)
             palette.setCurrentText(lut_default if lut_default in LUT_CHOICES else DEFAULT_LUT)
 
         palette.blockSignals(False)
+        # the column and its range only mean something when colouring by a property
+        w["property"].setEnabled(mode == MODE_PROPERTY)
+        w["limits"].setEnabled(mode == MODE_PROPERTY)
 
     def rebuild(self, base_names, current_settings_by_base: dict, mbm_source_base=None):
         """Repopulate the table. `mbm_source_base` is the single authority for the
@@ -483,6 +576,9 @@ class ColorSettingsPanel(QtWidgets.QGroupBox):
             size = int(s.get("size", DEFAULT_SIZE_2D))
             size = max(1, min(50, size))
 
+            prop = s.get("property")
+            limits = s.get("limits")
+
             # --- File cell (text) ---
             item = QtWidgets.QTableWidgetItem(base)
             item.setFlags(item.flags() & ~Qt.ItemIsEditable)
@@ -496,17 +592,52 @@ class ColorSettingsPanel(QtWidgets.QGroupBox):
             # --- Palette combo ---
             palette_combo = QtWidgets.QComboBox()
 
+            # --- Property combo: the column coloured by in property mode ---
+            property_combo = QtWidgets.QComboBox()
+            choices = list(self._properties_by_base.get(base) or DEFAULT_PROPERTY_CHOICES)
+            if prop is None:
+                prop = DEFAULT_PROPERTY if DEFAULT_PROPERTY in choices else choices[0]
+            elif prop not in choices:
+                choices.append(prop)  # chosen earlier; keep it
+            property_combo.addItems(choices)
+            property_combo.setCurrentText(prop)
+            property_combo.setToolTip(
+                "The column of the file to colour by (mode 'property'):\n"
+                "EFO, CFR, photon counts, time, ... The file's own columns\n"
+                "are listed once it is loaded."
+            )
+
+            # --- Limits: the range of that column the LUT spans ---
+            limits_edit = QtWidgets.QLineEdit()
+            limits_edit.setPlaceholderText("auto")
+            if limits is not None:
+                limits_edit.setText(", ".join("" if v is None else f"{float(v):g}" for v in limits))
+            limits_edit.setToolTip(
+                "Colour range of the property, as 'low, high'.\n"
+                "Empty or 'auto': the 1st to 99th percentile of the values.\n"
+                "Leave one end empty to keep it automatic, e.g. ', 0.8'."
+            )
+
             # --- Alpha spin ---
             alpha_spin = QtWidgets.QDoubleSpinBox()
             alpha_spin.setRange(0.0, 1.0)
             alpha_spin.setDecimals(2)
             alpha_spin.setSingleStep(0.05)
             alpha_spin.setValue(alpha)
+            alpha_spin.setEnabled(self._alpha_enabled)
+            alpha_spin.setToolTip(
+                "Opacity of Gaussians. Points are opaque: overlapping points hide\n"
+                "each other by depth instead of blending."
+            )
 
             # --- Size spin ---
             size_spin = QtWidgets.QSpinBox()
             size_spin.setRange(1, 50)
             size_spin.setValue(size)
+            size_spin.setToolTip(
+                "Point radius, or Gaussian width (sigma), in nm.\n"
+                "Points are never drawn smaller than 5 screen pixels."
+            )
 
             # --- mbm source ---
             src_chk = QtWidgets.QCheckBox()
@@ -524,6 +655,8 @@ class ColorSettingsPanel(QtWidgets.QGroupBox):
             self._widgets_by_base[base] = dict(
                 mode=mode_combo,
                 palette=palette_combo,
+                property=property_combo,
+                limits=limits_edit,
                 alpha=alpha_spin,
                 size=size_spin,
                 mbm_source=src_chk,  # self._widgets_by_base[base]["mbm_source"] = src_chk # Different??
@@ -535,11 +668,15 @@ class ColorSettingsPanel(QtWidgets.QGroupBox):
             # connect signals (avoid lambda capturing row; capture base)
             mode_combo.currentTextChanged.connect(lambda m, b=base: self._on_mode_changed(b, m))
             palette_combo.currentTextChanged.connect(lambda _, b=base: self._emit_row(b))
+            property_combo.currentTextChanged.connect(lambda _, b=base: self._emit_row(b))
+            limits_edit.editingFinished.connect(lambda b=base: self._emit_row(b))
             alpha_spin.valueChanged.connect(lambda _, b=base: self._emit_row(b))
             size_spin.valueChanged.connect(lambda _, b=base: self._emit_row(b))
 
             self.table.setCellWidget(row, self.COL_MODE, mode_combo)
             self.table.setCellWidget(row, self.COL_PALETTE, palette_combo)
+            self.table.setCellWidget(row, self.COL_PROPERTY, property_combo)
+            self.table.setCellWidget(row, self.COL_LIMITS, limits_edit)
             self.table.setCellWidget(row, self.COL_ALPHA, alpha_spin)
             self.table.setCellWidget(row, self.COL_SIZE, size_spin)
 
@@ -678,11 +815,12 @@ class ParametersDialog(QtWidgets.QDialog):
             scalebar_nm=float(self.scalebar_nm.value()),
         )
 
-    def set_mbm_rows(self, file_paths, current=None, bases=None):
+    def set_mbm_rows(self, file_paths, current=None, bases=None, data_root=None):
         """One row per file. `current` maps base -> already-chosen MBM folder; a base
-        missing from it (or mapped to "") falls back to the <dir of .npy>/grd/mbm
-        default. Without it a custom path would be overwritten by the default every
-        time the dialog is opened, since mbm_map() is written back on OK.
+        missing from it (or mapped to "") falls back to the MBM folder found for the
+        file (`core.find_mbm_dir`), or stays empty when none is found. Without it a
+        custom path would be overwritten by the default every time the dialog is
+        opened, since mbm_map() is written back on OK.
 
         `bases` are the dataset keys parallel to `file_paths` (MainWindow.all_bases());
         deriving them here from the basename would reintroduce the collision between
@@ -691,12 +829,17 @@ class ParametersDialog(QtWidgets.QDialog):
         self.mbm_table.setRowCount(0)
         for r, fp in enumerate(file_paths):
             base = bases[r] if bases else os.path.splitext(os.path.basename(fp))[0]
-            default_mbm = os.path.join(os.path.dirname(fp), "grd", "mbm")
+            default_mbm = find_mbm_dir(fp, data_root) or ""
 
             self.mbm_table.insertRow(r)
             self.mbm_table.setItem(r, 0, QtWidgets.QTableWidgetItem(base))
 
             le = QtWidgets.QLineEdit(current.get(base) or default_mbm)
+            le.setPlaceholderText("not found: Browse to the measurement folder")
+            le.setToolTip(
+                "The measurement's MBM bead data (its grd/mbm folder).\n"
+                "Picking the measurement folder itself is enough."
+            )
             self.mbm_table.setCellWidget(r, 1, le)
 
             btn = QtWidgets.QPushButton("Browse mbm…")
@@ -706,9 +849,12 @@ class ParametersDialog(QtWidgets.QDialog):
     def _browse_mbm(self, row):
         le = self.mbm_table.cellWidget(row, 1)
         start = le.text().strip() if le else ""
-        p = QtWidgets.QFileDialog.getExistingDirectory(self, "Select MBM folder", start)
+        p = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Select the measurement folder (or its grd/mbm folder)", start
+        )
         if p and le:
-            le.setText(p)
+            # a measurement or grd folder is taken to the MBM group inside it
+            le.setText(resolve_mbm_dir(p) or p)
 
     def mbm_map(self):
         out = {}
@@ -2512,15 +2658,35 @@ class PlotSyncBridge(QtCore.QObject):
 
 
 class MultiColorWindow(QtWidgets.QMainWindow):
-    def __init__(self, on_view_changed, on_crop_requested=None, on_reset_crop_requested=None, parent=None):
+    """Every dataset side by side (grid) or in one canvas (merged).
+
+    Drawn by whichever renderer the main window uses (*backend*).  With
+    napari-storm each grid cell is its own embedded napari viewer and the merged
+    page is one viewer holding a layer per dataset; Crop keeps what a 2-D panel
+    currently shows.  With Plotly each cell is a scatter plot in a web view and
+    Crop takes the last box selection.  Panels with Synchronize ticked share
+    pan, zoom and 3-D rotation either way.
+
+    `update_one`, `update_all` and `update_merged` take what the backend draws:
+    a `RenderSpec` per base for napari-storm, a Plotly figure otherwise.
+    """
+
+    def __init__(self, on_view_changed, on_crop_requested=None, on_reset_crop_requested=None, parent=None,
+                 on_ndisplay_changed=None, backend=BACKEND_NAPARI_STORM):
         super().__init__(parent)
         self.setWindowTitle("Multicolor")
         self.resize(1200, 700)
+        self._backend = backend
         self._on_view_changed = on_view_changed
         self._on_crop_requested = on_crop_requested
         self._on_reset_crop_requested = on_reset_crop_requested
-        self._last_selection_payload = None
+        self._on_ndisplay_changed = on_ndisplay_changed
+        self._last_active_source_id = None  # the panel the pointer touched last
+        self._last_selection_payload = None  # Plotly: the last box selection
         self._last_selection_source_id = None
+        self._contrast = DEFAULT_CONTRAST
+        self._specs_by_base = {}  # napari-storm: what each grid panel shows
+        self._merged_specs = {}  # napari-storm: what the merged viewer shows
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -2533,6 +2699,14 @@ class MultiColorWindow(QtWidgets.QMainWindow):
 
         # --- crop buttons overlaid bottom-right ---
         self._crop_btn = QtWidgets.QPushButton("Crop", central)
+        if self.uses_napari_storm:
+            self._crop_btn.setToolTip(
+                "Keep only the localizations inside the visible area of a 2-D panel:\n"
+                "pan and zoom to the region, then press Crop.\n"
+                "In grid mode the panel the pointer touched last is used."
+            )
+        else:
+            self._crop_btn.setToolTip("Keep only the localizations inside the last box selection.")
         self._crop_btn.clicked.connect(self._crop_current_selection)
         self._crop_btn.setFixedHeight(24)
         self._crop_btn.setMaximumWidth(90)
@@ -2544,14 +2718,19 @@ class MultiColorWindow(QtWidgets.QMainWindow):
         self._reset_crop_btn.setMaximumWidth(110)
         self._reset_crop_btn.raise_()
 
-        self._grid_on = True
-        self._axis_titles = {}       # 3-D axis titles, learned from each pushed figure
-        self._grid_chk = QtWidgets.QCheckBox("Grid", central)
-        self._grid_chk.setChecked(True)
-        self._grid_chk.setToolTip(
-            "Show the plot grid.\n"
-            "In 3-D this hides the whole coordinate system (grid, ticks, labels, axes)."
-        )
+        self._axis_titles = {}  # Plotly: 3-D axis titles, learned from each pushed figure
+        if self.uses_napari_storm:
+            self._grid_on = False
+            self._grid_chk = QtWidgets.QCheckBox("Axes", central)
+            self._grid_chk.setToolTip("Show the coordinate axes in every panel.")
+        else:
+            self._grid_on = True
+            self._grid_chk = QtWidgets.QCheckBox("Grid", central)
+            self._grid_chk.setToolTip(
+                "Show the plot grid.\n"
+                "In 3-D this hides the whole coordinate system (grid, ticks, labels, axes)."
+            )
+        self._grid_chk.setChecked(self._grid_on)
         self._grid_chk.toggled.connect(self._on_grid_toggled)
         self._grid_chk.setFixedHeight(24)
         self._grid_chk.raise_()
@@ -2568,27 +2747,43 @@ class MultiColorWindow(QtWidgets.QMainWindow):
         mv = QtWidgets.QVBoxLayout(self.merged_page)
         mv.setContentsMargins(0, 0, 0, 0)
 
-        self.merged_view = PlotlyView()
-        self.merged_view.viewChanged.connect(self._on_view_changed)
-        self.merged_view.selectionChanged.connect(self._on_plot_selection)
+        self.merged_view = self._make_view("Multicolor (merged)", self._on_view_changed)
         mv.addWidget(self.merged_view, 1)
 
         self.stack.addWidget(self.merged_page)
 
         # state
-        self._views = {}  # base -> PlotlyView
+        self._views = {}  # base -> NapariStormView
         self._mode = "grid"  # or "merged"
 
         # --- per-sample view synchronization (grid mode only) ---
         self._sync_by_base = {}      # base -> bool, survives rebuild()
         self._sync_boxes = {}        # base -> QCheckBox
-        self._last_view_by_base = {}  # base -> last relayout payload, to seed a newly ticked view
-        # base -> (deadline, payload just pushed). A view we pushed a range/camera into
-        # may echo that same relayout straight back; JS's `ignore` flag catches the
-        # common case and this is the backstop that stops an echo becoming a loop.
-        # Matching on the payload as well as the time window matters: suppressing a
-        # base outright would swallow a real gesture made right after it was synced.
+        self._last_view_by_base = {}  # base -> last camera payload, to seed a newly ticked view
+        # base -> (deadline, payload just pushed). A view we pushed a camera into
+        # may echo that same change straight back; the view's own guard catches
+        # the common case and this is the backstop that stops an echo becoming a
+        # loop. Matching on the payload as well as the time window matters:
+        # suppressing a base outright would swallow a real gesture made right
+        # after it was synced.
         self._sync_suppress = {}
+
+    @property
+    def uses_napari_storm(self):
+        return self._backend == BACKEND_NAPARI_STORM
+
+    def _make_view(self, title, on_view_changed):
+        """A viewer widget of the backend's kind, wired to this window."""
+        if self.uses_napari_storm:
+            view = NapariStormView(title=title)
+            view.viewChanged.connect(on_view_changed)
+            view.activated.connect(self._on_view_activated)
+            view.ndisplayChanged.connect(self._relay_ndisplay)
+        else:
+            view = PlotlyView()
+            view.viewChanged.connect(on_view_changed)
+            view.selectionChanged.connect(self._on_plot_selection)
+        return view
 
     def set_mode(self, mode: str):
         mode = "merged" if mode == "merged" else "grid"
@@ -2599,6 +2794,22 @@ class MultiColorWindow(QtWidgets.QMainWindow):
         return self._mode
 
     def rebuild(self, base_names):
+        base_names = list(base_names)
+
+        # A napari viewer is expensive to build and its camera is worth keeping
+        # across a refresh, so panels of samples this folder still has are
+        # reused; only the ones that went away are torn down.  A Plotly page
+        # is rebuilt with its figure anyway, so those panels are not kept.
+        keep = {b: v for b, v in self._views.items() if b in base_names} if self.uses_napari_storm else {}
+        for base, view in list(self._views.items()):
+            if base not in keep:
+                view.shutdown()
+                view.setParent(None)
+                view.deleteLater()
+        for view in keep.values():
+            view.setParent(None)  # out of the group boxes about to be deleted
+        self._specs_by_base = {b: v for b, v in self._specs_by_base.items() if b in keep}
+
         # clear grid
         while self.grid.count():
             item = self.grid.takeAt(0)
@@ -2606,7 +2817,7 @@ class MultiColorWindow(QtWidgets.QMainWindow):
             if w is not None:
                 w.deleteLater()
 
-        self._views.clear()
+        self._views = {}
         self._sync_boxes.clear()
         # keep the ticks the user set, but only for samples this folder still has
         self._sync_by_base = {b: v for b, v in self._sync_by_base.items() if b in base_names}
@@ -2636,11 +2847,13 @@ class MultiColorWindow(QtWidgets.QMainWindow):
             header.addStretch(1)
             vbox.addLayout(header)
 
-            view = PlotlyView()
-            view.viewChanged.connect(self._on_grid_view_changed)
-            view.selectionChanged.connect(self._on_plot_selection)
-            # set before the page exists: update_fig re-asserts it into the new page
+            view = keep.get(base)
+            if view is None:
+                view = self._make_view(f"Multicolor: {base}", self._on_grid_view_changed)
+            # set before the page exists: a Plotly view re-asserts it into the new page
             view.set_live_sync(self._sync_by_base.get(base, False))
+            if self.uses_napari_storm:
+                view.set_grid_visible(self._grid_on)
             vbox.addWidget(view, 1)
 
             self._views[base] = view
@@ -2652,10 +2865,10 @@ class MultiColorWindow(QtWidgets.QMainWindow):
                 c = 0
                 r += 1
 
-    # ---------------- grid visibility ----------------
+    # ---------------- grid / axes visibility ----------------
 
     def _apply_grid_to_fig(self, fig, is3d: bool, grid_on: bool):
-        """Bake the Grid setting into a figure before it is pushed.
+        """Plotly: bake the Grid setting into a figure before it is pushed.
 
         Applied at the two places figures reach a view, so a redraw (filter, crop,
         colour change, mode switch) cannot quietly bring the grid back. When the
@@ -2693,31 +2906,57 @@ class MultiColorWindow(QtWidgets.QMainWindow):
     def _on_grid_toggled(self, checked: bool):
         self._grid_on = bool(checked)
         # relayout the live pages for instant feedback instead of re-rendering every
-        # figure; the figure-side bake above keeps it stuck on the next redraw
+        # figure; for Plotly the figure-side bake above keeps it stuck on the next redraw
         for view in list(self._views.values()) + [self.merged_view]:
             if view is not None:
                 try:
-                    view.set_grid_visible(self._grid_on, self._axis_titles)
+                    if self.uses_napari_storm:
+                        view.set_grid_visible(self._grid_on)
+                    else:
+                        view.set_grid_visible(self._grid_on, self._axis_titles)
                 except Exception:
                     pass
 
-    def update_one(self, base, fig, reset_view=False, is3d=False, scalebar_nm=100.0):
+    def update_one(self, base, item, reset_view=False, is3d=False, scalebar_nm=100.0):
+        """Draw *item* in the panel of *base*.
+
+        *item* is a RenderSpec (or None for nothing) with napari-storm, a
+        Plotly figure otherwise.
+        """
         view = self._views.get(base)
         if view is None:
             return
-        self._apply_grid_to_fig(fig, is3d, self._grid_on)
         if reset_view:
-            # the remembered range/camera no longer describes what is on screen, and
+            # the remembered camera no longer describes what is on screen, and
             # after a 2D/3D switch it is the wrong kind of payload entirely
             self._last_view_by_base.pop(base, None)
             self._sync_suppress.pop(base, None)
-        if (not is3d) and fig is not None:
-            add_scalebar_2d(fig, length_nm=float(scalebar_nm))
-        view.update_fig(fig, reset_view=reset_view, is3d=is3d, scalebar_nm=scalebar_nm)
+        if self.uses_napari_storm:
+            self._specs_by_base[base] = item
+            view.set_scalebar_nm(scalebar_nm)
+            view.show_datasets({base: item}, is3d=is3d, reset_view=reset_view)
+        else:
+            self._apply_grid_to_fig(item, is3d, self._grid_on)
+            if (not is3d) and item is not None:
+                add_scalebar_2d(item, length_nm=float(scalebar_nm))
+            view.update_fig(item, reset_view=reset_view, is3d=is3d, scalebar_nm=scalebar_nm)
 
-    def update_all(self, figs_by_base, reset_view=False, is3d=False, scalebar_nm=100.0):
-        for base, fig in figs_by_base.items():
-            self.update_one(base, fig, reset_view=reset_view, is3d=is3d, scalebar_nm=scalebar_nm)
+    def update_all(self, items_by_base, reset_view=False, is3d=False, scalebar_nm=100.0):
+        for base, item in items_by_base.items():
+            self.update_one(base, item, reset_view=reset_view, is3d=is3d, scalebar_nm=scalebar_nm)
+
+    def set_contrast(self, contrast):
+        """napari-storm: re-window every open dataset to *contrast* (see
+        `NapariStormView.set_contrast`) without redrawing it."""
+        self._contrast = tuple(contrast)
+        if not self.uses_napari_storm:
+            return
+        for base, view in self._views.items():
+            spec = self._specs_by_base.get(base)
+            if spec is not None:
+                view.set_contrast(self._contrast, {base: spec})
+        if self._merged_specs:
+            self.merged_view.set_contrast(self._contrast, self._merged_specs)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -2833,7 +3072,11 @@ class MultiColorWindow(QtWidgets.QMainWindow):
         if self._on_view_changed is not None:
             self._on_view_changed(source_id, payload)
 
+    def _on_view_activated(self, source_id):
+        self._last_active_source_id = source_id
+
     def _on_plot_selection(self, _source_id, payload):
+        """Plotly: remember the last box selection, which Crop then uses."""
         if not isinstance(payload, dict):
             return
         if payload.get("mode") != "2d":
@@ -2845,9 +3088,49 @@ class MultiColorWindow(QtWidgets.QMainWindow):
         self._last_selection_payload = payload
         self._last_selection_source_id = _source_id
 
+    def _relay_ndisplay(self, ndisplay):
+        if self._on_ndisplay_changed is not None:
+            self._on_ndisplay_changed(int(ndisplay))
+
     def _crop_current_selection(self):
+        """Crop to the visible area of the merged view, or of the panel touched last.
+
+        With Plotly, to the last box selection instead.
+        """
         if self._on_crop_requested is None:
             return
+        if not self.uses_napari_storm:
+            self._crop_plotly_selection()
+            return
+        if self._mode == "merged":
+            view, base = self.merged_view, None
+        else:
+            base = self._source_id_to_base(self._last_active_source_id)
+            if base is None and self._views:
+                base = next(iter(self._views))
+            view = self._views.get(base)
+        rect = view.visible_rect_2d() if view is not None else None
+        if rect is None:
+            QtWidgets.QMessageBox.information(
+                self, "Crop",
+                "Crop keeps what a 2-D panel is showing: switch 3D off, pan and zoom "
+                "to the region, then press Crop.",
+            )
+            return
+        xmin, xmax, ymin, ymax = rect
+        payload = {
+            "mode": "2d",
+            "xRange": [float(xmin), float(xmax)],
+            "yRange": [float(ymin), float(ymax)],
+        }
+        if base is not None:
+            payload["base"] = base
+            if self._sync_by_base.get(base, False):
+                # a synchronized sample crops its whole group, not just itself
+                payload["bases"] = self.synced_bases()
+        self._on_crop_requested(payload)
+
+    def _crop_plotly_selection(self):
         p = self._last_selection_payload
         if not isinstance(p, dict):
             QtWidgets.QMessageBox.information(self, "Crop", "Use Box select on a multicolor plot first.")
@@ -2867,7 +3150,7 @@ class MultiColorWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(self, "Crop", "Invalid box selection values.")
             return
         if self._mode != "merged":
-            src_id = getattr(self, "_last_selection_source_id", None)
+            src_id = self._last_selection_source_id
             base = self._source_id_to_base(src_id) if src_id else None
             if base is not None:
                 payload["base"] = base
@@ -2884,9 +3167,16 @@ class MultiColorWindow(QtWidgets.QMainWindow):
     def grid_sync_enabled(self) -> bool:
         return False
 
-    def update_merged(self, fig, reset_view=False, is3d=False, scalebar_nm=100.0):
-        self._apply_grid_to_fig(fig, is3d, self._grid_on)
-        self.merged_view.update_fig(fig, reset_view=reset_view, is3d=is3d, scalebar_nm=scalebar_nm)
+    def update_merged(self, item, reset_view=False, is3d=False, scalebar_nm=100.0):
+        """Draw *item* in the one merged viewer: every dataset's RenderSpec by
+        base with napari-storm, one Plotly figure otherwise."""
+        if self.uses_napari_storm:
+            self._merged_specs = dict(item)
+            self.merged_view.set_scalebar_nm(scalebar_nm)
+            self.merged_view.show_datasets(item, is3d=is3d, reset_view=reset_view)
+        else:
+            self._apply_grid_to_fig(item, is3d, self._grid_on)
+            self.merged_view.update_fig(item, reset_view=reset_view, is3d=is3d, scalebar_nm=scalebar_nm)
 
     def shutdown(self):
         try:
@@ -3856,6 +4146,24 @@ function installRelayoutHandler() {{
 
 
 # -------------------- worker --------------------
+def last_valid_cfr_iteration(itr, cfr, default):
+    """The last iteration at which the CFR was measured: the last whose values vary.
+
+    *itr* and *cfr* are the columns of a flat (one row per iteration) MINFLUX
+    array.  Iterations without a measurement carry a constant (0, -0.0) or NaN;
+    NaN is ignored, so an iteration measured for most localizations and skipped
+    for some still counts.  *default* when no iteration varies.
+    """
+    itr = np.asarray(itr)
+    cfr = np.asarray(cfr, dtype=float)
+    for it in np.sort(np.unique(itr))[::-1]:
+        values = cfr[itr == it]
+        values = values[np.isfinite(values)]
+        if len(values) > 1 and np.std(values) > 0.0:
+            return int(it)
+    return int(default)
+
+
 class FileWorker(QtCore.QThread):
     need_efo = Signal(object)  # ctx dict -> GUI should show histogram + scatter and let user choose
     status = Signal(str)
@@ -3901,27 +4209,18 @@ class FileWorker(QtCore.QThread):
             self.done_one.emit(None)
 
     def _load_interruptible(self, file, chunk=100_000):
-        """`np.load` split into cancellable pieces.
+        """`np.load` split into cancellable pieces, in either MINFLUX layout.
 
         A plain `np.load` of a large file is one uninterruptible C call with no
         `_check_cancel()` inside it, so `MainWindow.closeEvent`'s cancel + wait
         times out and Qt destroys a still-running QThread — a hard crash on quit.
         Memory-mapping and copying row blocks gives cancellation somewhere to fire.
+
+        Returns ``(records, info)``; a legacy-layout file (iterations nested
+        under `itr`) comes back converted to the flat layout. See
+        `core.load_minflux_npy`.
         """
-        try:
-            mm = np.load(file, allow_pickle=False, mmap_mode="r")
-        except Exception:
-            # not memory-mappable (unusual layout, or a container) — one shot
-            return np.load(file, allow_pickle=False).copy()
-
-        if mm.ndim == 0 or len(mm) <= chunk:
-            return np.asarray(mm).copy()
-
-        out = np.empty(mm.shape, dtype=mm.dtype)
-        for i in range(0, len(mm), chunk):
-            self._check_cancel()
-            out[i:i + chunk] = mm[i:i + chunk]
-        return out
+        return load_minflux_npy(file, chunk=chunk, check_cancel=self._check_cancel)
 
     def _process_one_file(self):
         p = self.params
@@ -3931,10 +4230,20 @@ class FileWorker(QtCore.QThread):
         base = p.get("base") or os.path.splitext(os.path.basename(file))[0]
         self.status.emit(f"Loading: {base}")
 
-        MFX_Data = self._load_interruptible(file)
+        try:
+            MFX_Data, load_info = self._load_interruptible(file)
+        except MinfluxLayoutError as e:
+            self.status.emit(f"Skipping {base}: not MINFLUX data — {e}.")
+            return None
         if self.isInterruptionRequested():
             return None
         self._check_cancel()
+        legacy = load_info.get("layout") == "legacy"
+        if legacy:
+            self.status.emit(
+                f"Loading: {base} (legacy layout, {load_info['n_valid']} valid of "
+                f"{load_info['n_localizations']} localizations)"
+            )
 
         # Validate before touching any field. `dtype.names` is None for a plain
         # (non-structured) array, so testing membership against it directly would
@@ -3946,7 +4255,9 @@ class FileWorker(QtCore.QThread):
             self.status.emit(f"Skipping {base}: not MINFLUX data — {what}.")
             return None
         if len(MFX_Data) == 0:
-            self.status.emit(f"Skipping {base}: file contains no localizations.")
+            # a converted legacy file holds valid localizations only
+            what = "no valid localizations" if legacy and load_info["n_localizations"] else "file contains no localizations"
+            self.status.emit(f"Skipping {base}: {what}.")
             return None
         # loc is indexed as [:, -1] and [:, 1] below
         loc_shape = MFX_Data["loc"].shape
@@ -3954,7 +4265,9 @@ class FileWorker(QtCore.QThread):
             self.status.emit(f"Skipping {base}: 'loc' has shape {loc_shape}, expected (N, 2) or (N, 3).")
             return None
 
-        total_tim = MFX_Data["tim"][-1] - MFX_Data["tim"][0]
+        # A converted legacy file has lost its invalid localizations, and with them
+        # possibly the first and last time stamps; the loader kept the full span.
+        total_tim = load_info.get("total_tim", MFX_Data["tim"][-1] - MFX_Data["tim"][0])
         total_loc = len(MFX_Data)
 
         MFX_Data = MFX_Data[MFX_Data["vld"] == True]
@@ -3983,10 +4296,13 @@ class FileWorker(QtCore.QThread):
             self.status.emit(f"Skipping {base}: no data after trace filtering.")
             return None
 
-        # last valid CFR iteration = last itr with std(cfr) > 0
-        iters = np.sort(np.unique(MFX_Data["itr"]))
-        valid_cfr_iters = [it for it in iters if np.std(MFX_Data["cfr"][MFX_Data["itr"] == it]) > 0.0]
-        last_cfr_itr = int(valid_cfr_iters[-1]) if len(valid_cfr_iters) else last_itr
+        # The CFR is measured at one iteration of the sequence, not at the last:
+        # a 3-D sequence measures it at the second-to-last, and the final
+        # iteration's `cfr` is a constant (0 or -0.0). Take the last iteration
+        # whose CFR varies, whatever the sequence. NaN is ignored: a legacy
+        # file writes NaN for iterations a re-localization skipped, and a NaN
+        # standard deviation would have thrown that iteration out with them.
+        last_cfr_itr = last_valid_cfr_iteration(MFX_Data["itr"], MFX_Data["cfr"], default=last_itr)
 
         max_itr = np.max(MFX_Data_vld_fnl_filt["itr"])
         efo_vals = MFX_Data_vld_fnl_filt["efo"][MFX_Data_vld_fnl_filt["itr"] == max_itr]
@@ -4045,7 +4361,10 @@ class MainWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.setWindowTitle("pyflux")
         self.resize(1500, 950)
-        self._plotly_tmp = None
+        # napari-storm when it is installed, Plotly otherwise (see rendering_backend)
+        self._backend = rendering_backend()
+        #: window on the summed image of an additive napari-storm style
+        self._contrast = DEFAULT_CONTRAST
         # state
         self._all_files = []
         self._current_index = 0
@@ -4103,8 +4422,6 @@ class MainWindow(QtWidgets.QMainWindow):
         left.addLayout(grid)
 
         self._closing = False
-        self._plotly_loaded = False
-        self._pending_fig = None
 
         # base -> dict(mode="solid"/"end-to-end", solid="cyan"/..., lut="Turbo"/...)
         self._color_settings_by_base = {}
@@ -4181,6 +4498,80 @@ class MainWindow(QtWidgets.QMainWindow):
         row.addWidget(self.is3d, 0)
 
         right_controls.addLayout(row)
+
+        # What every localization is drawn as: napari-storm's rendering styles,
+        # points by default.  A napari-storm without its palette (2.1.0 and
+        # earlier) draws Gaussians only, and the menu is locked; without
+        # napari-storm at all pyflux draws Plotly markers, and the menu is
+        # locked on those.
+        style_row = QtWidgets.QHBoxLayout()
+        style_row.setContentsMargins(0, 0, 0, 0)
+        style_row.addWidget(QtWidgets.QLabel("Render as"), 0)
+        self.render_style = QtWidgets.QComboBox()
+        self._styles = {style.name: style for style in rendering_styles()} if self.uses_napari_storm else {}
+        for style in self._styles.values():
+            self.render_style.addItem(style.label, style.name)
+            self.render_style.setItemData(
+                self.render_style.count() - 1, style.description, Qt.ToolTipRole
+            )
+            if style.name == "gaussian" and len(self._styles) > 1:
+                self.render_style.insertSeparator(self.render_style.count())
+        if not self.uses_napari_storm:
+            self.render_style.addItem("Markers (Plotly)", "plotly")
+            self.render_style.setEnabled(False)
+            self.render_style.setToolTip(
+                "napari-storm is not installed, so localizations are drawn as\n"
+                "Plotly markers. Install napari-storm (pip install -r\n"
+                "requirements-napari-storm.txt) for points, Gaussians and the\n"
+                "other rendering styles."
+            )
+        elif len(self._styles) > 1:
+            self.render_style.setCurrentIndex(self.render_style.findData(default_style()))
+            self.render_style.setToolTip(
+                "What every localization is drawn as. Gaussian (scientific) sums\n"
+                "them like a super-resolution image; the rest are napari-storm's\n"
+                "alternative visualisations."
+            )
+        else:
+            self.render_style.setCurrentIndex(self.render_style.findData(default_style()))
+            self.render_style.setEnabled(False)
+            self.render_style.setToolTip(
+                "Other styles need napari-storm with its footprint palette\n"
+                "(newer than 2.1.0); this installation draws Gaussians."
+            )
+        self.render_style.currentIndexChanged.connect(lambda _: self._on_render_style_changed())
+        style_row.addWidget(self.render_style, 1)
+        right_controls.addLayout(style_row)
+
+        # Contrast of the summed image: how many overlapping localizations
+        # reach the full colour.  Only an additive napari-storm style (the
+        # Gaussian, the sprites) sums anything; markers are opaque and Plotly
+        # has no summed image, so the control is greyed out for those.
+        contrast_row = QtWidgets.QHBoxLayout()
+        contrast_row.setContentsMargins(0, 0, 0, 0)
+        contrast_row.addWidget(QtWidgets.QLabel("Contrast"), 0)
+        self.contrast_slider = QtWidgets.QSlider(Qt.Horizontal)
+        self.contrast_slider.setRange(0, CONTRAST_SLIDER_STEPS)
+        self.contrast_slider.setValue(contrast_slider_position(self._contrast[1]))
+        self.contrast_slider.setToolTip(
+            "Brightness window of the summed image: the number of overlapping\n"
+            "localizations drawn at the full colour. Lower is brighter.\n"
+            "Applies to the Gaussian and the glowing sprites; points are opaque."
+        )
+        self.contrast_slider.valueChanged.connect(self._on_contrast_slider_moved)
+        contrast_row.addWidget(self.contrast_slider, 1)
+        self.contrast_max = QtWidgets.QDoubleSpinBox()
+        self.contrast_max.setRange(CONTRAST_MIN, CONTRAST_MAX)
+        self.contrast_max.setDecimals(2)
+        self.contrast_max.setValue(self._contrast[1])
+        self.contrast_max.setToolTip(self.contrast_slider.toolTip())
+        self.contrast_max.setFixedWidth(72)
+        self.contrast_max.valueChanged.connect(self._on_contrast_max_edited)
+        contrast_row.addWidget(self.contrast_max, 0)
+        right_controls.addLayout(contrast_row)
+
+        self.color_panel.set_alpha_enabled(not self._render_style_opaque())
+        self._sync_contrast_enabled()
 
         # --- Binning + DBSCAN buttons (above multicolor section) ---
         VIEWER_W = 150
@@ -4374,27 +4765,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self._aligned_arr_by_base = {}  # base -> aligned array (same filtering), computed when enabled
         self._T_by_base = {}  # base -> 4x4 transform to source
 
-        # plotly panel
-        plot_box = QtWidgets.QGroupBox("Scatter plot")
+        # rendering panel: the current dataset, drawn by napari-storm on an
+        # embedded napari canvas, or by Plotly in a web view
+        if self.uses_napari_storm:
+            plot_box = QtWidgets.QGroupBox("Rendering (napari-storm)")
+        else:
+            plot_box = QtWidgets.QGroupBox("Scatter plot")
         bottom.addWidget(plot_box, 1)
         pv = QtWidgets.QVBoxLayout(plot_box)
-        self.plot_view = PlotlyView()
-        self.plot_view.viewChanged.connect(self.on_any_plot_view_changed)
+        self._main_specs = {}  # napari-storm: what the main view shows
+        if self.uses_napari_storm:
+            self.plot_view = NapariStormView(title="pyflux")
+            self.plot_view.viewChanged.connect(self.on_any_plot_view_changed)
+            self.plot_view.ndisplayChanged.connect(self._on_view_ndisplay_changed)
+        else:
+            self.plot_view = PlotlyView()
+            self.plot_view.viewChanged.connect(self.on_any_plot_view_changed)
         pv.addWidget(self.plot_view)
         # status
         self.statusBar().showMessage("Ready.")
-
-    # --- Dead code: references self.web which MainWindow never creates ---
-    # --- (leftover from before the PlotlyView extraction) ---
-    # def _plotly_bootstrap_html(self):
-    #         return """<!doctype html> ..."""
-    #
-    # def ensure_plotly_page(self):
-    #     if self._plotly_loaded:
-    #         return
-    #     self._plotly_loaded = True
-    #     self._plotly_ready = False
-    #     self.web.setHtml(self._plotly_bootstrap_html(), QUrl("about:blank"))
 
     def open_binning_window(self):
             if self._binning_win is None:
@@ -4417,13 +4806,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._dbscan_win.show()
             self._dbscan_win.raise_()
             self._dbscan_win.activateWindow()
-
-    # def _on_plotly_load_finished(self, ok: bool):
-    #     self._plotly_ready = bool(ok)
-    #     if ok and self._pending_fig is not None:
-    #         fig = self._pending_fig
-    #         self._pending_fig = None
-    #         self.update_plotly_fig(fig)
 
     def reset_session(self):
         """Reset all analysis state so a new folder starts from scratch.
@@ -4503,10 +4885,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # clear main plot
         try:
-            fig = go.Figure()
-            fig.update_layout(annotations=[dict(text="No data", x=0.5, y=0.5, showarrow=False)])
-            apply_plot_theme(fig, is3d=False)
-            self.plot_view.update_fig(fig, reset_view=True, is3d=False)
+            if self.uses_napari_storm:
+                self._main_specs = {}
+                self.plot_view.clear()
+            else:
+                fig = go.Figure()
+                fig.update_layout(annotations=[dict(text="No data", x=0.5, y=0.5, showarrow=False)])
+                apply_plot_theme(fig, is3d=False)
+                self.plot_view.update_fig(fig, reset_view=True, is3d=False)
         except Exception:
             pass
 
@@ -4582,33 +4968,12 @@ class MainWindow(QtWidgets.QMainWindow):
         # ensure default MBM paths even if Parameters was never confirmed with OK
         self._ensure_default_mbm_paths()
 
-        # validate source path exists
+        # every dataset to be aligned, the source first, needs its MBM bead data
         src = self._mbm_source_base
-        src_path = self._mbm_dir_by_base.get(src, "")
-        if not src_path or not os.path.isdir(src_path):
-            QtWidgets.QMessageBox.critical(
-                self,
-                "MBM alignment",
-                f"MBM path does not exist for source:\n\n{src}\n{src_path}\n\n"
-                "Open Parameters to set MBM folders, or ensure /grd/mbm exists."
-            )
-            return
-
-        # validate that every non-source dataset we might align has a valid path;
-        # we can either error-out immediately, or skip missing ones. You asked to prompt error.
-        missing = []
-        for base in self._filtered_by_base.keys() or self._raw_arr_by_base.keys():
-            if base == src:
-                continue
-            p = self._mbm_dir_by_base.get(base, "")
-            if not p or not os.path.isdir(p):
-                missing.append((base, p))
-
+        bases = [src] + [b for b in (self._filtered_by_base.keys() or self._raw_arr_by_base.keys()) if b != src]
+        missing = [(b, self._mbm_dir_by_base.get(b, "")) for b in bases if self._mbm_dir_for(b) is None]
         if missing:
-            msg = "MBM path does not exist for:\n\n" + "\n".join([f"{b}: {p}" for b, p in missing[:12]])
-            if len(missing) > 12:
-                msg += f"\n... and {len(missing) - 12} more"
-            QtWidgets.QMessageBox.critical(self, "MBM alignment", msg)
+            self._report_missing_mbm(missing, src)
             return
 
         # require data loaded
@@ -4621,17 +4986,53 @@ class MainWindow(QtWidgets.QMainWindow):
     def _ensure_default_mbm_paths(self):
         """
         Ensure self._mbm_dir_by_base has an entry for each base.
-        Default: <folder containing the .npy>/grd/mbm
+
+        Default: the MBM folder `core.find_mbm_dir` finds for the file -- inside
+        the measurement folder, wherever that sits relative to the .npy -- or ""
+        when there is none, which `on_mbm_align_clicked` then reports.
         """
         if not hasattr(self, "_mbm_dir_by_base") or self._mbm_dir_by_base is None:
             self._mbm_dir_by_base = {}
 
-        # build base -> file_path map from _all_files
+        data_root = self.data_edit.text().strip() or None
         for fp in self._all_files:
             base = self.base_of(fp)
             if base in self._mbm_dir_by_base and self._mbm_dir_by_base[base]:
                 continue
-            self._mbm_dir_by_base[base] = os.path.join(os.path.dirname(fp), "grd", "mbm")
+            self._mbm_dir_by_base[base] = find_mbm_dir(fp, data_root) or ""
+
+    def _mbm_dir_for(self, base):
+        """The MBM group set for *base*, resolved; None when it has none.
+
+        The path set in Parameters may be the group itself, its grd folder or
+        the measurement folder (see `core.resolve_mbm_dir`).
+        """
+        return resolve_mbm_dir(self._mbm_dir_by_base.get(base, ""))
+
+    def _report_missing_mbm(self, missing, src):
+        """Say which datasets have no MBM bead data, and where to set it."""
+        lines = []
+        for base, path in missing[:12]:
+            role = " (alignment source)" if base == src else ""
+            where = f"no MBM data in {path}" if path else "no MBM folder found near the file"
+            lines.append(f"\u2022 {base}{role}: {where}")
+        if len(missing) > 12:
+            lines.append(f"\u2026 and {len(missing) - 12} more")
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Warning)
+        box.setWindowTitle("MBM alignment")
+        box.setText("The MBM bead data could not be found. Please update the path in Parameters.")
+        box.setInformativeText(
+            "\n".join(lines)
+            + "\n\nThe MBM data is the grd/mbm folder Imspector writes inside each "
+            "measurement's folder. In Parameters, under \u2018MBM folders (per file)\u2019, "
+            "browse to the measurement folder of each file listed above."
+        )
+        open_btn = box.addButton("Open Parameters\u2026", QtWidgets.QMessageBox.AcceptRole)
+        box.addButton(QtWidgets.QMessageBox.Cancel)
+        box.exec()
+        if box.clickedButton() is open_btn:
+            self.open_parameters_dialog()
 
     def on_mbm_reset_clicked(self):
         self._remove_mbm_alignment()
@@ -4672,13 +5073,25 @@ class MainWindow(QtWidgets.QMainWindow):
         size = int(settings.get("size", DEFAULT_SIZE_2D))
         size = max(1, min(50, size))
 
+        prop = str(settings.get("property") or DEFAULT_PROPERTY)
+        limits = settings.get("limits")
+        if limits is not None:
+            try:
+                low, high = limits
+                limits = (None if low is None else float(low), None if high is None else float(high))
+            except (TypeError, ValueError):
+                limits = None
+
         self._color_settings_by_base[base] = {
             "mode": mode,
             "solid": solid,
             "lut": lut,
             "alpha": alpha,
             "size": size,
+            "property": prop,
+            "limits": limits,
         }
+        self._sync_contrast_enabled()
 
         self.redraw_scatter(reset_view=False)
         self._refresh_multicolor_contents(reset_view=False)
@@ -4697,7 +5110,8 @@ class MainWindow(QtWidgets.QMainWindow):
             scalebar_nm=getattr(self, "_scalebar_nm", 100.0),
         )
 
-        dlg.set_mbm_rows(self._all_files, self._mbm_dir_by_base, self.all_bases())  # <-- required
+        dlg.set_mbm_rows(self._all_files, self._mbm_dir_by_base, self.all_bases(),
+                         data_root=self.data_edit.text().strip() or None)  # <-- required
         if dlg.exec() == QtWidgets.QDialog.Accepted:
             # update, not replace: the table only holds rows for _all_files, so a
             # wholesale assignment would drop every path when no folder is loaded
@@ -4737,6 +5151,82 @@ class MainWindow(QtWidgets.QMainWindow):
             if self._current_ctx is not None:
                 self.on_need_efo(self._current_ctx)
 
+    @property
+    def uses_napari_storm(self):
+        """True when this window draws with napari-storm rather than Plotly."""
+        return self._backend == BACKEND_NAPARI_STORM
+
+    def _render_footprint(self):
+        """The chosen rendering style, a name from napari-storm's palette."""
+        if not self.uses_napari_storm:
+            return None
+        return self.render_style.currentData() or "gaussian"
+
+    def _render_style_opaque(self):
+        style = self._styles.get(self._render_footprint())
+        return bool(style is not None and style.opaque)
+
+    def _contrast_applies(self):
+        """True while the contrast window can change what is drawn.
+
+        That takes an additive napari-storm style, and a dataset whose values
+        are summed: every solid-coloured one, and the colour-coded ones only
+        on a napari-storm that blends them (see
+        `napari_storm_view.color_coded_supported`).
+        """
+        if not self.uses_napari_storm or self._render_style_opaque():
+            return False
+        if color_coded_supported():
+            return True
+        bases = self.all_bases() if hasattr(self, "file_combo") else list(self._color_settings_by_base)
+        modes = {self._color_settings_by_base.get(b, {}).get("mode", DEFAULT_MODE) for b in bases}
+        return MODE_SOLID in modes
+
+    def _sync_contrast_enabled(self):
+        on = self._contrast_applies()
+        self.contrast_slider.setEnabled(on)
+        self.contrast_max.setEnabled(on)
+
+    def _on_render_style_changed(self):
+        # α means something for the additive styles only; markers are opaque
+        self.color_panel.set_alpha_enabled(not self._render_style_opaque())
+        self._sync_contrast_enabled()
+        self._refresh_all_plots_same_data()
+
+    def _on_contrast_slider_moved(self, position):
+        self._set_contrast_max(contrast_from_slider(position), from_slider=True)
+
+    def _on_contrast_max_edited(self, value):
+        self._set_contrast_max(float(value), from_slider=False)
+
+    def _set_contrast_max(self, upper, *, from_slider):
+        """Apply a new upper window limit to every open napari-storm view.
+
+        The views are re-windowed in place -- no request is rebuilt -- so the
+        slider can be dragged over a large dataset.
+        """
+        upper = max(CONTRAST_MIN, min(CONTRAST_MAX, float(upper)))
+        self._contrast = (0.0, upper)
+        if from_slider:
+            self.contrast_max.blockSignals(True)
+            self.contrast_max.setValue(upper)
+            self.contrast_max.blockSignals(False)
+        else:
+            self.contrast_slider.blockSignals(True)
+            self.contrast_slider.setValue(contrast_slider_position(upper))
+            self.contrast_slider.blockSignals(False)
+        if not self.uses_napari_storm:
+            return
+        try:
+            self.plot_view.set_contrast(self._contrast, self._main_specs)
+        except Exception:
+            pass
+        if self._multicolor_win is not None:
+            try:
+                self._multicolor_win.set_contrast(self._contrast)
+            except Exception:
+                pass
+
     def _refresh_all_plots_same_data(self):
         self.redraw_scatter(reset_view=False)
         self._refresh_multicolor_contents(reset_view=False)
@@ -4750,7 +5240,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._on_multicolor_crop_requested,
                 self._on_multicolor_reset_crop_requested,
                 self,
+                on_ndisplay_changed=self._on_view_ndisplay_changed,
+                backend=self._backend,
             )
+            self._multicolor_win.set_contrast(self._contrast)
 
         bases = self.all_bases()
         self._multicolor_win.rebuild(bases)
@@ -4762,9 +5255,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._multicolor_win.raise_()
         self._multicolor_win.activateWindow()
 
-        # IMPORTANT: defer initial drawing so QWebEngineViews can finish bootstrapping
+        # first draw once the window has its size, so reset_view frames the data
         QtCore.QTimer.singleShot(0, lambda: self._refresh_multicolor_contents(reset_view=True))
-        QtCore.QTimer.singleShot(120, lambda: self._refresh_multicolor_contents(reset_view=False))
+        if not self.uses_napari_storm:
+            # and once more after the QWebEngineViews have finished bootstrapping
+            QtCore.QTimer.singleShot(120, lambda: self._refresh_multicolor_contents(reset_view=False))
 
     def on_merged_toggled(self):
         if self._multicolor_win is None or not self._multicolor_win.isVisible():
@@ -4785,35 +5280,44 @@ class MainWindow(QtWidgets.QMainWindow):
         is3d = self.is3d.isChecked()
         avg = self.avg_tid.isChecked()
         sb = float(getattr(self, "_scalebar_nm", 100.0))
+
+        # whatever is in _arr_by_base (trace-filtered or EFO-filtered), cropped
+        # if a crop is active, in the order of _all_files
+        arr_by_base = {}
+        for f in self._all_files:
+            base = self.base_of(f)
+            arr = self._get_multicolor_arr_for_base(base)
+            if arr is not None:
+                arr_by_base[base] = arr
+
+        if not self.uses_napari_storm:
+            if self._multicolor_win.mode() == "merged":
+                fig = make_plotly_fig_merged(
+                    arr_by_base, avg_tid=avg, is3d=is3d,
+                    color_settings_by_base=self._color_settings_by_base, scalebar_nm=sb,
+                )
+                self._multicolor_win.update_merged(fig, reset_view=reset_view, is3d=is3d, scalebar_nm=sb)
+            else:
+                figs = {
+                    base: make_plotly_fig(arr, avg, is3d, color_settings=self._color_settings_by_base.get(base), scalebar_nm=sb)
+                    for base, arr in arr_by_base.items()
+                }
+                self._multicolor_win.update_all(figs, reset_view=reset_view, is3d=is3d, scalebar_nm=sb)
+            return
+
         if self._multicolor_win.mode() == "merged":
-            # Build merged from whatever is in _arr_by_base (trace-filtered or EFO-filtered)
-            # preserve insertion order from _all_files:
-            arr_by_base = {}
-            for f in self._all_files:
-                base = self.base_of(f)
-                arr = self._get_multicolor_arr_for_base(base)
-                if arr is not None:
-                    arr_by_base[base] = arr
-
-            fig = make_plotly_fig_merged(
-                arr_by_base,
-                avg_tid=avg,
-                is3d=is3d,
-                color_settings_by_base=self._color_settings_by_base,
-                scalebar_nm=getattr(self, "_scalebar_nm", 100.0)
+            # one depth scale for all channels, so the same z is the same colour
+            specs = build_render_specs(
+                arr_by_base, avg, is3d, self._color_settings_by_base,
+                shared_depth_range=True, footprint=self._render_footprint(), contrast=self._contrast,
             )
-            self._multicolor_win.update_merged(fig, reset_view=reset_view, is3d=is3d, scalebar_nm=sb)
+            self._multicolor_win.update_merged(specs, reset_view=reset_view, is3d=is3d, scalebar_nm=sb)
         else:
-            figs = {}
-            for f in self._all_files:
-                base = self.base_of(f)
-                cs = self._color_settings_by_base.get(base, {"mode": DEFAULT_MODE, "solid": DEFAULT_SOLID, "lut": DEFAULT_LUT, "alpha": DEFAULT_ALPHA, "size": DEFAULT_SIZE_2D})
-                arr = self._get_multicolor_arr_for_base(base)
-                if arr is None:
-                    continue
-                figs[base] = make_plotly_fig(arr, avg, is3d, color_settings=cs, scalebar_nm=getattr(self, "_scalebar_nm", 100.0))
-
-            self._multicolor_win.update_all(figs, reset_view=reset_view, is3d=is3d, scalebar_nm=sb)
+            specs = build_render_specs(
+                arr_by_base, avg, is3d, self._color_settings_by_base,
+                footprint=self._render_footprint(), contrast=self._contrast,
+            )
+            self._multicolor_win.update_all(specs, reset_view=reset_view, is3d=is3d, scalebar_nm=sb)
 
     def _get_arr_for_base(self, base: str):
         arr = self._arr_by_base.get(base)
@@ -4943,16 +5447,19 @@ class MainWindow(QtWidgets.QMainWindow):
         arr = self._get_multicolor_arr_for_base(base)
         if arr is None:
             return
-        cs = self._color_settings_by_base.get(base, {"mode": DEFAULT_MODE, "solid": DEFAULT_SOLID, "lut": DEFAULT_LUT, "alpha": DEFAULT_ALPHA, "size": DEFAULT_SIZE_2D})
-        fig = make_plotly_fig(
-            arr,
-            self.avg_tid.isChecked(),
-            self.is3d.isChecked(),
-            color_settings=cs,
-            scalebar_nm=getattr(self, "_scalebar_nm", 100.0),
-        )
+        cs = self._color_settings_by_base.get(base)
+        if self.uses_napari_storm:
+            item = build_render_spec(
+                arr, self.avg_tid.isChecked(), self.is3d.isChecked(), cs, name=base,
+                footprint=self._render_footprint(), contrast=self._contrast,
+            )
+        else:
+            item = make_plotly_fig(
+                arr, self.avg_tid.isChecked(), self.is3d.isChecked(), color_settings=cs,
+                scalebar_nm=getattr(self, "_scalebar_nm", 100.0),
+            )
         self._multicolor_win.update_one(
-            base, fig,
+            base, item,
             reset_view=reset_view,
             is3d=self.is3d.isChecked(),
             scalebar_nm=getattr(self, "_scalebar_nm", 100.0),
@@ -4991,15 +5498,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
         return ordered_all
 
-    def update_plotly_fig(self, fig, reset_view=False):
-        if (not self.is3d.isChecked()) and fig is not None:
-            add_scalebar_2d(fig, length_nm=float(getattr(self, "_scalebar_nm", 100.0)))
-        self.plot_view.update_fig(
-            fig,
-            reset_view=reset_view,
-            is3d=self.is3d.isChecked(),
-            scalebar_nm=getattr(self, "_scalebar_nm", 100.0),
-        )
+    def _on_view_ndisplay_changed(self, ndisplay):
+        """napari's own 2D/3D button was pressed in one of the viewers: follow it.
+
+        The 3D box is the single authority for how every viewer draws, so it
+        is set here and its handler redraws everything, which brings the other
+        viewers to the same mode too.
+        """
+        want = int(ndisplay) == 3
+        if self.is3d.isChecked() != want:
+            self.is3d.setChecked(want)
 
     # ---------------- UI actions ----------------
     def browse_folder(self):
@@ -5084,17 +5592,6 @@ class MainWindow(QtWidgets.QMainWindow):
         """Clean up worker reference when it finishes."""
         if self._current_worker is worker:
             self._current_worker = None
-
-    # def show_plotly(self, html: str):
-    #     if self._plotly_tmp is None:
-    #         fd, path = tempfile.mkstemp(suffix=".html")
-    #         os.close(fd)
-    #         self._plotly_tmp = path
-    #
-    #     with open(self._plotly_tmp, "w", encoding="utf-8") as f:
-    #         f.write(html)
-    #
-    #     self.web.load(QUrl.fromLocalFile(self._plotly_tmp))
 
     @staticmethod
     def _unique_bases(file_paths, root=None):
@@ -5354,6 +5851,12 @@ class MainWindow(QtWidgets.QMainWindow):
         cfr_vals = np.asarray(ctx["cfr_vals"])
         bin_size = float(self.bin_size.value())
 
+        # the columns this file can be coloured by
+        try:
+            self.color_panel.set_properties(base, property_columns(arr))
+        except Exception:
+            pass
+
         # Ensure caches exist
         if not hasattr(self, "_raw_arr_by_base") or self._raw_arr_by_base is None:
             self._raw_arr_by_base = {}
@@ -5567,25 +6070,33 @@ class MainWindow(QtWidgets.QMainWindow):
         # keep state consistent
         self._plot_arr = arr_to_plot
 
-        cs = self._color_settings_by_base.get(
-            base,
-            {
-                "mode": DEFAULT_MODE,
-                "solid": DEFAULT_SOLID,
-                "lut": DEFAULT_LUT,
-                "alpha": DEFAULT_ALPHA,
-                "size": DEFAULT_SIZE_2D,
-            },
+        cs = self._color_settings_by_base.get(base)
+        is3d = self.is3d.isChecked()
+        if not self.uses_napari_storm:
+            fig = make_plotly_fig(
+                arr_to_plot, self.avg_tid.isChecked(), is3d, color_settings=cs,
+                scalebar_nm=getattr(self, "_scalebar_nm", 100.0),
+            )
+            self.update_plotly_fig(fig, reset_view=reset_view)
+            return
+        spec = build_render_spec(
+            arr_to_plot, self.avg_tid.isChecked(), is3d, cs, name=base,
+            footprint=self._render_footprint(), contrast=self._contrast,
         )
+        self._main_specs = {base: spec}
+        self.plot_view.set_scalebar_nm(getattr(self, "_scalebar_nm", 100.0))
+        self.plot_view.show_datasets({base: spec}, is3d=is3d, reset_view=reset_view)
 
-        fig = make_plotly_fig(
-            arr_to_plot,
-            self.avg_tid.isChecked(),
-            self.is3d.isChecked(),
-            color_settings=cs,
+    def update_plotly_fig(self, fig, reset_view=False):
+        """Plotly: push *fig* to the main view, with the 2-D scale bar."""
+        if (not self.is3d.isChecked()) and fig is not None:
+            add_scalebar_2d(fig, length_nm=float(getattr(self, "_scalebar_nm", 100.0)))
+        self.plot_view.update_fig(
+            fig,
+            reset_view=reset_view,
+            is3d=self.is3d.isChecked(),
             scalebar_nm=getattr(self, "_scalebar_nm", 100.0),
         )
-        self.update_plotly_fig(fig, reset_view=reset_view)
 
     def apply_preview(self):
         if self._current_ctx is None:
@@ -5795,9 +6306,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if src_arr is None:
             return abort(f"MBM: no loaded data for source {src} — run that file first")
 
-        mbm_src = self._mbm_dir_by_base.get(src)
-        if not mbm_src or not os.path.isdir(mbm_src):
-            return abort(f"MBM: source folder missing for {src}")
+        mbm_src = self._mbm_dir_for(src)
+        if mbm_src is None:
+            return abort(f"MBM: no MBM bead data for the source {src}; set its folder in Parameters")
 
         # only now is alignment actually going to happen
         self._mbm_enabled = True
@@ -5807,6 +6318,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # source stays unchanged
         self._aligned_arr_by_base[src] = src_arr
         self._T_by_base[src] = np.eye(4)
+        failures = []  # (base, reason) of the datasets left unaligned
 
         for base, arr in self._filtered_by_base.items():
             if base == src:
@@ -5815,9 +6327,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._aligned_arr_by_base[base] = arr
                 continue
 
-            mbm_mov = self._mbm_dir_by_base.get(base)
-            if not mbm_mov or not os.path.isdir(mbm_mov):
+            mbm_mov = self._mbm_dir_for(base)
+            if mbm_mov is None:
                 # keep unaligned if no mbm folder
+                failures.append((base, "no MBM bead data; set its folder in Parameters"))
                 self._aligned_arr_by_base[base] = arr
                 continue
 
@@ -5834,12 +6347,25 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._aligned_arr_by_base[base] = apply_transform_to_arr(arr, T)
                 self._save_mbm_alignment_bead_plots(src, base, diagnostics, T)
             except Exception as e:
-                self.statusBar().showMessage(f"MBM align failed for {base}: {e}")
+                failures.append((base, str(e)))
                 self._aligned_arr_by_base[base] = arr
 
         # drive plotting from aligned (aligned if present else original)
         for base, arr in self._filtered_by_base.items():
             self._arr_by_base[base] = self._aligned_arr_by_base.get(base, arr)
+
+        if failures:
+            # a status-bar line used to be all there was, easily missed: the
+            # dataset was simply drawn unaligned
+            summary = "; ".join(f"{b}: {why}" for b, why in failures)
+            self.statusBar().showMessage(f"MBM align: left unaligned \u2014 {summary}")
+            QtWidgets.QMessageBox.warning(
+                self,
+                "MBM alignment",
+                "These datasets could not be aligned and are shown unaligned:\n\n"
+                + "\n".join(f"\u2022 {b}: {why}" for b, why in failures[:12])
+                + "\n\nCheck their MBM folders in Parameters.",
+            )
 
         self.redraw_scatter(reset_view=False)
         self._refresh_multicolor_contents(reset_view=False)

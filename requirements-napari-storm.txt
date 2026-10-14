@@ -1,0 +1,58 @@
+# Optional: napari-storm rendering.  Install on top of requirements.txt:
+#     pip install -r requirements.txt -r requirements-napari-storm.txt
+# Points, the default rendering, and the other styles under 'Render as' come
+# from napari-storm's footprint palette (3.0); 3.1 draws every Gaussian at its
+# requested width. With an older napari-storm pyflux falls back to Gaussians.
+annotated-doc==0.0.5
+annotated-types==0.8.0
+app-model==0.5.1
+cachey==0.2.1
+cloudpickle==3.1.2
+dask==2026.8.0
+docstring_parser==0.18.0
+flexcache==0.3
+flexparser==0.4
+freetype-py==2.5.1
+fsspec==2026.9.0
+h5py==3.16.0
+HeapDict==1.0.1
+hsluv==5.0.4
+ImageIO==2.37.4
+in-n-out==0.2.1
+joblib==1.6.0
+lazy-loader==0.6
+locket==1.0.0
+magicgui==0.10.2
+napari==0.7.1
+napari-console==0.1.4
+napari-plugin-engine==0.2.1
+napari-storm==3.1.0
+napari-svg==0.2.1
+networkx==3.7
+npe2==0.9.0
+partd==1.4.2
+Pint==0.26.1
+pooch==1.9.0
+psygnal==0.16.1
+pyconify==0.2.1
+pydantic==2.13.5
+pydantic_core==2.46.5
+pydantic-extra-types==2.11.1
+pydantic-settings==2.15.0
+PyOpenGL==3.1.10
+PySide6_Addons==6.9.2
+PySide6_Essentials==6.9.2
+python-dotenv==1.2.3
+qtconsole==5.7.2
+QtPy==2.4.3
+scikit-image==0.26.0
+scikit-learn==1.9.1
+shellingham==1.5.4
+superqt==0.8.2
+threadpoolctl==3.7.0
+tomli_w==1.2.0
+toolz==1.1.0
+tqdm==4.70.1
+typer==0.27.2
+typing-inspection==0.4.4
+vispy==0.16.2

@@ -1,3 +1,6 @@
+# pyflux without napari-storm: localizations are drawn in Plotly scatter plots.
+# For napari-storm rendering (points, Gaussians, the other styles, the
+# contrast window) also install requirements-napari-storm.txt.
 appnope==0.1.4
 asciitree==0.3.3
 asttokens==3.0.1
@@ -29,7 +32,7 @@ google-crc32c==1.8.0
 idna==3.11
 importlib_metadata==8.7.1
 iniconfig==2.3.0
-ipykernel==7.1.0
+ipykernel==6.31.0
 ipython==9.10.0
 ipython_pygments_lexers==1.1.1
 itsdangerous==2.2.0
@@ -48,7 +51,7 @@ matplotlib-inline==0.2.1
 mdurl==0.1.2
 narwhals==2.7.0
 nbformat==5.10.4
-nest_asyncio==1.6.0
+nest-asyncio==1.6.0
 numcodecs==0.15.1
 numexpr==2.14.1
 numpy==2.4.1
@@ -77,6 +80,7 @@ pyobjc-framework-WebKit==12.1; platform_system == "Darwin"
 pyparsing==3.2.5
 PySide6==6.9.2
 pytest==9.0.2
+pytest-qt==4.5.0
 pytest-timeout==2.4.0
 python-dateutil==2.9.0.post0
 pytz==2025.2
@@ -93,7 +97,7 @@ setuptools==80.10.1
 shiboken6==6.9.2
 simplejson==3.20.2
 six==1.17.0
-stack_data==0.6.3
+stack-data==0.6.3
 tifffile==2026.2.20
 tornado==6.5.4
 traitlets==5.14.3

@@ -1,0 +1,882 @@
+"""Localization rendering through napari-storm.
+
+pyflux used to draw its scatter plots with Plotly inside a QtWebEngineView.
+This module replaces that with napari-storm, on a napari canvas that lives
+*inside* the pyflux window -- no separate napari window, no browser engine, no
+JavaScript bridge.  What each localization is drawn as is a rendering style
+from napari-storm's footprint palette: points by default -- opaque discs,
+depth-tested so a nearer one hides a farther one -- or the scientific Gaussian,
+summed like a super-resolution image, or any other alternative visualisation
+napari-storm offers.  A napari-storm without the palette (2.1.0 and earlier)
+draws Gaussians only; see :func:`rendering_styles`.
+
+napari-storm is optional.  :func:`napari_storm_available` says whether it
+(and napari) can be imported; without them pyflux draws its Plotly scatter
+plots as before, and nothing in this module beyond that check is used.
+
+Two halves, deliberately separated:
+
+* :func:`build_render_spec` turns a pyflux MINFLUX array plus one row of the
+  colour-settings table into what napari-storm draws.  Pure numpy -- it imports
+  neither Qt nor napari -- so it is unit-testable headlessly.
+* :class:`NapariStormView` is the widget.  It owns one napari viewer whose
+  canvas is reparented into pyflux's layout, and offers the same shape of API
+  ``PlotlyView`` had: push datasets, read and apply the camera, report the
+  visible rectangle for cropping, shut down.
+
+Coordinates
+-----------
+pyflux stores ``loc`` in nanometres with *y negated*, so that Plotly's y-up
+axes showed the sample the way Imspector does.  napari's canvas is y-down, so
+the negation is undone here and the picture keeps the same orientation.  The
+crop rectangle reported by :meth:`NapariStormView.visible_rect_2d` is
+translated back into pyflux's convention, so the rest of the application never
+sees napari's.
+"""
+
+import hashlib
+import warnings
+from dataclasses import dataclass, fields, replace
+
+import numpy as np
+
+from .plotting import (
+    DEFAULT_ALPHA,
+    DEFAULT_LUT,
+    DEFAULT_MODE,
+    DEFAULT_PROPERTY,
+    DEFAULT_SIZE_2D,
+    DEFAULT_SOLID,
+    LUT_CHOICES,
+    MODE_DEPTH,
+    MODE_E2E,
+    MODE_PROPERTY,
+    MODE_SOLID,
+    MODE_TID,
+    SOLID_COLOR_MAP,
+    _resolve_mpl_cmap,
+    property_limits,
+    property_values,
+    scatter_points_and_color,
+    shared_property_ranges,
+)
+
+#: Below this much z extent (nm) a dataset is drawn flat, whatever the 3D box
+#: says.  A 2-D MINFLUX acquisition writes z as float noise around 1e-13 m, not
+#: as an exact zero.
+FLAT_Z_EXTENT_NM = 1.0
+
+#: Every dataset is drawn with the same contrast window.  In the depth, trace
+#: and end-to-end modes a per-localization value in [0, 1] is the colormap
+#: position, not an intensity to be rescaled; in solid mode every value is 1,
+#: and the window applies to the summed image (see `RenderSpec.summed_contrast`).
+CONTRAST_LIMITS = (0.0, 1.0)
+
+#: Colormap for ``tid`` mode: one hue per trace, cyclic so the hash can land
+#: anywhere in [0, 1).
+TID_COLORMAP = "hsv"
+
+#: Smallest on-screen point diameter, in screen pixels: Plotly's default marker
+#: size in pyflux, so a zoomed-out overview looks as the scatter plot did.
+#: Zoomed in, points grow with their size in nanometres.
+POINT_MIN_PX = 5.0
+
+
+#: What pyflux draws by default: points, napari-storm's "disc" footprint.
+DEFAULT_STYLE = "disc"
+
+#: The scientific Gaussian, which every napari-storm can draw.
+GAUSSIAN_STYLE = "gaussian"
+
+
+@dataclass(frozen=True)
+class RenderStyle:
+    """One entry of napari-storm's palette, as pyflux offers it."""
+
+    name: str
+    label: str
+    opaque: bool
+    description: str = ""
+
+
+def rendering_styles():
+    """What the installed napari-storm can draw, in its own order.
+
+    napari-storm's footprint palette when it has one: the scientific Gaussian,
+    then the alternative visualisations.  A napari-storm that predates the
+    palette can draw Gaussians only.  Checked by capability rather than version,
+    because a development install reports whatever version its checkout carries.
+    """
+    try:
+        from napari_storm.core import PALETTE
+    except ImportError:
+        return (RenderStyle(GAUSSIAN_STYLE, "Gaussian", opaque=False),)
+    return tuple(
+        RenderStyle(f.name, f.label, f.blend == "opaque", f.description) for f in PALETTE
+    )
+
+
+def default_style():
+    """Points when napari-storm can draw them, the Gaussian otherwise."""
+    names = {style.name for style in rendering_styles()}
+    return DEFAULT_STYLE if DEFAULT_STYLE in names else GAUSSIAN_STYLE
+
+
+def points_supported():
+    """True when the installed napari-storm can draw points."""
+    return default_style() == DEFAULT_STYLE
+
+
+def summed_contrast_supported():
+    """True when the installed napari-storm can be told what its values mean.
+
+    napari-storm windows an additive style's summed image by default, treating
+    each localization's value as a weight.  One that predates that windowed
+    each localization on its own, which is what pyflux's colour modes assume,
+    so there is nothing to tell it.  Checked by capability, as for the palette.
+    """
+    try:
+        from napari_storm.core import LayerAppearance
+    except ImportError:
+        return False
+    return "summed_contrast" in {f.name for f in fields(LayerAppearance)}
+
+
+def napari_storm_available():
+    """True when napari-storm and napari can be imported.
+
+    Decides which renderer pyflux builds.  ``PYFLUX_RENDERER=plotly`` in the
+    environment forces the Plotly path even when they are installed, which
+    is how the fallback is exercised on a machine that has them.
+    """
+    import os
+
+    if os.environ.get("PYFLUX_RENDERER", "").strip().lower() == "plotly":
+        return False
+    try:
+        import napari  # noqa: F401
+        import napari_storm.core  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def color_coded_supported():
+    """True when the installed napari-storm blends colour-coded localizations.
+
+    From napari-storm 3.2 a colour-coded additive layer blends overlapping
+    localizations to the mean of their colours and windows the summed weight
+    alone, so the contrast window sets brightness while the property sets
+    colour.  Earlier versions window each localization on its own; pyflux
+    then keeps the window at ``(0, 1)`` for the colour modes.
+    """
+    try:
+        from napari_storm.core import LayerAppearance
+    except ImportError:
+        return False
+    return "color_coded" in {f.name for f in fields(LayerAppearance)}
+
+
+#: The contrast window pyflux starts with for a summed image: the full
+#: colour at one localization, as the per-localization window gave.
+DEFAULT_CONTRAST = (0.0, 1.0)
+
+
+@dataclass(frozen=True)
+class ColormapSpec:
+    """A colormap as data, so the planning half needs no napari import."""
+
+    name: str
+    colors: np.ndarray  # (N, 4) RGBA in [0, 1]
+
+
+@dataclass(frozen=True)
+class RenderSpec:
+    """One dataset, ready for :meth:`NapariStormView.show_datasets`."""
+
+    request: object  # napari_storm.core.RenderRequest
+    colormap: ColormapSpec
+    opacity: float
+    contrast_limits: tuple = CONTRAST_LIMITS
+    zdim_present: bool = False
+    #: The rendering style, a name from napari-storm's palette.
+    footprint: str = DEFAULT_STYLE
+    #: Whether the values are weights to sum (solid colour, every value 1) or
+    #: colormap positions (depth, trace, end-to-end).  napari-storm windows the
+    #: summed image of an additive style by default, which turns a position
+    #: into a weight: colour would follow density, and the localizations at
+    #: the bottom of the colormap would all but vanish.
+    summed_contrast: bool = True
+    #: Whether the values are colormap positions.  With a napari-storm that
+    #: blends colour-coded localizations (see :func:`color_coded_supported`)
+    #: the window then applies to the summed weight, as in solid mode.
+    color_coded: bool = False
+
+    @property
+    def n_localizations(self):
+        return int(len(self.request.coords))
+
+
+# ----------------------------------------------------------------------
+# Colormaps
+# ----------------------------------------------------------------------
+
+
+def _hex_to_rgb(hexcol):
+    s = hexcol.lstrip("#")
+    return tuple(int(s[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
+
+
+def solid_colormap(solid):
+    """Black-to-colour ramp for one of pyflux's solid colours."""
+    if solid not in SOLID_COLOR_MAP:
+        solid = DEFAULT_SOLID
+    r, g, b = _hex_to_rgb(SOLID_COLOR_MAP[solid])
+    colors = np.array([[0.0, 0.0, 0.0, 1.0], [r, g, b, 1.0]], dtype=float)
+    return ColormapSpec(name=f"pyflux solid {solid}", colors=colors)
+
+
+def lut_colormap(lut, steps=256):
+    """One of pyflux's LUT choices, sampled the way its heatmaps sample it.
+
+    Goes through :func:`pyflux.plotting._resolve_mpl_cmap`, which builds the
+    colormap from the Plotly colorscale definition, so a rendering here uses
+    exactly the colours the binning window would -- including the ``cu_*``
+    custom ramps, which no colormap registry knows by name.
+    """
+    if lut not in LUT_CHOICES:
+        lut = DEFAULT_LUT
+    cmap = _resolve_mpl_cmap(lut)
+    colors = np.asarray(cmap(np.linspace(0.0, 1.0, int(steps))), dtype=float)
+    colors[:, 3] = 1.0
+    return ColormapSpec(name=f"pyflux lut {lut}", colors=colors)
+
+
+# ----------------------------------------------------------------------
+# Per-localization colour values
+# ----------------------------------------------------------------------
+
+
+def _normalized(values, low=None, high=None):
+    """Scale to [0, 1].  A constant column maps to 0 rather than to NaN."""
+    values = np.asarray(values, dtype=np.float64)
+    finite = np.isfinite(values)
+    if not finite.any():
+        return np.zeros(len(values), dtype=np.float32)
+    if low is None:
+        low = float(np.min(values[finite]))
+    if high is None:
+        high = float(np.max(values[finite]))
+    if not (high > low):
+        return np.zeros(len(values), dtype=np.float32)
+    out = (values - low) / (high - low)
+    out[~finite] = 0.0
+    return np.clip(out, 0.0, 1.0).astype(np.float32)
+
+
+def tid_color_values(tids):
+    """Deterministic pseudo-random colormap position per trace id.
+
+    The same recipe as :func:`pyflux.plotting.tid_to_color` -- an MD5 of the
+    integer id -- so a trace keeps its colour across redraws, filters and
+    sessions, and neighbouring ids do not get neighbouring hues.
+    """
+    tids = np.asarray(tids)
+    unique, inverse = np.unique(tids, return_inverse=True)
+    positions = np.empty(len(unique), dtype=np.float32)
+    for i, tid in enumerate(unique):
+        digest = hashlib.md5(str(int(tid)).encode("utf-8")).digest()
+        positions[i] = int.from_bytes(digest[:2], "big") / 65536.0
+    return positions[inverse.ravel()]
+
+
+# ----------------------------------------------------------------------
+# The plan
+# ----------------------------------------------------------------------
+
+
+def _settings_with_defaults(color_settings):
+    cs = dict(color_settings or {})
+    cs.setdefault("mode", DEFAULT_MODE)
+    cs.setdefault("solid", DEFAULT_SOLID)
+    cs.setdefault("lut", DEFAULT_LUT)
+    cs.setdefault("alpha", DEFAULT_ALPHA)
+    cs.setdefault("size", DEFAULT_SIZE_2D)
+    cs.setdefault("property", DEFAULT_PROPERTY)
+    cs.setdefault("limits", None)
+    return cs
+
+
+def scatter_xyz(arr, avg_tid):
+    """``(xyz, end_to_end, tids)`` for *arr*, non-finite rows dropped.
+
+    The same rows Plotly was given, so switching renderer changes how the
+    localizations are drawn and not which ones.
+    """
+    xyz, vals, tids = scatter_points_and_color(arr, avg_tid)
+    if xyz is None or len(xyz) == 0:
+        return None, None, None
+    xyz = np.asarray(xyz, dtype=np.float64)
+    if xyz.ndim != 2 or xyz.shape[1] < 2:
+        return None, None, None
+    if xyz.shape[1] < 3:
+        xyz = np.column_stack([xyz, np.zeros(len(xyz))])
+    vals = np.asarray(vals, dtype=np.float64) if vals is not None else np.zeros(len(xyz))
+    tids = np.asarray(tids)
+    finite = np.isfinite(xyz).all(axis=1) & np.isfinite(vals)
+    if not finite.all():
+        xyz, vals, tids = xyz[finite], vals[finite], tids[finite]
+    if len(xyz) == 0:
+        return None, None, None
+    return xyz, vals, tids
+
+
+def build_render_spec(
+    arr, avg_tid, is3d, color_settings=None, *, name="pyflux", depth_range=None,
+    footprint=DEFAULT_STYLE, property_range=None, contrast=DEFAULT_CONTRAST,
+):
+    """What napari-storm should draw for one pyflux dataset.
+
+    Args:
+        arr: structured MINFLUX array with ``loc`` (N, 3) in nm and ``tid``,
+            exactly what pyflux hands its Plotly builders.
+        avg_tid: draw one localization per trace (its centroid) instead of all.
+        is3d: give the localizations their z.  Off, everything is drawn on one
+            plane, which is what the 2-D scatter plot showed.
+        color_settings: one row of the colour-settings table -- ``mode``,
+            ``solid``, ``lut``, ``alpha`` and ``size``.  ``size`` is in
+            nanometres: a marker's radius, or a Gaussian's sigma -- the same
+            number, since napari-storm draws a marker at the Gaussian's
+            one-sigma outline.  ``alpha`` applies to the additive styles;
+            markers are opaque.
+        name: layer name in the viewer.
+        depth_range: ``(zmin, zmax)`` to colour depth against, so several
+            datasets shown together share one scale.  None uses this
+            dataset's own range.
+        footprint: the rendering style, a name from napari-storm's palette
+            (see :func:`rendering_styles`); points by default.
+        property_range: ``(low, high)`` to colour the property mode against,
+            shared across datasets like *depth_range*.  None uses the
+            dataset's own: the typed-in ``limits`` of the settings row, or
+            the 1st to 99th percentile of the values.
+        contrast: ``(low, high)`` window on the summed image of an additive
+            style, in units of summed weight -- the number of localizations
+            overlapping on screen, for fixed-size Gaussians.  Opaque styles
+            ignore it, and so do the colour modes on a napari-storm that
+            does not blend colour-coded localizations.
+
+    Returns None when there is nothing to draw.
+    """
+    from napari_storm.core import DatasetTraits, GaussianSettings, LocalizationTable, RenderPlanner
+
+    cs = _settings_with_defaults(color_settings)
+    xyz, end_to_end, tids = scatter_xyz(arr, avg_tid)
+    if xyz is None:
+        return None
+
+    x = xyz[:, 0]
+    y = -xyz[:, 1]  # undo pyflux's Plotly-facing flip; see the module docstring
+    z = xyz[:, 2]
+
+    z_extent = float(np.max(z) - np.min(z))
+    zdim_present = bool(is3d) and z_extent > FLAT_Z_EXTENT_NM
+
+    records = np.rec.fromarrays([x, y, z], names=("x", "y", "z"))
+    table = LocalizationTable(
+        records,
+        position_columns={"x": "x", "y": "y", "z": "z"},
+        position_scale_nm=1.0,
+        copy=False,
+    )
+
+    sigma = float(cs["size"])
+    sigma = max(sigma, 0.1)
+    settings = GaussianSettings(mode=0, fixed_sigma_xy_nm=sigma, fixed_sigma_z_nm=sigma)
+    traits = DatasetTraits(zdim_present=zdim_present)
+    request = RenderPlanner().plan(table, settings, traits, name=str(name))
+
+    mode = cs["mode"]
+    if mode == MODE_SOLID:
+        colormap = solid_colormap(cs["solid"])
+        values = np.ones(len(x), dtype=np.float32)
+    elif mode == MODE_DEPTH:
+        colormap = lut_colormap(cs["lut"])
+        low, high = (None, None) if depth_range is None else depth_range
+        values = _normalized(z, low, high)
+    elif mode == MODE_TID:
+        colormap = lut_colormap(TID_COLORMAP)
+        values = tid_color_values(tids)
+    elif mode == MODE_PROPERTY:
+        colormap = lut_colormap(cs["lut"])
+        values = _property_positions(arr, avg_tid, cs, property_range, finite_rows=len(x))
+    else:  # MODE_E2E
+        colormap = lut_colormap(cs["lut"])
+        values = _normalized(end_to_end)
+
+    request = replace(request, values=np.ascontiguousarray(values, dtype=np.float32))
+
+    alpha = float(cs["alpha"])
+    alpha = max(0.0, min(1.0, alpha))
+    color_coded = mode != MODE_SOLID
+    blends = color_coded_supported()
+    return RenderSpec(
+        request=request,
+        colormap=colormap,
+        opacity=alpha,
+        contrast_limits=tuple(contrast) if (not color_coded or blends) else CONTRAST_LIMITS,
+        zdim_present=zdim_present,
+        footprint=str(footprint),
+        summed_contrast=(not color_coded) or blends,
+        color_coded=color_coded,
+    )
+
+
+def _property_positions(arr, avg_tid, cs, property_range, *, finite_rows):
+    """Colormap positions for the property mode, one per drawn point.
+
+    Rows :func:`scatter_xyz` dropped as non-finite are dropped here too, so
+    the positions line up with the coordinates; a point without the value
+    sits at the bottom of the colormap.
+    """
+    values = property_values(arr, cs["property"], avg_tid)
+    if values is None:
+        return np.zeros(finite_rows, dtype=np.float32)
+    values = np.asarray(values, dtype=np.float64)
+    xyz, end_to_end, _tids = scatter_points_and_color(arr, avg_tid)
+    xyz = np.asarray(xyz, dtype=np.float64)
+    if xyz.shape[1] < 3:
+        xyz = np.column_stack([xyz, np.zeros(len(xyz))])
+    e2e = np.asarray(end_to_end, dtype=np.float64) if end_to_end is not None else np.zeros(len(xyz))
+    finite = np.isfinite(xyz).all(axis=1) & np.isfinite(e2e)
+    values = values[finite]
+    limits = property_range if property_range is not None else property_limits(values, cs.get("limits"))
+    if limits is None:
+        return np.zeros(len(values), dtype=np.float32)
+    return _normalized(values, limits[0], limits[1])
+
+
+def depth_range_of(arr_by_base, avg_tid):
+    """The z range spanned by every dataset together, or None if there is none."""
+    low = high = None
+    for arr in arr_by_base.values():
+        xyz, _vals, _tids = scatter_xyz(arr, avg_tid)
+        if xyz is None:
+            continue
+        z = xyz[:, 2]
+        lo, hi = float(np.min(z)), float(np.max(z))
+        low = lo if low is None else min(low, lo)
+        high = hi if high is None else max(high, hi)
+    if low is None:
+        return None
+    return (low, high)
+
+
+def build_render_specs(
+    arr_by_base, avg_tid, is3d, color_settings_by_base, *, shared_depth_range=False,
+    footprint=DEFAULT_STYLE, contrast=DEFAULT_CONTRAST,
+):
+    """One :class:`RenderSpec` per base, in the given order.
+
+    With *shared_depth_range* every depth-coloured dataset is scaled against
+    the z range of all of them, and every property-coloured dataset against
+    the range of that property over all of them, which is what the merged
+    multicolor view needs so that the same depth, or the same EFO, is the
+    same colour in every channel.  Bases with nothing to draw map to None, so
+    the caller can close them.
+    """
+    depth_range = None
+    property_ranges = {}
+    if shared_depth_range:
+        depth_bases = {
+            b: a
+            for b, a in arr_by_base.items()
+            if _settings_with_defaults((color_settings_by_base or {}).get(b)).get("mode") == MODE_DEPTH
+        }
+        depth_range = depth_range_of(depth_bases, avg_tid) if depth_bases else None
+        property_ranges = shared_property_ranges(arr_by_base, avg_tid, color_settings_by_base)
+
+    specs = {}
+    for base, arr in arr_by_base.items():
+        cs = (color_settings_by_base or {}).get(base)
+        settings = _settings_with_defaults(cs)
+        property_range = None
+        if settings["mode"] == MODE_PROPERTY:
+            property_range = property_ranges.get(settings["property"])
+        specs[base] = build_render_spec(
+            arr, avg_tid, is3d, cs, name=base, depth_range=depth_range, footprint=footprint,
+            property_range=property_range, contrast=contrast,
+        )
+    return specs
+
+
+# ----------------------------------------------------------------------
+# The widget
+# ----------------------------------------------------------------------
+
+
+def _make_view_class():
+    """Build the widget class lazily, so importing this module needs no Qt."""
+    from PySide6 import QtCore, QtWidgets
+    from PySide6.QtCore import Signal
+
+    class NapariStormView(QtWidgets.QWidget):
+        """A napari canvas, embedded, drawing pyflux datasets through napari-storm.
+
+        The napari main window is created and never shown; its viewer widget
+        is taken out of it and placed in this widget's layout.  The window has
+        to stay alive -- it owns the viewer, and dropping it takes the canvas
+        with it -- so the viewer is held for the widget's lifetime and given
+        back on :meth:`shutdown`.
+        """
+
+        #: (source_id, payload) -- the camera moved.  The payload holds
+        #: ``mode`` ("2d"/"3d"), ``center``, ``zoom``, ``angles``,
+        #: ``perspective``; :meth:`apply_view` takes the same dict back.
+        viewChanged = Signal(str, object)
+        #: (source_id) -- the pointer entered or pressed on this canvas.  The
+        #: multicolor window crops whichever panel was touched last.
+        activated = Signal(str)
+        #: (ndisplay) -- the user switched 2-D/3-D from napari's own button.
+        ndisplayChanged = Signal(int)
+
+        def __init__(self, parent=None, title="napari-storm"):
+            super().__init__(parent)
+            import napari
+            from napari.qt import get_stylesheet
+            from napari_storm.napari_particles.selection import select_renderer
+
+            self._id = hex(id(self))
+            self._ids = {}  # base -> dataset id handed to the renderer
+            self._next_id = 1  # never reused: the renderer keys resources by it
+            self._is3d = None
+            self._applying_view = False
+            self._live_sync = False
+            self._colormaps = {}
+            self._closed = False
+
+            self.viewer = napari.Viewer(show=False, show_welcome_screen=False, title=title)
+            self._qt_viewer = self.viewer.window._qt_viewer
+            self._napari_center = self._qt_viewer.parentWidget()
+            # The stylesheet napari's main window would have cascaded down.
+            try:
+                self._qt_viewer.setStyleSheet(get_stylesheet(self.viewer.theme))
+            except Exception:
+                pass
+
+            lay = QtWidgets.QVBoxLayout(self)
+            lay.setContentsMargins(0, 0, 0, 0)
+            lay.addWidget(self._qt_viewer)
+
+            self.renderer = select_renderer(self.viewer)
+            #: The styles the installed napari-storm can draw.  Without its
+            #: palette that is the Gaussian alone, and every dataset is drawn so.
+            self.styles = {style.name for style in rendering_styles()}
+            self.points_supported = DEFAULT_STYLE in self.styles
+            self._summed_contrast_supported = summed_contrast_supported()
+            self._color_coded_supported = color_coded_supported()
+
+            self.viewer.scale_bar.visible = True
+            self.viewer.scale_bar.length = 100.0
+            # napari < 0.8 reads the unit off the overlay; setting it warns of
+            # the per-layer units that replace it in 0.8, which napari-storm
+            # does not support yet, so the warning is noise here.
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                try:
+                    self.viewer.scale_bar.unit = "nm"
+                except Exception:
+                    pass
+            # The axes overlay is a gizmo at the world origin, not a plot
+            # grid; off unless the host asks for it.
+            self.viewer.axes.visible = False
+
+            camera_events = self.viewer.camera.events
+            for field in ("center", "zoom", "angles", "perspective"):
+                getattr(camera_events, field).connect(self._on_camera_changed)
+            self.viewer.dims.events.ndisplay.connect(self._on_ndisplay_changed)
+
+            self._canvas_native = self._qt_viewer.canvas.native
+            self._canvas_native.installEventFilter(self)
+
+        # ------------------------------------------------------------ data
+
+        def show_datasets(self, specs, is3d, reset_view=False):
+            """Draw exactly the datasets in *specs* (base -> RenderSpec | None).
+
+            Bases already open are updated in place; new ones are opened;
+            open ones missing from *specs*, or mapped to None, are closed.
+            """
+            from napari_storm.core import LayerAppearance
+
+            is3d = bool(is3d)
+            if self._is3d is not None and is3d != self._is3d:
+                # Flat and 3-D data are different geometry to the instanced
+                # layer (its quad sits on the data plane), so switch by
+                # rebuilding rather than by updating.
+                self.clear()
+            self._is3d = is3d
+
+            for base, spec in specs.items():
+                if spec is None:
+                    self._close_base(base)
+                    continue
+                colormap = self._colormap(spec.colormap)
+                dataset_id = self._ids.get(base)
+                if dataset_id is not None and self.renderer.is_open(dataset_id):
+                    self.renderer.update(dataset_id, spec.request)
+                else:
+                    dataset_id = self._next_id
+                    self._next_id += 1
+                    self._ids[base] = dataset_id
+                    self.renderer.open(dataset_id, replace(spec.request, colormap=colormap))
+                self._refresh_extent(dataset_id)
+                appearance = dict(
+                    colormap=colormap,
+                    opacity=float(spec.opacity),
+                    contrast_limits=tuple(spec.contrast_limits),
+                    visible=True,
+                )
+                if len(self.styles) > 1:
+                    footprint = spec.footprint if spec.footprint in self.styles else GAUSSIAN_STYLE
+                    appearance["footprint"] = footprint
+                    appearance["min_size_px"] = POINT_MIN_PX
+                if self._summed_contrast_supported:
+                    appearance["summed_contrast"] = bool(spec.summed_contrast)
+                if self._color_coded_supported:
+                    appearance["color_coded"] = bool(spec.color_coded)
+                self.renderer.set_appearance(dataset_id, LayerAppearance(**appearance))
+
+            for base in [b for b in self._ids if b not in specs]:
+                self._close_base(base)
+
+            self._label_axes()
+            self._set_ndisplay(3 if is3d else 2)
+            if reset_view:
+                self.reset_view()
+
+        def set_contrast(self, contrast, specs):
+            """Re-window the open datasets to *contrast* without redrawing them.
+
+            *specs* (base -> RenderSpec) says which datasets take the window
+            at all: those whose values are summed (see
+            :attr:`RenderSpec.summed_contrast`).
+            """
+            from napari_storm.core import LayerAppearance
+
+            for base, spec in specs.items():
+                dataset_id = self._ids.get(base)
+                if spec is None or dataset_id is None or not self.renderer.is_open(dataset_id):
+                    continue
+                limits = tuple(contrast) if spec.summed_contrast else CONTRAST_LIMITS
+                self.renderer.set_appearance(dataset_id, LayerAppearance(contrast_limits=limits))
+
+        def clear(self):
+            """Close every dataset; the canvas goes empty."""
+            try:
+                self.renderer.close_all()
+            except Exception:
+                pass
+            self._ids.clear()
+
+        def _close_base(self, base):
+            dataset_id = self._ids.pop(base, None)
+            if dataset_id is not None:
+                try:
+                    self.renderer.close(dataset_id)
+                except Exception:
+                    pass
+
+        def open_bases(self):
+            """The bases currently drawn, in the order they were opened."""
+            return [b for b, i in self._ids.items() if self.renderer.is_open(i)]
+
+        def _colormap(self, spec):
+            """The napari colormap for a :class:`ColormapSpec`, built once."""
+            cmap = self._colormaps.get(spec.name)
+            if cmap is None:
+                from napari.utils.colormaps import Colormap
+
+                cmap = Colormap(colors=np.asarray(spec.colors, dtype=float), name=spec.name)
+                self._colormaps[spec.name] = cmap
+            return cmap
+
+        def _refresh_extent(self, dataset_id):
+            """Drop napari's cached extent for a layer whose rows just changed.
+
+            napari caches a layer's extent and clears it in its own data
+            setter, which the in-place update bypasses; left alone, reset_view
+            would frame the previous rows. Clearing it here also keeps the
+            layer list's cached extent -- and the units it reports to the
+            canvas -- in step with the layers actually present.
+            """
+            layer = self.renderer.layer(dataset_id)
+            if layer is None:
+                return
+            try:
+                layer.refresh(thumbnail=False, data_displayed=False, highlight=False, extent=True)
+            except TypeError:
+                try:
+                    layer.refresh()  # napari < 0.5 takes no arguments
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        def _label_axes(self):
+            """Name the world axes, so the axes overlay reads x/y/z, not -1/-2/-3."""
+            dims = self.viewer.dims
+            labels = ("z", "y", "x")[-int(dims.ndim):]
+            try:
+                if tuple(dims.axis_labels) != labels:
+                    dims.axis_labels = labels
+            except Exception:
+                pass
+
+        # ------------------------------------------------------------ view
+
+        def _set_ndisplay(self, ndisplay):
+            if int(self.viewer.dims.ndisplay) != int(ndisplay):
+                self.viewer.dims.ndisplay = int(ndisplay)
+
+        def _on_ndisplay_changed(self, event=None):
+            self.ndisplayChanged.emit(int(self.viewer.dims.ndisplay))
+
+        def reset_view(self):
+            try:
+                self.viewer.reset_view()
+            except Exception:
+                pass
+
+        def set_grid_visible(self, on, axis_titles=None):
+            """napari has no plot grid; its axes overlay is the coordinate system."""
+            self.viewer.axes.visible = bool(on)
+
+        def set_scalebar_nm(self, length_nm):
+            try:
+                self.viewer.scale_bar.length = float(length_nm)
+            except Exception:
+                pass
+
+        def set_live_sync(self, on):
+            """Kept for API parity with PlotlyView.
+
+            napari reports every camera move as it happens, so a synchronized
+            panel always follows live; there is no separate gesture-end event
+            to hold the broadcast back for.
+            """
+            self._live_sync = bool(on)
+
+        def view_payload(self):
+            cam = self.viewer.camera
+            return {
+                "mode": "3d" if int(self.viewer.dims.ndisplay) == 3 else "2d",
+                "center": [float(c) for c in cam.center],
+                "zoom": float(cam.zoom),
+                "angles": [float(a) for a in cam.angles],
+                "perspective": float(cam.perspective),
+            }
+
+        def _on_camera_changed(self, event=None):
+            if self._applying_view or self._closed:
+                return
+            self.viewChanged.emit(self._id, self.view_payload())
+
+        def apply_view(self, payload):
+            """Move this camera to *payload* without re-broadcasting it."""
+            if not isinstance(payload, dict):
+                return
+            is3d = int(self.viewer.dims.ndisplay) == 3
+            mode = payload.get("mode")
+            if mode is not None and (mode == "3d") != is3d:
+                return  # captured in the other display mode; meaningless here
+            self._applying_view = True
+            try:
+                cam = self.viewer.camera
+                if payload.get("center") is not None:
+                    cam.center = tuple(float(c) for c in payload["center"])
+                if payload.get("zoom") is not None:
+                    cam.zoom = float(payload["zoom"])
+                if is3d:
+                    if payload.get("angles") is not None:
+                        cam.angles = tuple(float(a) for a in payload["angles"])
+                    if payload.get("perspective") is not None:
+                        cam.perspective = float(payload["perspective"])
+            finally:
+                self._applying_view = False
+
+        def visible_rect_2d(self):
+            """``(xmin, xmax, ymin, ymax)`` on screen now, in pyflux's coordinates.
+
+            None in 3-D display, where a rectangle on screen is not a
+            rectangle in the sample.
+            """
+            if int(self.viewer.dims.ndisplay) != 2:
+                return None
+            try:
+                height, width = self._qt_viewer.canvas.size
+            except Exception:
+                return None
+            cam = self.viewer.camera
+            zoom = float(cam.zoom)
+            if not (zoom > 0) or width <= 0 or height <= 0:
+                return None
+            cy, cx = float(cam.center[-2]), float(cam.center[-1])
+            half_w = float(width) / (2.0 * zoom)
+            half_h = float(height) / (2.0 * zoom)
+            xmin, xmax = cx - half_w, cx + half_w
+            # napari y is pyflux's y negated (module docstring)
+            ymin, ymax = -(cy + half_h), -(cy - half_h)
+            return (xmin, xmax, ymin, ymax)
+
+        def eventFilter(self, obj, event):
+            if obj is self._canvas_native and event.type() in (
+                QtCore.QEvent.Type.MouseButtonPress,
+                QtCore.QEvent.Type.Enter,
+            ):
+                self.activated.emit(self._id)
+            return False
+
+        # ------------------------------------------------------------ end
+
+        def shutdown(self):
+            if self._closed:
+                return
+            self._closed = True
+            # The canvas would draw once more while its GL context is torn
+            # down and log an error for it; stop the draw events first.
+            try:
+                self._qt_viewer.canvas._scene_canvas.events.draw.block()
+                self._canvas_native.setUpdatesEnabled(False)
+            except Exception:
+                pass
+            self.clear()
+            try:
+                self.renderer.detach()
+            except Exception:
+                pass
+            # Hand the viewer widget back to the window that owns it, so the
+            # window's own close tears everything down in the order it built it.
+            try:
+                self._canvas_native.removeEventFilter(self)
+                self.layout().removeWidget(self._qt_viewer)
+                if self._napari_center is not None and self._napari_center.layout() is not None:
+                    self._napari_center.layout().addWidget(self._qt_viewer)
+            except Exception:
+                pass
+            try:
+                self.viewer.close()
+            except Exception:
+                pass
+
+    return NapariStormView
+
+
+_VIEW_CLASS = None
+
+
+def NapariStormView(*args, **kwargs):
+    """Construct the embedded viewer widget (see :func:`_make_view_class`)."""
+    global _VIEW_CLASS
+    if _VIEW_CLASS is None:
+        _VIEW_CLASS = _make_view_class()
+    return _VIEW_CLASS(*args, **kwargs)
